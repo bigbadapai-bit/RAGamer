@@ -17,8 +17,9 @@ env/
 
 # 解析产物与模型文件
 # 上一版项目把 25MB 的解析产物提交进了仓库，这是明确的纠正
-output/
-models/
+# 加前导 / 锚在仓库根：不然 src/ragamer/models/ 这样的包会被静默忽略掉
+/output/
+/models/
 *.log
 
 # IDE / 编辑器
