@@ -42,8 +42,8 @@ from ragamer.stores.base import (
     unavailable,
 )
 
-# 稠密向量的维度（BGE-M3）由产出向量的那一侧定义：collection 的 FLOAT_VECTOR 必须
-# 与向量化模型对得上，写死在两处迟早会漂。这里转出来给本模块用（也供 tests 取）。
+# 稠密向量的维度由产出向量的那一侧定义：schema 里的 FLOAT_VECTOR 必须与向量化模型
+# 对得上，写死在两处迟早会漂。这里取来用，本模块对外仍叫 DENSE_DIM。
 from ragamer.vectors.base import DENSE_DIM
 
 logger = get_logger(__name__)

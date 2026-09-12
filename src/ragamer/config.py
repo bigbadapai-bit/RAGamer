@@ -98,7 +98,7 @@ class ModelSettings(BaseModel):
 
     #: 加载到哪个设备：cpu / cuda / cuda:0
     device: NonEmptyStr = "cpu"
-    #: 半精度。CPU 上必须关着；GPU 上打开能省一半显存。
+    #: 半精度。GPU 上打开能省一半显存；CPU 上开着也没关系——两个库都会把模型转回单精度。
     fp16: bool = False
 
 
