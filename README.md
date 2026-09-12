@@ -37,7 +37,7 @@ CI 在每次 push 与 PR 上跑 lint、格式检查与测试，见 [`.github/wor
 ## 目录
 
 ```
-src/ragamer/    应用代码（config 配置装载、logging 日志、__main__ 启动自检）
+src/ragamer/    应用代码（config 配置装载、logging 日志、llm 语言模型适配器、__main__ 启动自检）
 tests/          测试：行为测试 + 结构约束
 docs/           架构文档、ADR、给 agent 的说明
 ```
