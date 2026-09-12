@@ -48,11 +48,32 @@ CI 在每次 push 与 PR 上跑 lint、格式检查与测试，见 [`.github/wor
 - 与原项目共用实例、**命名空间错开**：Milvus 用 database（不接受 `default`）、MinIO 换桶名、Mongo 换库名。
 - 切片存储的过滤条件只收结构化对象，不接受字符串表达式——表达式的生成与取值转义都封在适配器里。
 
+## 向量化与精排
+
+两个模型适配器（`ragamer.vectors`），协议与组合根里的存储客户端是同一套打法：
+业务层只认 `Embedder` / `Reranker` 两个协议，`ragamer.vectors.fake` 里的确定性假件实现同一组协议，
+默认测试一行云端代码、一个权重都不碰。
+
+- **一个模型同时产出稠密与稀疏两路**（BGE-M3），混合检索的两路因此必然同源。
+  稠密向量一律归一化，配 Milvus 的 IP 度量等价于余弦相似度。
+- **精排吃长文本、不截断、不摘要**。两个库自己给的 `max_length` 默认值都是 512，
+  照默认值用就等于把原项目「超长就 LLM 摘要压缩再重试」那条路径搬回来，
+  所以上限显式来自配置（`RAGAMER_EMBED_MAX_LENGTH` / `RAGAMER_RERANK_MAX_LENGTH`，默认 8192）。
+- **模型只加载一次**：权重在第一次真的要用到时才加载，之后整个进程复用同一个实例。
+
+真实模型（torch + transformers）放在可选的 `models` 组里——核心链路与默认测试都不需要它：
+
+```bash
+uv sync --extra models           # 装真实模型
+uv run pytest -m integration     # 跑真模型的集成测试（首次会下载几个 G 的权重）
+```
+
 ## 目录
 
 ```
-src/ragamer/         应用代码（config 配置装载、logging 日志、container 组合根、__main__ 启动自检）
-src/ragamer/stores/  存储适配器：base 协议与共享类型、chunks Milvus、documents Mongo、objects MinIO、memory 内存假件
-tests/               测试：行为测试 + 结构约束 + 集成测试
-docs/                架构文档、ADR、给 agent 的说明
+src/ragamer/          应用代码（config 配置装载、logging 日志、container 组合根、__main__ 启动自检）
+src/ragamer/stores/   存储适配器：base 协议与共享类型、chunks Milvus、documents Mongo、objects MinIO、memory 内存假件
+src/ragamer/vectors/  向量化与精排：base 协议与共享类型、bge 真实模型、fake 确定性假件
+tests/                测试：行为测试 + 结构约束 + 集成测试
+docs/                 架构文档、ADR、给 agent 的说明
 ```
