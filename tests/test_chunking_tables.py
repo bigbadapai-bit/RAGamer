@@ -49,6 +49,12 @@ def _types(chunks) -> list[str]:
     return [chunk.chunk_type for chunk in chunks]
 
 
+def _stage_table(rows: int) -> str:
+    """一张「阶段／血量」两列的表，`rows` 行。"""
+    body = "\n".join(f"| 第{index}阶段 | 血量 {index}000 |" for index in range(rows))
+    return f"| 阶段 | 血量 |\n| --- | --- |\n{body}\n"
+
+
 # --- 整表成块 ---
 
 
@@ -108,6 +114,36 @@ def test_正文切片的_content_meta_是空的():
     assert chunks[0].content_meta == ""
 
 
+def test_单列表格也是表格():
+    markdown = "# 说明\n\n| 招式 |\n| --- |\n| 横扫 |\n| 突刺 |\n"
+
+    chunks = chunk_document(markdown, RULES)
+
+    assert _types(chunks) == ["table"]
+    assert chunks[0].content.splitlines() == ["| 招式 |", "| --- |", "| 横扫 |", "| 突刺 |"]
+
+
+def test_单列表格超长时也按行组重复表头():
+    rows = "\n".join(f"| 第{index}阶段的说明 |" for index in range(8))
+    markdown = f"# 说明\n\n| 阶段 |\n| --- |\n{rows}\n"
+
+    chunks = chunk_document(markdown, RULES)
+
+    assert len(chunks) > 1
+    assert all(chunk.content.splitlines()[0] == "| 阶段 |" for chunk in chunks)
+    assert "".join(chunk.content for chunk in chunks).count("阶段的说明") == 8
+
+
+def test_正文里的一条横线不算表格():
+    # Setext 标题：正文下面画一条 `---`。单列表格必须带竖线，就是为的不认错它
+    markdown = "# 说明\n\n他有两种形态\n\n---\n\n后面还有正文。\n"
+
+    chunks = chunk_document(markdown, RULES)
+
+    assert _types(chunks) == ["text"]
+    assert chunks[0].content == "他有两种形态\n\n---\n\n后面还有正文。"
+
+
 def test_单元格里转义的竖线不是分隔符():
     markdown = "# 说明\n\n| 名称 | 值 |\n| --- | --- |\n| A\\|B | 1 |\n"
 
@@ -121,8 +157,7 @@ def test_单元格里转义的竖线不是分隔符():
 
 
 def test_超长表格按行组切且每块都带表头():
-    rows = "\n".join(f"| 第{index}阶段 | 血量 {index}000 |" for index in range(12))
-    markdown = f"# 二郎神\n\n| 阶段 | 血量 |\n| --- | --- |\n{rows}\n"
+    markdown = f"# 二郎神\n\n{_stage_table(12)}"
 
     chunks = chunk_document(markdown, RULES)
 
@@ -140,8 +175,7 @@ def test_超长表格按行组切且每块都带表头():
 
 
 def test_行组切分后仍带同一祖先标题路径():
-    rows = "\n".join(f"| 第{index}阶段 | 血量 {index}000 |" for index in range(12))
-    markdown = f"# 二郎神\n\n## 数值\n\n| 阶段 | 血量 |\n| --- | --- |\n{rows}\n"
+    markdown = f"# 二郎神\n\n## 数值\n\n{_stage_table(12)}"
 
     chunks = chunk_document(markdown, RULES)
 
@@ -192,7 +226,22 @@ def test_长列跟着它所在的行组分片():
     assert "".join(chunk.content_meta for chunk in chunks).count("这一阶段的说明写得足够长") == 12
 
 
-def test_整张表只有长列时第一列留在正文里做锚点():
+def test_第一列自己就是长列时_meta_里不重复渲染它():
+    long_cell = "超长文本" * 6
+
+    chunks = chunk_document(f"| {long_cell} | 短列 |\n| --- | --- |\n| {long_cell} | 1 |\n", RULES)
+
+    chunk = chunks[0]
+    assert chunk.content.splitlines() == ["| 短列 |", "| --- |", "| 1 |"]
+    # 第 0 列既当行首锚点、自己又是长列，只该出现一次
+    assert chunk.content_meta.splitlines() == [
+        f"| {long_cell} |",
+        "| --- |",
+        f"| {long_cell} |",
+    ]
+
+
+def test_每一列都是长文本列时正文只留表头骨架():
     markdown = (
         "# 说明\n"
         "\n"
@@ -206,13 +255,14 @@ def test_整张表只有长列时第一列留在正文里做锚点():
     chunks = chunk_document(markdown, RULES)
 
     chunk = chunks[0]
-    # 正文不能是空的，第一列留着；剩下那列整列降级
+    # 正文不能是空的，也不能拿长文本凑数：只留列名做锚点，数据行整份进 meta
     assert chunk.content.splitlines() == [
-        "| 这一列的标题本身就写得很长，长到超过长文本列的门槛 |",
-        "| --- |",
-        "| 这一格的内容也长，也同样超过长文本列的门槛 |",
+        "| 这一列的标题本身就写得很长，长到超过长文本列的门槛 | "
+        "另一列的标题也一样长，也同样超过长文本列的门槛 |",
+        "| --- | --- |",
     ]
-    assert "另一格的内容也一样长，也超过长文本列的门槛" not in chunk.content
+    assert "这一格的内容也长，也同样超过长文本列的门槛" not in chunk.content
+    assert "这一格的内容也长，也同样超过长文本列的门槛" in chunk.content_meta
     assert "另一格的内容也一样长，也超过长文本列的门槛" in chunk.content_meta
 
 
@@ -230,6 +280,18 @@ def test_模板块整体保留不被切开():
     assert infobox[0].ancestor_path == "二郎神"
     # 模板块多是 Infobox 这类键值结构，与表格同归结构化块
     assert infobox[0].chunk_type == "table"
+
+
+def test_带模板块的稀疏文档仍按结构切():
+    # 模板块本身就是结构信号：否则整篇退化按长度切，Infobox 会被从中间切开
+    body = "\n".join(f"第 {index} 句：这一段只是正文，没有标题。" for index in range(60))
+    markdown = f"{{{{Infobox character\n| name = 二郎神\n}}}}\n\n{body}\n"
+
+    chunks = chunk_document(markdown, RULES)
+    infobox = [chunk for chunk in chunks if "Infobox" in chunk.content]
+
+    assert len(infobox) == 1
+    assert infobox[0].content == "{{Infobox character\n| name = 二郎神\n}}"
 
 
 def test_模板块与正文各自成片():

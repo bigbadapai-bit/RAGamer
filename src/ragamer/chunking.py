@@ -37,8 +37,13 @@ _FENCE = re.compile(r"^(`{3,}|~{3,})")
 #: 正文里若真的在讲 `<details>` 这个元素，那几个字符也会一并去掉。
 _FOLD_TAG = re.compile(r"</?(?:details|summary)(?:\s[^>]*)?>", re.IGNORECASE)
 
-#: Markdown 表格的分隔行。有它才说明这是个表格块——结构探测的一个信号。
-_TABLE_RULE = re.compile(r"^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?\s*$")
+#: 表格的分隔行。有它才说明这是个表格块——结构探测的一个信号。
+_TABLE_RULE = re.compile(
+    # 两列及以上：`| --- | --- |`
+    r"^\s*\|?\s*:?-{2,}:?\s*(?:\|\s*:?-{2,}:?\s*)+\|?\s*$"
+    # 单列表格也是表格，但它那一行必须带竖线：光一条 `---` 与 Setext 标题分不开
+    r"|^\s*\|\s*:?-{2,}:?\s*\|?\s*$"
+)
 
 #: 表格行里分隔单元格的竖线。转义的（`\|`）是单元格内容，不是分隔符。
 _CELL_SEPARATOR = re.compile(r"(?<!\\)\|")
@@ -364,7 +369,11 @@ def _source_line(block: _Block) -> str:
 
 @dataclass(frozen=True)
 class _Table:
-    """解析后的表格。单元格已去空白，转义的竖线留在原处。"""
+    """解析后的表格。单元格已去空白，转义的竖线留在原处。
+
+    **结构归它自己**（`render`），**怎么切归下面的自由函数**：哪几列算长文本列、
+    按什么分组都是切分策略，要跟着 `ChunkRules` 走，不该长在数据结构上。
+    """
 
     header: list[str]
     aligns: list[str]
@@ -384,7 +393,7 @@ class _Table:
 def _table_chunks(piece: _Piece, index: int, rules: ChunkRules) -> list[Chunk]:
     """把一张表切成切片：整表装得下就一片，装不下按行组切、**每块重复表头**。
 
-    🔴 **长文本列整列降级进 `content_meta`，不进正文。** 这不是优化：超长行会在
+    **长文本列整列降级进 `content_meta`，不进正文。** 这不是优化：超长行会在
     向量化阶段被静默截断，内容永久丢失且不报错，而 `content_meta` 不参与向量化，
     随结果返回即可（架构文档 §2.5）。
 
@@ -392,29 +401,34 @@ def _table_chunks(piece: _Piece, index: int, rules: ChunkRules) -> list[Chunk]:
 
     - **整列一起降级**，而不是只挪走超长的那几格——一列里长短不齐时，行的内容会被
       拆到两个地方，读的人对不上号。
-    - **全表没有一列是短的时，第一列留在正文里做锚点**：正文不能是空的，否则这一片
-      检索不回来，`content_meta` 也就没有随结果返回的机会。
+    - **每一列都是长文本列时，正文只留表头骨架**，数据行全数进 meta：正文不能是空的
+      （空了就检索不回来，meta 也就没机会随结果返回），但也不能拿长文本凑数。
     """
     table = _parse_table(piece.text)
     long_columns = _long_columns(table, rules)
-    if len(long_columns) == len(table.header):
-        long_columns.discard(0)
-    kept = [column for column in range(len(table.header)) if column not in long_columns]
-    meta = [0, *sorted(long_columns)] if long_columns else []
+    kept_columns = [column for column in range(len(table.header)) if column not in long_columns]
+    # meta 里带上第一列：长列单拎出来之后，得知道哪一格属于哪一行
+    meta_columns = sorted(long_columns | {0}) if long_columns else []
+    # 一列都没剩下时不再分组：正文只剩骨架，分几组都一样，数据行整份进 meta
+    groups = _group_rows(table, kept_columns, rules) if kept_columns else [table.rows]
 
     chunks: list[Chunk] = []
-    for rows in _group_rows(table, kept, rules):
+    for rows in groups:
         chunks.append(
             Chunk(
-                content=table.render(kept, rows),
+                content=table.render(kept_columns, rows) if kept_columns else _skeleton(table),
                 chunk_index=index + len(chunks),
                 ancestor_path=piece.path,
-                # meta 里带上第一列：长列单拎出来之后，得知道哪一格属于哪一行
-                content_meta=table.render(meta, rows) if meta else "",
+                content_meta=table.render(meta_columns, rows) if meta_columns else "",
                 chunk_type="table",
             )
         )
     return chunks
+
+
+def _skeleton(table: _Table) -> str:
+    """只剩表头的一张空表——列名是全表都是长文本列时仅剩的检索锚点。"""
+    return table.render(range(len(table.header)), [])
 
 
 def _parse_table(text: str) -> _Table:
@@ -464,23 +478,20 @@ def _long_columns(table: _Table, rules: ChunkRules) -> set[int]:
 def _group_rows(table: _Table, columns: Sequence[int], rules: ChunkRules) -> list[list[list[str]]]:
     """把数据行分组，每组配上表头之后不超过 `max_chars`。
 
-    只量正文那几列：`content_meta` 不参与向量化，长短与这一片的上限无关。
+    量的是**渲染之后的正文**，只算留下的那几列：`content_meta` 不参与向量化，
+    长短与这一片的上限无关。
 
     两个与正文切分不同的地方：单行自己就超长时让它独占一组，不把一行掰到两组里去；
     也不为了凑够下限把两组并回去——每块都带着表头，只剩一行也是读得懂的。
     """
     groups: list[list[list[str]]] = []
     for row in table.rows:
-        if groups and _table_width(table, columns, [*groups[-1], row]) <= rules.max_chars:
+        if groups and len(table.render(columns, [*groups[-1], row])) <= rules.max_chars:
             groups[-1].append(row)
         else:
             groups.append([row])
     # 没有数据行也留一片：表头本身是内容，丢掉就等于把这张表删了
     return groups or [[]]
-
-
-def _table_width(table: _Table, columns: Sequence[int], rows: Sequence[Sequence[str]]) -> int:
-    return len(table.render(columns, rows))
 
 
 def _split(text: str, rules: ChunkRules) -> list[str]:
