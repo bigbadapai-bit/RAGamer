@@ -21,6 +21,13 @@ dependencies = [
 [project.scripts]
 ragamer = "ragamer.__main__:main"
 
+[project.optional-dependencies]
+# 真实向量化模型（BGE-M3 与长上下文 reranker）。它拉进 torch 与 transformers，
+# 装一次好几个 G，而核心链路与全部默认测试都用确定性的哈希假件跑——所以放进可选组，
+# 只有要跑 `pytest -m integration` 时才 `uv sync --extra models`。
+# 适配器里是懒加载：没装这个组也能 import，只在真的要用模型时才报错并说明装法。
+models = ["FlagEmbedding>=1.4"]
+
 [dependency-groups]
 dev = [
     "pytest>=8.3",
