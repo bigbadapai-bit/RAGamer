@@ -42,10 +42,11 @@ from ragamer.stores.base import (
     unavailable,
 )
 
-logger = get_logger(__name__)
+# 稠密向量的维度（BGE-M3）由产出向量的那一侧定义：collection 的 FLOAT_VECTOR 必须
+# 与向量化模型对得上，写死在两处迟早会漂。这里转出来给本模块用（也供 tests 取）。
+from ragamer.vectors.base import DENSE_DIM
 
-#: 稠密向量的维度（BGE-M3）。
-DENSE_DIM = 1024
+logger = get_logger(__name__)
 
 #: 稠密与稀疏两路在混合检索里的权重。原项目标定过的值，本项目还没有评测集，
 #: 先照搬；调参要等评测（见 docs/ARCHITECTURE.md §11）。

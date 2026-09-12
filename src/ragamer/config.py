@@ -89,6 +89,45 @@ class LlmSettings(BaseModel):
     model: NonEmptyStr
 
 
+class ModelSettings(BaseModel):
+    """向量化与精排**共用**的加载参数。
+
+    两个模型跑在同一台机器上，设备与精度没有分开配置的理由——分开只会带来
+    「一个在 GPU、一个在 CPU」这种没人有意为之、出事也难查的组合。
+    """
+
+    #: 加载到哪个设备：cpu / cuda / cuda:0
+    device: NonEmptyStr = "cpu"
+    #: 半精度。CPU 上必须关着；GPU 上打开能省一半显存。
+    fp16: bool = False
+
+
+class EmbedSettings(BaseModel):
+    """向量化模型。**一个模型同时产出稠密与稀疏两路**，这是混合检索的基础。"""
+
+    #: HuggingFace 上的模型名，或本地权重目录
+    model: NonEmptyStr = "BAAI/bge-m3"
+    #: 一次喂给模型几条文本
+    batch_size: int = Field(default=8, ge=1, le=1024)
+    #: 单条文本的 token 上限。**不要往下调**——调低就是重新引入静默截断：
+    #: 超出的部分被悄悄丢掉，内容永久缺失且不报错（原项目照库的默认值 512 用，
+    #: 踩的正是这一个）。真正生效的上限由模型自己的上下文长度决定，这里只是防手滑。
+    max_length: int = Field(default=8192, ge=1, le=32768)
+
+
+class RerankSettings(BaseModel):
+    """精排模型。
+
+    选长上下文的是有意的：512 token 那种上限会把「超长就摘要压缩再重试」逼出来，
+    而那条路径在长上下文模型上根本不需要存在（docs/ARCHITECTURE.md §3.3）。
+    """
+
+    model: NonEmptyStr = "BAAI/bge-reranker-v2-m3"
+    batch_size: int = Field(default=8, ge=1, le=1024)
+    #: 单条候选的 token 上限。同样**不要往下调**，理由见 `EmbedSettings.max_length`。
+    max_length: int = Field(default=8192, ge=1, le=32768)
+
+
 class Settings(BaseSettings):
     """全部配置。由 :func:`load_settings` 或 :func:`get_settings` 构造。"""
 
@@ -116,6 +155,10 @@ class Settings(BaseSettings):
     mongo: MongoSettings
     minio: MinioSettings
     llm: LlmSettings
+    # 三个模型配置组都有完整默认值：不配也能跑，配了才落进 .env
+    models: ModelSettings = Field(default_factory=ModelSettings)
+    embed: EmbedSettings = Field(default_factory=EmbedSettings)
+    rerank: RerankSettings = Field(default_factory=RerankSettings)
 
 
 def load_settings(env_file: str | Path | None = DEFAULT_ENV_FILE) -> Settings:

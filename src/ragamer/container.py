@@ -4,6 +4,8 @@
 `build_container` 每次都新建一套：调用两次得到两套互不相干的客户端。
 
 启动自检也在这里：`Container.check` 一次报出全部不通的服务。
+**两个模型不进自检**——它们的权重是几个 G，加载要等到第一次真的用到时；
+自检卡在这上面，`ragamer` 这条命令就没法当"配置对不对"的快速检查用了。
 """
 
 from __future__ import annotations
@@ -24,20 +26,24 @@ from ragamer.stores.base import (
 from ragamer.stores.chunks import MilvusChunkStore
 from ragamer.stores.documents import MongoDocStore
 from ragamer.stores.objects import MinioObjectStore
+from ragamer.vectors.base import Embedder, Reranker
+from ragamer.vectors.bge import BgeM3Embedder, BgeReranker
 
 logger = get_logger(__name__)
 
 
 @dataclass(frozen=True)
 class Container:
-    """一套存储客户端。测试里换成内存假件即可整条链路照跑。"""
+    """一套外部依赖。测试里换成内存假件即可整条链路照跑。"""
 
     chunks: ChunkStore
     docs: DocStore
     objects: ObjectStore
+    embedder: Embedder
+    reranker: Reranker
 
     def stores(self) -> tuple[Store, ...]:
-        """三个服务，自检按这个顺序走。"""
+        """三个存储服务，自检按这个顺序走。"""
         return (self.chunks, self.docs, self.objects)
 
     def check(self) -> None:
@@ -67,10 +73,15 @@ def _collect(failures: list[StoreUnavailableError], probe: Callable[[], None]) -
 
 
 def build_container(settings: Settings) -> Container:
-    """按配置构造三个客户端。构造只发生在这里。"""
+    """按配置构造全部外部依赖。构造只发生在这里。
+
+    两个模型在这里只是被造出来，权重等第一次真的要用时才加载（见 `ragamer.vectors.bge`）。
+    """
     timeout = settings.store_timeout_seconds
     return Container(
         chunks=MilvusChunkStore(settings.milvus, timeout=timeout),
         docs=MongoDocStore(settings.mongo, timeout=timeout),
         objects=MinioObjectStore(settings.minio, timeout=timeout),
+        embedder=BgeM3Embedder(settings.embed, settings.models),
+        reranker=BgeReranker(settings.rerank, settings.models),
     )
