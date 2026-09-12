@@ -5,10 +5,17 @@ description = "面向游戏攻略与资料的中文 RAG 助手"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    # 三个存储客户端。业务层只认 ragamer.stores 里的协议，不直接依赖这三个库
+    # 向量库；下限取 3.0 以对齐 Milvus v3 服务端（动态字段那个坑出在 v3.0.0）
+    "pymilvus>=3.0",
+    "pymongo>=4.9",
+    "minio>=7.2",
     # 配置装载的唯一入口；用到 dotenv_filtering，故下限取 2.15
     "pydantic-settings>=2.15",
     # 直接读 .env 做「未知键 / 取值被 ${…} 改写」这两项检查，pydantic-settings 不汇报
     "python-dotenv>=1.0",
+    # minio 的传输层就是 urllib3；要自定义 PoolManager 才能设连接超时并关掉重试
+    "urllib3>=2.0",
 ]
 
 [project.scripts]
