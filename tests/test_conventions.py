@@ -34,6 +34,7 @@ def test_守则扫到了源码():
         "__init__.py",
         "__main__.py",
         "config.py",
+        "llm.py",
         "logging.py",
     }
 

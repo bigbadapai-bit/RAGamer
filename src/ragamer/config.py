@@ -73,6 +73,13 @@ class LlmSettings(BaseModel):
     base_url: NonEmptyStr
     api_key: NonEmptySecret
     model: NonEmptyStr
+    #: 单次请求的超时（秒）。流式按两次产出之间的间隔计，不是整段答案的时长。
+    timeout: float = Field(default=60.0, gt=0, le=600)
+    #: 一次调用的总尝试次数（含首次）。有上限，重试不可能变成无限循环。
+    max_attempts: int = Field(default=3, ge=1, le=10)
+    #: 重试退避：起始间隔与封顶（秒），中间按 2 的幂增长。
+    backoff_base: float = Field(default=0.5, gt=0, le=60)
+    backoff_max: float = Field(default=8.0, gt=0, le=120)
 
 
 class Settings(BaseSettings):
