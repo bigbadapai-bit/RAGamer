@@ -10,6 +10,7 @@ from ragamer.__main__ import main
 from ragamer.config import Settings
 from ragamer.container import Container
 from ragamer.stores import InMemoryDocStore, InMemoryObjectStore
+from ragamer.vectors import FakeEmbedder, FakeReranker
 
 from .conftest import FailingStore
 
@@ -107,6 +108,8 @@ def test_存储连不上时退出码为_3_并点名服务与地址(settings_env,
             chunks=FailingStore("Milvus", "milvus.test:19530"),
             docs=InMemoryDocStore(),
             objects=InMemoryObjectStore(),
+            embedder=FakeEmbedder(),
+            reranker=FakeReranker(),
         ),
     )
 

@@ -53,6 +53,14 @@ def test_每个配置键都能从环境变量读入(settings_env):
     assert settings.llm.base_url == "https://llm.test/v1"
     assert settings.llm.api_key.get_secret_value() == "test-llm-api-key"
     assert settings.llm.model == "test-model"
+    assert settings.models.device == "cuda:1"
+    assert settings.models.fp16 is True
+    assert settings.embed.model == "test-embed-model"
+    assert settings.embed.batch_size == 16
+    assert settings.embed.max_length == 4096
+    assert settings.rerank.model == "test-rerank-model"
+    assert settings.rerank.batch_size == 32
+    assert settings.rerank.max_length == 2048
 
 
 def test_未给出可选项时取默认值(settings_env, monkeypatch):
@@ -61,6 +69,10 @@ def test_未给出可选项时取默认值(settings_env, monkeypatch):
         "RAGAMER_STORE_TIMEOUT_SECONDS",
         "RAGAMER_MILVUS_DB",
         "RAGAMER_MINIO_BUCKET",
+        "RAGAMER_MODELS_DEVICE",
+        "RAGAMER_MODELS_FP16",
+        "RAGAMER_EMBED_BATCH_SIZE",
+        "RAGAMER_RERANK_BATCH_SIZE",
     ):
         monkeypatch.delenv(key)
 
@@ -71,6 +83,25 @@ def test_未给出可选项时取默认值(settings_env, monkeypatch):
     assert settings.store_timeout_seconds == 5.0
     assert settings.milvus.db == "ragamer"
     assert settings.minio.bucket == "ragamer-images"
+    # 默认落在 CPU 与单精度上：这台机器上不一定有 GPU，CPU 上也用不了半精度
+    assert settings.models.device == "cpu"
+    assert settings.models.fp16 is False
+    assert settings.embed.batch_size == 8
+    assert settings.rerank.batch_size == 8
+
+
+def test_模型上下文上限默认是长上下文而不是_512(settings_env, monkeypatch):
+    """512 正好是原项目「超长就摘要压缩再重试」那条路径的来源。
+
+    两个库自己的默认值都是 512，照抄过来等于把坑搬回来——所以这里钉住默认值。
+    """
+    monkeypatch.delenv("RAGAMER_EMBED_MAX_LENGTH")
+    monkeypatch.delenv("RAGAMER_RERANK_MAX_LENGTH")
+
+    settings = load_settings(env_file=None)
+
+    assert settings.embed.max_length == 8192
+    assert settings.rerank.max_length == 8192
 
 
 @pytest.mark.parametrize("value", ["0", "-1", "很快"])

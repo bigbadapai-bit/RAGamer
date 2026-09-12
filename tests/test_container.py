@@ -18,6 +18,7 @@ from ragamer.stores import (
     ObjectStore,
     StoreCheckError,
 )
+from ragamer.vectors import Embedder, FakeEmbedder, FakeReranker, Reranker
 
 from .conftest import FailingStore
 
@@ -39,15 +40,24 @@ def _container(chunks=None, docs=None, objects=None) -> Container:
         chunks=chunks or InMemoryChunkStore(),
         docs=docs or InMemoryDocStore(),
         objects=objects or InMemoryObjectStore(),
+        embedder=FakeEmbedder(),
+        reranker=FakeReranker(),
     )
 
 
-def test_组合根按配置构造三个客户端(settings_env):
+def test_组合根按配置构造全部外部依赖(settings_env):
+    """造得出来这一条本身就是断言：真实模型是懒加载的，这里不该去碰几个 G 的权重。
+
+    跑测试的环境没有装可选的 models 组，所以只要组合根在构造时碰了模型，
+    这里就会以 ModelUnavailableError 炸掉。
+    """
     container = build_container(load_settings(env_file=None))
 
     assert isinstance(container.chunks, ChunkStore)
     assert isinstance(container.docs, DocStore)
     assert isinstance(container.objects, ObjectStore)
+    assert isinstance(container.embedder, Embedder)
+    assert isinstance(container.reranker, Reranker)
     # 出错信息里出现的地址已经抹掉凭据
     assert container.chunks.address == "http://milvus.test:19530"
     assert container.objects.address == "minio.test:9000"
@@ -55,9 +65,18 @@ def test_组合根按配置构造三个客户端(settings_env):
 
 
 def test_自检把三个服务都查一遍(settings_env):
-    """命名空间各由自己的 check 确保（Milvus 的库、MinIO 的桶），容器只管跑一遍。"""
+    """命名空间各由自己的 check 确保（Milvus 的库、MinIO 的桶），容器只管跑一遍。
+
+    两个模型不在自检里：它们的权重几个 G，等第一次真的要用时才加载。
+    """
     stores = [RecordingStore(f"服务{index}") for index in range(3)]
-    container = Container(chunks=stores[0], docs=stores[1], objects=stores[2])
+    container = Container(
+        chunks=stores[0],
+        docs=stores[1],
+        objects=stores[2],
+        embedder=FakeEmbedder(),
+        reranker=FakeReranker(),
+    )
 
     container.check()
 

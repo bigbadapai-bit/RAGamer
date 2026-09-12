@@ -11,6 +11,7 @@ from ragamer.config import get_settings
 from ragamer.container import Container
 from ragamer.stores.base import Chunk, StoreUnavailableError
 from ragamer.stores.memory import InMemoryChunkStore, InMemoryDocStore, InMemoryObjectStore
+from ragamer.vectors.fake import FakeEmbedder, FakeReranker
 
 #: 一组完整、合法的配置。每个键给不同的值，以便断言"读到的正是这个键"。
 #: 键名与模型的对应关系由 `tests/test_config.py::test_env_keys_列出模型读取的全部键` 兜住。
@@ -30,6 +31,14 @@ COMPLETE_ENV: dict[str, str] = {
     "RAGAMER_LLM_BASE_URL": "https://llm.test/v1",
     "RAGAMER_LLM_API_KEY": "test-llm-api-key",
     "RAGAMER_LLM_MODEL": "test-model",
+    "RAGAMER_MODELS_DEVICE": "cuda:1",
+    "RAGAMER_MODELS_FP16": "true",
+    "RAGAMER_EMBED_MODEL": "test-embed-model",
+    "RAGAMER_EMBED_BATCH_SIZE": "16",
+    "RAGAMER_EMBED_MAX_LENGTH": "4096",
+    "RAGAMER_RERANK_MODEL": "test-rerank-model",
+    "RAGAMER_RERANK_BATCH_SIZE": "32",
+    "RAGAMER_RERANK_MAX_LENGTH": "2048",
 }
 
 
@@ -50,7 +59,7 @@ def settings_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[di
 
 @pytest.fixture
 def memory_container() -> Container:
-    """整条链路的内存版：三个客户端全换成内存假件，一行云端代码都不碰。
+    """整条链路的内存版：三个客户端与两个模型全换成假件，一行云端代码、一个权重都不碰。
 
     需要"应用跑起来"的测试（启动自检、将来的 HTTP 缝）都从这里拿容器。
     """
@@ -58,6 +67,8 @@ def memory_container() -> Container:
         chunks=InMemoryChunkStore(),
         docs=InMemoryDocStore(),
         objects=InMemoryObjectStore(),
+        embedder=FakeEmbedder(),
+        reranker=FakeReranker(),
     )
 
 

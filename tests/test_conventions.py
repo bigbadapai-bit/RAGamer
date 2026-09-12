@@ -22,17 +22,26 @@ _CONTAINER_MODULE = _PACKAGE / "container.py"
 #: 读环境变量的名字。`from os import getenv` 之后是裸名字，只认属性会漏掉。
 _ENV_NAMES = {"environ", "environb", "getenv", "putenv", "load_dotenv"}
 
-#: 三个存储客户端的实现类。它们在组合根构造一次然后注入——模块级单例换不掉，
-#: 测试缝也就没了。
-_ADAPTERS = {"MilvusChunkStore", "MongoDocStore", "MinioObjectStore"}
+#: 三个存储客户端与两个模型适配器的实现类。它们在组合根构造一次然后注入——
+#: 模块级单例换不掉，测试缝也就没了。
+_ADAPTERS = {
+    "MilvusChunkStore",
+    "MongoDocStore",
+    "MinioObjectStore",
+    "BgeM3Embedder",
+    "BgeReranker",
+}
 
-#: 供应商库只允许出现在各自的适配器模块里：其余模块只认 ragamer.stores 的协议，
-#: 换后端不动业务代码。测试不在扫描范围内——造假件要用到供应商的异常类型。
+#: 供应商库只允许出现在各自的适配器模块里：其余模块只认 ragamer.stores 与
+#: ragamer.vectors 的协议，换后端、换模型都不动业务代码。
+#: 测试不在扫描范围内——造假件要用到供应商的异常类型。
 _VENDOR_MODULES = {
     "pymilvus": _PACKAGE / "stores" / "chunks.py",
     "pymongo": _PACKAGE / "stores" / "documents.py",
     "minio": _PACKAGE / "stores" / "objects.py",
     "urllib3": _PACKAGE / "stores" / "objects.py",
+    # 真实模型是可选的 models 组，bge 里对它是懒导入（没装也能 import 本模块）
+    "FlagEmbedding": _PACKAGE / "vectors" / "bge.py",
 }
 
 
@@ -55,10 +64,13 @@ def test_守则扫到了源码():
         "chunks.py",
         "documents.py",
         "objects.py",
+        "base.py",
+        "bge.py",
+        "fake.py",
     }
 
 
-def test_存储客户端只在组合根构造():
+def test_存储客户端与模型适配器只在组合根构造():
     """没有任何模块级单例——单例在测试里换不成内存假件。"""
     offenders = [
         f"{path.name}:{node.lineno}"
@@ -68,7 +80,7 @@ def test_存储客户端只在组合根构造():
         if _calls_adapter(node)
     ]
 
-    assert offenders == [], f"客户端只在 ragamer.container 构造：{offenders}"
+    assert offenders == [], f"客户端与模型适配器只在 ragamer.container 构造：{offenders}"
 
 
 def _calls_adapter(node: ast.AST) -> bool:
