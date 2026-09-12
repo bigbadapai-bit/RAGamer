@@ -1,6 +1,6 @@
 """切分器：结构探测、祖先标题路径与降级切分。
 
-这是架构文档定下的「缝一」：纯函数、零 I/O、零假件，测试直接调它。
+这是规格 #1 定下的「缝一」：纯函数、零 I/O、零假件，测试直接调它。
 切分参数收窄到能一眼数清的程度，断言才写得实。
 
 表格原子化与打标不在这里——它们各有各的票，测试也各有各的文件。
@@ -194,7 +194,7 @@ def test_切片顺序能还原文档顺序():
 # --- 结构探测 ---
 
 
-def test_标题密度低的文档退化为递归切分():
+def test_标题稀疏的扁平文档退化为递归切分():
     markdown = f"# 资料\n\n{_plain_lines(60)}\n"
     probe = probe_structure(markdown, RULES)
 
@@ -231,9 +231,26 @@ def test_标题稀疏但带_MediaWiki_特征的文档仍按结构切():
 def test_探测结果带上判定依据():
     probe = probe_structure(WIKI_ARTICLE, RULES)
 
-    assert probe.headings == 4
-    assert probe.body_lines == 3
+    assert probe.heading_count == 4
+    assert probe.body_line_count == 3
     assert probe.density == 4 / 3
+
+
+def test_正文全是代码块的文档仍按标题切():
+    # 围栏里的行也算正文行，否则这份文档的密度恒为 0，会被误判成扁平——
+    # 标题丢了路径，`#` 还漏回正文里
+    markdown = "# 配置\n\n```sh\nuv sync\nuv run ragamer\n```\n"
+
+    assert probe_structure(markdown, RULES).structured is True
+
+    chunks = chunk_document(markdown, RULES)
+
+    assert _paths(chunks) == ["配置"]
+    assert "# 配置" not in chunks[0].content
+
+
+def test_只有标题的文档不落进扁平切分():
+    assert probe_structure("# 一\n\n## 二\n", RULES).structured is True
 
 
 def test_空文档探不出结构():

@@ -1,6 +1,7 @@
 """切分器：把 Markdown 切成切片。纯函数，不碰网络与数据库。
 
-全项目边角最多的一段，也是唯一值得逐条钉死的地方（架构文档「缝一」）。三件事：
+全项目边角最多的一段，也是规格 #1 的测试决策里定下「缝一」的理由：纯函数、零假件，
+测试直接调它，失败就落在出错的那一行。三件事：
 
 - **结构探测**：有可用的标题结构就按标题层级切，**每个切片带完整祖先标题路径**
   （`二郎神 › 打法 › 第二阶段`，不是只记一层父标题）；标题稀疏的文档退化为递归切分
@@ -29,7 +30,8 @@ _HEADING = re.compile(r"^(#{1,6})\s+(.*)$")
 #: 围栏标记：三个及以上的反引号或波浪线。
 _FENCE = re.compile(r"^(`{3,}|~{3,})")
 
-#: MinerU 折叠块的标记。只去标记，块内的图内文字留着。
+#: MinerU 折叠块的标记。只去标记，块内的图内文字留着——按 MinerU 产物的形态换：
+#: 正文里若真的在讲 `<details>` 这个元素，那几个字符也会一并去掉。
 _FOLD_TAG = re.compile(r"</?(?:details|summary)(?:\s[^>]*)?>", re.IGNORECASE)
 
 #: Markdown 表格的分隔行。有它才说明这是个表格块——结构探测的一个信号。
@@ -74,56 +76,65 @@ class Chunk:
 
 @dataclass(frozen=True)
 class StructureProbe:
-    """结构探测的结果。判定依据一并带出来，排障与切分预览都用得上。"""
+    """结构探测的结果。
 
-    headings: int
-    body_lines: int
+    判定依据一并带出来：这几个门槛都是经验值（见 `ChunkRules`），判定不合预期时
+    要能看见是哪个信号把它推过去的，否则只能对着一个布尔值猜。
+    """
+
+    #: 标题行数。
+    heading_count: int
+    #: 正文行数。围栏代码块按它的行数计——代码也是正文，见 `_probe`。
+    body_line_count: int
+    #: 标题行占正文行的比，也就是主信号。
     density: float
+    #: 有没有表格块。
     has_table: bool
+    #: 有没有 MediaWiki 特征（`[[内链]]` / `Category:` / `{{模板}}`）。
     mediawiki: bool
+    #: 最终判定：按标题层级切，还是退化为扁平切分。
     structured: bool
 
 
 def chunk_document(markdown: str, rules: ChunkRules | None = None) -> list[Chunk]:
     """把一份 Markdown 切成切片。纯函数：不联网、不落库、不读配置。"""
-    rules = rules if rules is not None else ChunkRules()
+    rules = rules or ChunkRules()
     blocks = _scan(markdown)
     pieces = _hierarchy_pieces(blocks) if _probe(blocks, rules).structured else _flat_pieces(blocks)
 
     chunks: list[Chunk] = []
     for piece in pieces:
-        texts = (
-            [piece.text]
-            if len(piece.text) <= rules.max_chars
-            else _split_semantically(piece.text, rules)
-        )
-        for text in texts:
-            if text.strip():
-                chunks.append(Chunk(text, len(chunks), piece.path))
+        for text in _split(piece.text, rules):
+            chunks.append(Chunk(text, len(chunks), piece.path))
     return chunks
 
 
 def probe_structure(markdown: str, rules: ChunkRules | None = None) -> StructureProbe:
     """探测这份文档有没有可用的标题结构。
 
-    判定信号按架构文档的权重：**标题密度为主**，表格块与 MediaWiki 特征为辅——
+    判定信号按架构文档 §1.4 的权重：**标题密度为主**，表格块与 MediaWiki 特征为辅——
     带表格或 `[[内链]]` / `Category:` / `{{模板}}` 的文档，即使标题稀疏也是词条页，
     按结构切比按长度切更贴它的本来面目。
     架构文档列的第四个信号「平均段落长度」还没用上：它与密度同向变化，
     在没有真实语料能标定阈值之前加进来只会多一个拍出来的数。
     """
-    return _probe(_scan(markdown), rules if rules is not None else ChunkRules())
+    return _probe(_scan(markdown), rules or ChunkRules())
 
 
 def _probe(blocks: Sequence[_Block], rules: ChunkRules) -> StructureProbe:
+    prose = [block.text for block in blocks if block.kind == "text" and block.text.strip()]
     headings = sum(1 for block in blocks if block.kind == "heading")
-    body = [block.text for block in blocks if block.kind == "text" and block.text.strip()]
-    has_table = any(_TABLE_RULE.match(line) for line in body)
-    mediawiki = any(_MEDIAWIKI.search(line) for line in body)
-    density = headings / len(body) if body else 0.0
+    # 围栏里的行也算正文行：一份正文全是代码的文档照样有标题结构，漏掉它们会让
+    # 密度恒为 0，整篇被误判成扁平——于是标题丢了路径，`#` 还漏回正文里去
+    code_lines = sum(len(block.text.splitlines()) for block in blocks if block.kind == "fence")
+    body_lines = len(prose) + code_lines
+    has_table = any(_TABLE_RULE.match(line) for line in prose)
+    mediawiki = any(_MEDIAWIKI.search(line) for line in prose)
+    # 有标题就先把分母垫到 1：只有标题的文档不该因为没有正文而被判成扁平
+    density = headings / max(body_lines, 1)
     return StructureProbe(
-        headings=headings,
-        body_lines=len(body),
+        heading_count=headings,
+        body_line_count=body_lines,
         density=density,
         has_table=has_table,
         mediawiki=mediawiki,
@@ -137,7 +148,7 @@ class _Block:
     """扫出来的一行，或一整个围栏代码块。"""
 
     kind: Literal["heading", "text", "fence"]
-    #: 标题的正文（不含 `#`）；其余情况是原始行。
+    #: 标题的正文（不含 `#`）；围栏块是整块（含首尾标记）；其余情况是原始行。
     text: str
     #: 标题层级，一至六级；其余情况是 0。
     level: int = 0
@@ -147,7 +158,9 @@ class _Block:
 class _Piece:
     """一段待切的正文，以及它在源文档标题目录中的位置。"""
 
+    #: 正文。同一个祖先标题路径底下的行连成一段。
     text: str
+    #: 祖先标题路径。不在任何标题底下时是空串。
     path: str
 
 
@@ -215,12 +228,13 @@ def _hierarchy_pieces(blocks: Sequence[_Block]) -> list[_Piece]:
     """按标题层级切：每个标题底下的正文是一段，路径带上它的全部祖先标题。"""
     pieces: list[_Piece] = []
     buffer: list[str] = []
-    stack: list[tuple[int, str]] = []
+    # 还开着的标题，从根往下。栈上放的就是那些标题块本身
+    opened: list[_Block] = []
 
     def flush() -> None:
         text = "\n".join(buffer).strip()
         if text:
-            pieces.append(_Piece(text, PATH_SEPARATOR.join(title for _, title in stack)))
+            pieces.append(_Piece(text, PATH_SEPARATOR.join(heading.text for heading in opened)))
         buffer.clear()
 
     for block in blocks:
@@ -229,9 +243,9 @@ def _hierarchy_pieces(blocks: Sequence[_Block]) -> list[_Piece]:
             continue
         flush()
         # 回过头去到同级的上一层：`## 打法` 之后再出现 `## 掉落`，它不该认打法做父亲
-        while stack and stack[-1][0] >= block.level:
-            stack.pop()
-        stack.append((block.level, block.text))
+        while opened and opened[-1].level >= block.level:
+            opened.pop()
+        opened.append(block)
     flush()
     return pieces
 
@@ -247,13 +261,19 @@ def _source_line(block: _Block) -> str:
     return f"{'#' * block.level} {block.text}" if block.kind == "heading" else block.text
 
 
-def _split_semantically(text: str, rules: ChunkRules) -> list[str]:
-    """按语义边界递归切开一段超长正文，再把过短的相邻片并回去。"""
+def _split(text: str, rules: ChunkRules) -> list[str]:
+    """把一段正文切成若干片，每片不超过上限，也不留下读不成句的碎片。
+
+    本来就装得下的一段原样留成一片；超长的按语义边界递归切开，再把过短的相邻片
+    并回去（见 `_cut_by` 与 `_merge`）。
+    """
+    if len(text) <= rules.max_chars:
+        return [text] if text.strip() else []
     return _merge(_cut_by(text, rules, _SEPARATORS), rules)
 
 
 def _cut_by(text: str, rules: ChunkRules, separators: tuple[str, ...]) -> list[str]:
-    """按 `separators` 从粗到细地切；切完仍旧超长的片段，换更细的边界再切。
+    """按 `separators` 从粗到细地切；切完仍旧超长的那些候选片，换更细的边界再切。
 
     边界留在前一片的尾巴上（`_split_keep`），所以拼回去与原文一致——
     合并时直接相接即可，不必再补分隔符。
