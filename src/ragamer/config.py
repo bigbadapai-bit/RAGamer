@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Annotated, Any, Literal
 
 from dotenv import dotenv_values
-from pydantic import BaseModel, Field, SecretStr, ValidationError
+from pydantic import BaseModel, Field, SecretStr, ValidationError, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict, SettingsError
 
 #: 所有键的前缀。与原项目共享同一台机器时靠它避免环境变量串味。
@@ -47,6 +47,20 @@ class MilvusSettings(BaseModel):
     uri: NonEmptyStr
     token: NonEmptySecret
     db: NonEmptyStr = "ragamer"
+
+    @field_validator("db")
+    @classmethod
+    def _reject_shared_namespace(cls, value: str) -> str:
+        """`default` 是每个 Milvus 实例都自带的库，原项目八成就在里面。
+
+        两个项目共用实例时撞进同一个库，检索就会捞到对方的数据——而且是静默的。
+        """
+        if value == "default":
+            raise ValueError(
+                "不能叫 default：那是 Milvus 自带的库，与原项目共用实例时会撞在一起。"
+                "请换一个只属于本项目的库名"
+            )
+        return value
 
 
 class MongoSettings(BaseModel):
@@ -95,6 +109,9 @@ class Settings(BaseSettings):
     )
 
     log_level: LogLevel = "INFO"
+    # 外部存储的连接与自检超时。远端不可达时要在这一点时间内失败，
+    # 而不是挂在启动上——三个客户端共用同一个值，原项目标定的是 5 秒。
+    store_timeout_seconds: Annotated[float, Field(gt=0)] = 5.0
     milvus: MilvusSettings
     mongo: MongoSettings
     minio: MinioSettings
@@ -226,7 +243,9 @@ _HINTS = {
     "string_too_short": "不能为空",
     "too_short": "不能为空",
     "int_parsing": "必须是整数",
+    "float_parsing": "必须是数字",
     "bool_parsing": "必须是 true 或 false",
+    "greater_than": "必须大于 0",
 }
 
 
@@ -268,4 +287,8 @@ def _keys_of(error: Mapping[str, Any]) -> list[str]:
 
 
 def _hint(error: Mapping[str, Any]) -> str:
-    return _HINTS.get(str(error["type"]), str(error["msg"]))
+    hint = _HINTS.get(str(error["type"]))
+    if hint is not None:
+        return hint
+    # 校验器自己抛的 ValueError，pydantic 会加一层 "Value error, " 前缀
+    return str(error["msg"]).removeprefix("Value error, ")

@@ -11,8 +11,11 @@
 ```bash
 uv sync                  # 建虚拟环境、装依赖
 cp .env.example .env     # 然后按注释把值填成自己的
-uv run ragamer           # 配置自检：通过则打印生效的配置摘要
+uv run ragamer           # 启动自检：配置合格、Milvus/Mongo/MinIO 都连得上才通过
 ```
+
+退出码 `0` 通过、`2` 配置有问题、`3` 存储连不上——远端不可达时在
+`RAGAMER_STORE_TIMEOUT_SECONDS` 秒内失败，错误信息里点名是哪个服务、哪个地址。
 
 ## 常用命令
 
@@ -34,10 +37,22 @@ CI 在每次 push 与 PR 上跑 lint、格式检查与测试，见 [`.github/wor
 - **取值按字面读取**：`.env` 默认会做 `${…}` 插值、静默改写取值，因此这类写法一律在启动时报错。
 - 日志统一走 `ragamer.logging`，源码里不出现 `print`（同样由 `tests/test_conventions.py` 拦截）。
 
+## 存储
+
+三个外部存储各自定义成一个协议（`ragamer.stores`），实现类**只在组合根 `ragamer.container` 构造一次**，
+没有任何模块级单例——这条由 `tests/test_conventions.py` 机械拦截。
+
+- 换后端不动业务代码：业务层只认协议，`pymilvus` / `pymongo` / `minio` 只允许出现在各自的适配器模块里。
+- 测试不依赖云端：`ragamer.stores.memory` 里的内存假件实现同一组协议，测试里整体替换。
+  真的连云端的那部分标了 `integration`，默认不跑，`uv run pytest -m integration` 才跑（需要填好的 `.env`）。
+- 与原项目共用实例、**命名空间错开**：Milvus 用 database（不接受 `default`）、MinIO 换桶名、Mongo 换库名。
+- 切片存储的过滤条件只收结构化对象，不接受字符串表达式——表达式的生成与取值转义都封在适配器里。
+
 ## 目录
 
 ```
-src/ragamer/    应用代码（config 配置装载、logging 日志、__main__ 启动自检）
-tests/          测试：行为测试 + 结构约束
-docs/           架构文档、ADR、给 agent 的说明
+src/ragamer/         应用代码（config 配置装载、logging 日志、container 组合根、__main__ 启动自检）
+src/ragamer/stores/  存储适配器：base 协议与共享类型、chunks Milvus、documents Mongo、objects MinIO、memory 内存假件
+tests/               测试：行为测试 + 结构约束 + 集成测试
+docs/                架构文档、ADR、给 agent 的说明
 ```

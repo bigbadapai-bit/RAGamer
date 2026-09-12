@@ -1,6 +1,7 @@
 """`ragamer` 命令：启动自检。
 
-阶段 0 能自检的只有配置本身——存储连通性检查随 T02 接到同一条启动路径上。
+配置装载 → 按配置构造组合根 → 三个存储逐个连通性自检。任一步失败都不放行，
+退出码区分是哪一类问题。存储自检要连云端，测试里把 `build_container` 换成内存假件。
 """
 
 from __future__ import annotations
@@ -8,9 +9,17 @@ from __future__ import annotations
 import logging
 
 from ragamer.config import ConfigError, Settings, get_settings
+from ragamer.container import build_container
 from ragamer.logging import get_logger, setup_logging
+from ragamer.redaction import redact_address
+from ragamer.stores.base import StoreError
 
 logger = get_logger(__name__)
+
+#: 退出码。配置问题与服务不可达分开，脚本里能分别处理。
+EXIT_OK = 0
+EXIT_CONFIG = 2
+EXIT_STORE = 3
 
 
 def describe(settings: Settings) -> str:
@@ -18,38 +27,40 @@ def describe(settings: Settings) -> str:
     return "\n".join(
         [
             f"log_level={settings.log_level}",
-            f"milvus: uri={_redact(settings.milvus.uri)} db={settings.milvus.db} token=已配置",
+            f"store_timeout_seconds={settings.store_timeout_seconds:g}",
+            f"milvus: uri={redact_address(settings.milvus.uri)} db={settings.milvus.db}"
+            " token=已配置",
             f"mongo: uri=已配置 db={settings.mongo.db}",
-            f"minio: endpoint={_redact(settings.minio.endpoint)} bucket={settings.minio.bucket}"
+            f"minio: endpoint={redact_address(settings.minio.endpoint)}"
+            f" bucket={settings.minio.bucket}"
             f" secure={settings.minio.secure} access_key=已配置 secret_key=已配置",
-            f"llm: base_url={_redact(settings.llm.base_url)} model={settings.llm.model}"
+            f"llm: base_url={redact_address(settings.llm.base_url)} model={settings.llm.model}"
             " api_key=已配置",
         ]
     )
 
 
-def _redact(address: str) -> str:
-    """抹掉地址里的账号密码与查询串：`user:pass@host`、`?api_key=…` 都可能带凭据。"""
-    scheme, separator, rest = address.partition("//")
-    if not separator:
-        rest, scheme = scheme, ""
-    return f"{scheme}{separator}{rest.partition('?')[0].rpartition('@')[2]}"
-
-
 def main() -> int:
-    """装载配置并输出自检结果。0 = 通过，2 = 配置有问题。"""
+    """装载配置、构造存储、自检。0 = 通过，2 = 配置有问题，3 = 服务不可达。"""
     setup_logging()  # 先按默认等级装上，配置装载失败时才有地方报错
     try:
         settings = get_settings()
     except ConfigError as exc:
         logger.error("%s", exc)
-        return 2
+        return EXIT_CONFIG
 
     setup_logging(settings.log_level)
     # 自检报告是这条命令的输出，不该被 RAGAMER_LOG_LEVEL 吞掉
     logger.setLevel(logging.INFO)
     logger.info("配置自检通过\n%s", describe(settings))
-    return 0
+
+    container = build_container(settings)
+    try:
+        container.check()
+    except StoreError as exc:
+        logger.error("%s", exc)
+        return EXIT_STORE
+    return EXIT_OK
 
 
 if __name__ == "__main__":

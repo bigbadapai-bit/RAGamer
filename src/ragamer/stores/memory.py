@@ -1,0 +1,157 @@
+"""内存假件：与三个真实客户端实现同一组协议。
+
+测试里把整条链路换到这三个上，一行云端代码都不碰（`tests/test_stores_memory.py`）。
+过滤语义走 `base.matches`、collection 名走 `base.collection_name`——与真实适配器同一份规则，
+所以在内存上跑过的行为，接线到云端仍然成立。
+
+打分只走稠密一路：本层要验证的是**接线**（过滤条件是否生效、顺序、引用组装），
+不是语义相似度。哈希假向量完全够用，而且确定。
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping, Sequence
+from typing import Any
+
+from ragamer.stores.base import (
+    Chunk,
+    ChunkFilter,
+    ChunkHit,
+    StoreError,
+    collection_name,
+    matches,
+    normalize_prefix,
+    require_vectors,
+)
+
+#: 假件的名字与地址：它们永远不会报"连不上"，这两个字段只为凑齐协议。
+NAME = "内存假件"
+ADDRESS = "内存"
+
+
+def _dot(left: Sequence[float], right: Sequence[float]) -> float:
+    """内积。真实那边稠密向量配 IP 度量（向量化时归一化过），口径一致。"""
+    return sum(a * b for a, b in zip(left, right, strict=False))
+
+
+class InMemoryChunkStore:
+    """内存里的切片存储。"""
+
+    name = NAME
+    address = ADDRESS
+
+    def __init__(self) -> None:
+        self._collections: dict[str, dict[int, Chunk]] = {}
+
+    def check(self) -> None:
+        """内存里没有可检查的东西。"""
+
+    def ensure_collection(self, game_id: str) -> None:
+        self._collection(collection_name(game_id))
+
+    def upsert(self, game_id: str, chunks: Sequence[Chunk]) -> None:
+        rows = self._collection(collection_name(game_id))
+        for chunk in chunks:
+            require_vectors(chunk)
+            rows[chunk.chunk_id] = chunk
+
+    def search(
+        self,
+        game_id: str,
+        *,
+        dense: Sequence[float],
+        sparse: Mapping[int, float] | None = None,
+        where: ChunkFilter | None = None,
+        limit: int = 10,
+    ) -> list[ChunkHit]:
+        """按稠密内积排序；稀疏一路不参与打分（见模块说明）。"""
+        hits = [
+            ChunkHit(chunk=chunk, score=_dot(dense, chunk.dense_vector or ()))
+            for chunk in self._collection(collection_name(game_id)).values()
+            if matches(chunk, where)
+        ]
+        # 分数相同时按 chunk_id 定序，结果与写入顺序无关
+        hits.sort(key=lambda hit: (-hit.score, hit.chunk.chunk_id))
+        return hits[:limit]
+
+    def fetch_document(self, game_id: str, doc_title: str, *, version: str) -> list[Chunk]:
+        where = ChunkFilter(doc_title=doc_title, version=version)
+        chunks = [
+            chunk
+            for chunk in self._collection(collection_name(game_id)).values()
+            if matches(chunk, where)
+        ]
+        return sorted(chunks, key=lambda chunk: chunk.chunk_index)
+
+    def drop(self, game_id: str) -> None:
+        self._collections.pop(collection_name(game_id), None)
+
+    def _collection(self, game_id: str) -> dict[int, Chunk]:
+        return self._collections.setdefault(game_id, {})
+
+
+class InMemoryDocStore:
+    """内存里的文档存储。"""
+
+    name = NAME
+    address = ADDRESS
+
+    def __init__(self) -> None:
+        self._collections: dict[str, dict[str, dict[str, Any]]] = {}
+
+    def check(self) -> None:
+        """内存里没有可检查的东西。"""
+
+    def get(self, collection: str, doc_id: str) -> dict[str, Any] | None:
+        document = self._collections.get(collection, {}).get(doc_id)
+        return None if document is None else dict(document)
+
+    def put(self, collection: str, doc_id: str, document: Mapping[str, Any]) -> None:
+        # 真客户端会丢掉载荷里的 `_id`（id 是参数不是载荷），这里照做，行为对齐
+        payload = {key: value for key, value in document.items() if key != "_id"}
+        self._collections.setdefault(collection, {})[doc_id] = payload
+
+    def delete(self, collection: str, doc_id: str) -> None:
+        self._collections.get(collection, {}).pop(doc_id, None)
+
+    def list_ids(self, collection: str) -> list[str]:
+        return sorted(self._collections.get(collection, {}))
+
+
+class InMemoryObjectStore:
+    """内存里的对象存储。桶是隐含的：有对象就算有桶。"""
+
+    name = NAME
+    address = ADDRESS
+
+    def __init__(self) -> None:
+        self._objects: dict[str, bytes] = {}
+
+    def check(self) -> None:
+        """内存里没有可检查的东西。"""
+
+    def ensure_bucket(self) -> None:
+        """内存里没有桶这个概念。"""
+
+    def put(self, key: str, data: bytes, *, content_type: str = "application/octet-stream") -> None:
+        self._objects[normalize_prefix(key)] = data
+
+    def get(self, key: str) -> bytes:
+        normalized = normalize_prefix(key)
+        if normalized not in self._objects:
+            # 与真实客户端同一个异常类型：缝里跑过的分支，接到云端还是同一条
+            raise StoreError(f"{self.name} 上没有这个对象：{key}")
+        return self._objects[normalized]
+
+    def delete(self, key: str) -> None:
+        self._objects.pop(normalize_prefix(key), None)
+
+    def list_keys(self, prefix: str = "") -> list[str]:
+        start = normalize_prefix(prefix)
+        return sorted(key for key in self._objects if key.startswith(start))
+
+    def delete_prefix(self, prefix: str) -> int:
+        keys = self.list_keys(prefix)
+        for key in keys:
+            del self._objects[key]
+        return len(keys)

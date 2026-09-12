@@ -103,7 +103,7 @@ flowchart LR
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `chunk_id` | INT64 | 自增主键 |
+| `chunk_id` | INT64 | 主键。**由导入侧分配**，不用服务端自增 —— 重导一份文档要能覆盖同一批 id |
 | `content` | VARCHAR | 正文。图片的 VLM 摘要与二次 OCR 文字都在这里。**参与向量化** |
 | `content_meta` | VARCHAR | 不参与向量化的附加文本（表格长列、Infobox 原始字段）。随结果返回但不打分 |
 | `ancestor_path` | VARCHAR | **祖先标题路径**，如 `二郎神 › 打法 › 第二阶段` |
