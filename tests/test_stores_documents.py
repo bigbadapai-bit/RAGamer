@@ -44,9 +44,14 @@ class FakeDatabase:
     def __init__(self, name: str) -> None:
         self.name = name
         self.collections: dict[str, FakeCollection] = {}
+        self.listed = 0
 
     def __getitem__(self, collection: str) -> FakeCollection:
         return self.collections.setdefault(collection, FakeCollection())
+
+    def list_collection_names(self) -> list[str]:
+        self.listed += 1
+        return sorted(self.collections)
 
 
 class FakeMongoClient:
@@ -100,10 +105,13 @@ def test_连接串与超时按配置传给_Mongo(store, mongo):
     assert client.init_kwargs["connectTimeoutMS"] == 2500
 
 
-def test_自检就是_ping_一次(store, mongo):
+def test_自检探的是本项目的库(store, mongo):
+    """`ping` 匿名连接也能成功，试不出鉴权；列本库的集合才能证明权限落在了自己库上。"""
     store.check()
 
-    assert _client(mongo).pings == 1
+    client = _client(mongo)
+    assert client.pings == 0
+    assert client["ragamer-test"].listed == 1
 
 
 def test_构造时不连服务(store, mongo):

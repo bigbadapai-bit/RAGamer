@@ -37,9 +37,14 @@ class MongoDocStore:
         self._client: MongoClient | None = None
 
     def check(self) -> None:
-        """连通性自检：ping 一次。地址不通或凭据被拒都在这条路上报出来。"""
+        """连通性自检：在本项目的库上做一次只读探测。
+
+        🔴 用 `ping` 不行：服务端开了鉴权时，**匿名连接 ping 照样成功**——
+        自检放行，等真去读写才报 Unauthorized。列一次本库的集合就能试出到底有没有
+        权限落到自己的库上（库不存在也会正常返回空列表，不会平白建一个出来）。
+        """
         try:
-            self._connect().admin.command("ping")
+            self._connect()[self._db].list_collection_names()
         except _FAILURES as exc:
             raise unavailable(self.name, self.address, self._timeout, exc) from exc
 

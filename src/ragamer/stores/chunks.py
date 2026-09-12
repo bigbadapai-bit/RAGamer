@@ -63,6 +63,12 @@ SPARSE_INDEX_ALGO = "DAAT_MAXSCORE"
 #: 建索引的标量字段。聚合父块要靠它们回查同文档的兄弟切片。
 INDEXED_SCALARS = ("doc_title", "version")
 
+#: 一致性级别。不能用默认的 Bounded：写入的数据先落在增长段上，此时做混合检索
+#: 服务端会直接报 `service internal error: unsupported ID type`（Milvus 3.0 实测），
+#: 而"导入完立刻提问"正是本项目的主流程。Strong 让检索等到最新时间戳，
+#: 本项目这个数据量下代价可接受。
+CONSISTENCY_LEVEL = "Strong"
+
 #: 各 VARCHAR 字段的长度上限。Milvus 要求显式给，超长会在写入时报错——
 #: 报错好过静默截断，但上限要留得够宽，别把正常内容卡在门外。
 _MAX_LENGTH = {
@@ -168,8 +174,11 @@ def filter_expression(where: ChunkFilter | None) -> str:
         ("game_terms", where.game_terms),
     ):
         if values:
+            # ANY 而不是 ARRAY_CONTAINS：后者只收单个字面量，给列表会在服务端解析失败
+            # （"cannot cast value to VarChar, value: array_val"）。语义上这里要的正是
+            # 「任一命中」——主体类型不互斥，"二郎神的技能"同时属于角色与技能。
             literals = ", ".join(_quote(value) for value in values)
-            clauses.append(f"ARRAY_CONTAINS({name}, [{literals}])")
+            clauses.append(f"ARRAY_CONTAINS_ANY({name}, [{literals}])")
     return " and ".join(clauses)
 
 
@@ -281,6 +290,7 @@ class MilvusChunkStore:
                 collection_name=name,
                 schema=chunk_schema(),
                 index_params=chunk_index_params(),
+                consistency_level=CONSISTENCY_LEVEL,
                 timeout=self._timeout,
             )
             logger.info("新建 Milvus collection %s", name)

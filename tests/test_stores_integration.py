@@ -73,7 +73,8 @@ def probe_chunks() -> Iterator[list[Chunk]]:
 def test_建表_写入_检索_取回_删表(settings: Settings, probe_chunks: list[Chunk]):
     """一条走完的链路。任何一步不对，都说明接到云端这层出了问题。"""
     container = build_container(settings)
-    container.check()
+    # 各服务自检自己那一个：某个服务没配好，不该把别的服务的用例一起拖死
+    container.chunks.check()
     try:
         container.chunks.ensure_collection(PROBE_GAME)
         # 建表是幂等的：再跑一次不该炸
@@ -102,7 +103,7 @@ def test_建表_写入_检索_取回_删表(settings: Settings, probe_chunks: li
 def test_未标注版本的切片在版本过滤下也取得到(settings: Settings, probe_chunks: list[Chunk]):
     """漏掉"未标注版本"这一支是静默失效，只能靠真检索抓。"""
     container = build_container(settings)
-    container.check()
+    container.chunks.check()
     unversioned = make_chunk(
         3,
         game_id=PROBE_GAME,
@@ -126,7 +127,7 @@ def test_未标注版本的切片在版本过滤下也取得到(settings: Settin
 
 def test_对象存储能存能取能清(settings: Settings):
     container = build_container(settings)
-    container.check()
+    container.objects.check()
     try:
         container.objects.put(PROBE_PREFIX + "探针.txt", b"probe", content_type="text/plain")
 
@@ -139,7 +140,7 @@ def test_对象存储能存能取能清(settings: Settings):
 
 def test_文档存储能存能取能删(settings: Settings):
     container = build_container(settings)
-    container.check()
+    container.docs.check()
     document = {"probe": PROBE_GAME}
     try:
         container.docs.put(PROBE_COLLECTION, "probe", document)

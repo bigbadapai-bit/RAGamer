@@ -207,17 +207,29 @@ def test_倒排索引建在回查兄弟切片的两个字段上():
         (ChunkFilter(chunk_type="table"), 'chunk_type == "table"'),
         (
             ChunkFilter(subject_types=("character", "skill")),
-            'ARRAY_CONTAINS(subject_type, ["character", "skill"])',
+            'ARRAY_CONTAINS_ANY(subject_type, ["character", "skill"])',
         ),
         (
             ChunkFilter(version="1.2", doc_title="二郎神", content_natures=("guide",)),
             'version in ["1.2", ""] and doc_title == "二郎神"'
-            ' and ARRAY_CONTAINS(content_nature, ["guide"])',
+            ' and ARRAY_CONTAINS_ANY(content_nature, ["guide"])',
         ),
     ],
 )
 def test_过滤条件翻成表达式(where: ChunkFilter | None, expected: str):
     assert filter_expression(where) == expected
+
+
+def test_数组过滤用_ANY_而不是_CONTAINS():
+    """`ARRAY_CONTAINS(field, [列表])` 在 Milvus 3.0 上解析失败：它只收单个字面量。
+
+    服务端原话：`cannot cast value to VarChar, value: array_val:{...}`。
+    语义上这里要的也正是"任一命中"——主体类型不互斥。
+    """
+    expression = filter_expression(ChunkFilter(subject_types=("character", "skill")))
+
+    assert expression == 'ARRAY_CONTAINS_ANY(subject_type, ["character", "skill"])'
+    assert "ARRAY_CONTAINS(" not in expression
 
 
 def test_版本过滤带上未标注版本():
@@ -315,6 +327,13 @@ def test_建_collection_时带上完整_schema_与索引参数(store, milvus):
         "dense_vector",
         "sparse_vector",
     }
+
+
+def test_建_collection_时用_Strong_一致性(store, milvus):
+    """Bounded（pymilvus 的默认）下刚写入的数据还在增长段，混合检索会直接报错。"""
+    store.ensure_collection("black_myth")
+
+    assert _client(milvus).called("create_collection")[0]["consistency_level"] == "Strong"
 
 
 def test_重复确保同一个_collection_时只建一次(store, milvus):
