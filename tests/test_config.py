@@ -39,6 +39,7 @@ def test_每个配置键都能从环境变量读入(settings_env):
     settings = load_settings(env_file=None)
 
     assert settings.log_level == "DEBUG"
+    assert settings.store_timeout_seconds == 2.5
     assert settings.milvus.uri == "http://milvus.test:19530"
     assert settings.milvus.token.get_secret_value() == "test-milvus-token"
     assert settings.milvus.db == "ragamer-test"
@@ -55,14 +56,43 @@ def test_每个配置键都能从环境变量读入(settings_env):
 
 
 def test_未给出可选项时取默认值(settings_env, monkeypatch):
-    for key in ("RAGAMER_LOG_LEVEL", "RAGAMER_MILVUS_DB", "RAGAMER_MINIO_BUCKET"):
+    for key in (
+        "RAGAMER_LOG_LEVEL",
+        "RAGAMER_STORE_TIMEOUT_SECONDS",
+        "RAGAMER_MILVUS_DB",
+        "RAGAMER_MINIO_BUCKET",
+    ):
         monkeypatch.delenv(key)
 
     settings = load_settings(env_file=None)
 
     assert settings.log_level == "INFO"
+    # 原项目标定过的 5 秒：远端不可达时要快速失败
+    assert settings.store_timeout_seconds == 5.0
     assert settings.milvus.db == "ragamer"
     assert settings.minio.bucket == "ragamer-images"
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "很快"])
+def test_存储超时非法时报错并指出键名(settings_env, monkeypatch, value):
+    monkeypatch.setenv("RAGAMER_STORE_TIMEOUT_SECONDS", value)
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_settings(env_file=None)
+
+    assert "RAGAMER_STORE_TIMEOUT_SECONDS" in str(excinfo.value)
+
+
+def test_milvus_的库名不能叫_default(settings_env, monkeypatch):
+    """default 是每个 Milvus 实例都自带的库，与原项目共用实例时会撞在一起。"""
+    monkeypatch.setenv("RAGAMER_MILVUS_DB", "default")
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_settings(env_file=None)
+
+    message = str(excinfo.value)
+    assert "RAGAMER_MILVUS_DB" in message
+    assert "default" in message
 
 
 def test_取值为空时按没配处理(settings_env, monkeypatch):
@@ -267,6 +297,7 @@ def test_必需的是凭据与地址_有默认值的不在其中():
     } <= required
     assert not required & {
         "RAGAMER_LOG_LEVEL",
+        "RAGAMER_STORE_TIMEOUT_SECONDS",
         "RAGAMER_MILVUS_DB",
         "RAGAMER_MINIO_BUCKET",
         "RAGAMER_MINIO_SECURE",

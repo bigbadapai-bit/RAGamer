@@ -8,11 +8,15 @@ from pathlib import Path
 import pytest
 
 from ragamer.config import get_settings
+from ragamer.container import Container
+from ragamer.stores.base import Chunk, StoreUnavailableError
+from ragamer.stores.memory import InMemoryChunkStore, InMemoryDocStore, InMemoryObjectStore
 
 #: 一组完整、合法的配置。每个键给不同的值，以便断言"读到的正是这个键"。
 #: 键名与模型的对应关系由 `tests/test_config.py::test_env_keys_列出模型读取的全部键` 兜住。
 COMPLETE_ENV: dict[str, str] = {
     "RAGAMER_LOG_LEVEL": "DEBUG",
+    "RAGAMER_STORE_TIMEOUT_SECONDS": "2.5",
     "RAGAMER_MILVUS_URI": "http://milvus.test:19530",
     "RAGAMER_MILVUS_TOKEN": "test-milvus-token",
     "RAGAMER_MILVUS_DB": "ragamer-test",
@@ -42,3 +46,50 @@ def settings_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[di
     get_settings.cache_clear()
     yield COMPLETE_ENV
     get_settings.cache_clear()
+
+
+@pytest.fixture
+def memory_container() -> Container:
+    """整条链路的内存版：三个客户端全换成内存假件，一行云端代码都不碰。
+
+    需要"应用跑起来"的测试（启动自检、将来的 HTTP 缝）都从这里拿容器。
+    """
+    return Container(
+        chunks=InMemoryChunkStore(),
+        docs=InMemoryDocStore(),
+        objects=InMemoryObjectStore(),
+    )
+
+
+def fake_vector(seed: int, dim: int = 4) -> tuple[float, ...]:
+    """确定性的假向量。本层要验证的是接线，不是语义相似度。"""
+    return tuple(round(((seed * 31 + index * 17) % 100) / 100, 4) for index in range(dim))
+
+
+class FailingStore:
+    """一个连不上的服务。自检相关的测试用它造失败项，不必真去连一个不存在的地址。"""
+
+    def __init__(self, name: str, address: str, reason: str = "连接被拒绝") -> None:
+        self.name = name
+        self.address = address
+        self.reason = reason
+
+    def check(self) -> None:
+        raise StoreUnavailableError(self.name, self.address, 2.5, self.reason)
+
+
+def make_chunk(chunk_id: int, **overrides: object) -> Chunk:
+    """造一个切片：缺省值都合法且已向量化，测试只覆盖自己关心的那几个字段。"""
+    defaults: dict[str, object] = {
+        "content": f"正文{chunk_id}",
+        "ancestor_path": "二郎神 › 打法",
+        "chunk_index": chunk_id,
+        "subject_name": "二郎神",
+        "game_id": "black_myth",
+        "version": "1.0",
+        "doc_title": "二郎神",
+        "chunk_type": "text",
+        "dense_vector": fake_vector(chunk_id),
+        "sparse_vector": {chunk_id: 1.0},
+    }
+    return Chunk(chunk_id=chunk_id, **{**defaults, **overrides})

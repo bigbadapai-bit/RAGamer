@@ -16,9 +16,24 @@ _PACKAGE = _ROOT / "src" / "ragamer"
 _ENV_EXAMPLE = _ROOT / ".env.example"
 #: 只有这个模块允许读环境变量
 _CONFIG_MODULE = _PACKAGE / "config.py"
+#: 只有这个模块允许构造存储客户端
+_CONTAINER_MODULE = _PACKAGE / "container.py"
 
 #: 读环境变量的名字。`from os import getenv` 之后是裸名字，只认属性会漏掉。
 _ENV_NAMES = {"environ", "environb", "getenv", "putenv", "load_dotenv"}
+
+#: 三个存储客户端的实现类。它们在组合根构造一次然后注入——模块级单例换不掉，
+#: 测试缝也就没了。
+_ADAPTERS = {"MilvusChunkStore", "MongoDocStore", "MinioObjectStore"}
+
+#: 供应商库只允许出现在各自的适配器模块里：其余模块只认 ragamer.stores 的协议，
+#: 换后端不动业务代码。测试不在扫描范围内——造假件要用到供应商的异常类型。
+_VENDOR_MODULES = {
+    "pymilvus": _PACKAGE / "stores" / "chunks.py",
+    "pymongo": _PACKAGE / "stores" / "documents.py",
+    "minio": _PACKAGE / "stores" / "objects.py",
+    "urllib3": _PACKAGE / "stores" / "objects.py",
+}
 
 
 def _sources() -> list[Path]:
@@ -34,8 +49,54 @@ def test_守则扫到了源码():
         "__init__.py",
         "__main__.py",
         "config.py",
+        "container.py",
         "logging.py",
+        "memory.py",
+        "chunks.py",
+        "documents.py",
+        "objects.py",
     }
+
+
+def test_存储客户端只在组合根构造():
+    """没有任何模块级单例——单例在测试里换不成内存假件。"""
+    offenders = [
+        f"{path.name}:{node.lineno}"
+        for path in _sources()
+        if path != _CONTAINER_MODULE
+        for node in ast.walk(_tree(path))
+        if _calls_adapter(node)
+    ]
+
+    assert offenders == [], f"客户端只在 ragamer.container 构造：{offenders}"
+
+
+def _calls_adapter(node: ast.AST) -> bool:
+    if not isinstance(node, ast.Call):
+        return False
+    return (getattr(node.func, "id", None) or getattr(node.func, "attr", None)) in _ADAPTERS
+
+
+def test_供应商库只在各自的适配器模块导入():
+    """业务层只认协议，不认 pymilvus / pymongo / minio。"""
+    offenders = [
+        f"{path.name}:{node.lineno} → {vendor}"
+        for path in _sources()
+        for node in ast.walk(_tree(path))
+        if (vendor := _imported_vendor(node)) is not None and path != _VENDOR_MODULES[vendor]
+    ]
+
+    assert offenders == [], f"供应商库只能出现在自己的适配器模块里：{offenders}"
+
+
+def _imported_vendor(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Import):
+        roots = [alias.name.split(".")[0] for alias in node.names]
+    elif isinstance(node, ast.ImportFrom):
+        roots = [(node.module or "").split(".")[0]]
+    else:
+        return None
+    return next((root for root in roots if root in _VENDOR_MODULES), None)
 
 
 def test_源码里没有_print():

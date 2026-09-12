@@ -1,11 +1,26 @@
-"""启动自检：配置合格才放行，不合格时点名是哪个键，输出里不带凭据。"""
+"""启动自检：配置合格、存储连得上才放行；失败时点名是哪个键、哪个服务。"""
 
 from __future__ import annotations
 
+import pytest
 from pydantic import BaseModel, SecretStr
 
+from ragamer import __main__ as startup
 from ragamer.__main__ import main
 from ragamer.config import Settings
+from ragamer.container import Container
+from ragamer.stores import InMemoryDocStore, InMemoryObjectStore
+
+from .conftest import FailingStore
+
+
+@pytest.fixture(autouse=True)
+def 内存版的组合根(monkeypatch: pytest.MonkeyPatch, memory_container) -> None:
+    """自检这条路径不该真的去连云端：把组合根换成内存假件。
+
+    真要连云端的那部分（建表、检索）属于集成测试，见 pyproject 里的 integration 标记。
+    """
+    monkeypatch.setattr(startup, "build_container", lambda settings: memory_container)
 
 
 def _secret_values(node: BaseModel) -> list[str]:
@@ -76,3 +91,28 @@ def test_地址里内嵌的账号密码与查询串被抹掉(settings_env, monke
     # 主机留着，出问题时还能定位到打给了谁
     assert "milvus.internal:19530" in captured.err
     assert "https://gw.test/v1" in captured.err
+
+
+def test_存储自检通过时报告里列出服务(settings_env, capsys):
+    assert main() == 0
+
+    assert "存储自检通过" in capsys.readouterr().err
+
+
+def test_存储连不上时退出码为_3_并点名服务与地址(settings_env, monkeypatch, capsys):
+    monkeypatch.setattr(
+        startup,
+        "build_container",
+        lambda settings: Container(
+            chunks=FailingStore("Milvus", "milvus.test:19530"),
+            docs=InMemoryDocStore(),
+            objects=InMemoryObjectStore(),
+        ),
+    )
+
+    # 退出码把"存储不通"与"配置有问题"分开，脚本里能分别处理
+    assert main() == 3
+
+    captured = capsys.readouterr()
+    assert "Milvus" in captured.err
+    assert "milvus.test:19530" in captured.err
