@@ -52,10 +52,22 @@ def test_每个配置键都能从环境变量读入(settings_env):
     assert settings.llm.base_url == "https://llm.test/v1"
     assert settings.llm.api_key.get_secret_value() == "test-llm-api-key"
     assert settings.llm.model == "test-model"
+    assert settings.llm.timeout == 12.5
+    assert settings.llm.max_attempts == 5
+    assert settings.llm.backoff_base == 0.25
+    assert settings.llm.backoff_max == 4.0
 
 
 def test_未给出可选项时取默认值(settings_env, monkeypatch):
-    for key in ("RAGAMER_LOG_LEVEL", "RAGAMER_MILVUS_DB", "RAGAMER_MINIO_BUCKET"):
+    for key in (
+        "RAGAMER_LOG_LEVEL",
+        "RAGAMER_MILVUS_DB",
+        "RAGAMER_MINIO_BUCKET",
+        "RAGAMER_LLM_TIMEOUT",
+        "RAGAMER_LLM_MAX_ATTEMPTS",
+        "RAGAMER_LLM_BACKOFF_BASE",
+        "RAGAMER_LLM_BACKOFF_MAX",
+    ):
         monkeypatch.delenv(key)
 
     settings = load_settings(env_file=None)
@@ -63,6 +75,22 @@ def test_未给出可选项时取默认值(settings_env, monkeypatch):
     assert settings.log_level == "INFO"
     assert settings.milvus.db == "ragamer"
     assert settings.minio.bucket == "ragamer-images"
+    assert settings.llm.timeout == 60.0
+    assert settings.llm.max_attempts == 3
+    assert settings.llm.backoff_base == 0.5
+    assert settings.llm.backoff_max == 8.0
+
+
+@pytest.mark.parametrize("override", ["RAGAMER_LLM_MAX_ATTEMPTS=99", "RAGAMER_LLM_TIMEOUT=0"])
+def test_重试次数与超时超出可接受范围时报错并指出键名(settings_env, monkeypatch, override):
+    """重试必须有界：配置里给个天文数字不该被原样接受。"""
+    key, _, value = override.partition("=")
+    monkeypatch.setenv(key, value)
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_settings(env_file=None)
+
+    assert key in str(excinfo.value)
 
 
 def test_取值为空时按没配处理(settings_env, monkeypatch):

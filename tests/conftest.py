@@ -26,6 +26,10 @@ COMPLETE_ENV: dict[str, str] = {
     "RAGAMER_LLM_BASE_URL": "https://llm.test/v1",
     "RAGAMER_LLM_API_KEY": "test-llm-api-key",
     "RAGAMER_LLM_MODEL": "test-model",
+    "RAGAMER_LLM_TIMEOUT": "12.5",
+    "RAGAMER_LLM_MAX_ATTEMPTS": "5",
+    "RAGAMER_LLM_BACKOFF_BASE": "0.25",
+    "RAGAMER_LLM_BACKOFF_MAX": "4",
 }
 
 
