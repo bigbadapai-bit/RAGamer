@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import math
 import sys
 import threading
 import time
@@ -40,8 +41,8 @@ class _Loader:
 class _StubM3:
     """假 BGE-M3：返回固定形状的两路向量，并记下每一次调用拿到了什么。
 
-    稀疏向量的键**照 FlagEmbedding 的原样用字符串**——真实那边就是 `str(token_id)`，
-    适配器必须把它转成 int，这条靠这里钉住。
+    稠密向量按真实模型的样子归一化（`Embedding` 会核这一条），稀疏向量的键**照
+    FlagEmbedding 的原样用字符串**——真实那边就是 `str(token_id)`，适配器必须转成 int。
     """
 
     def __init__(self, dim: int = DENSE_DIM) -> None:
@@ -51,7 +52,7 @@ class _StubM3:
     def encode(self, sentences: Sequence[str], **kwargs: Any) -> Mapping[str, Any]:
         self.calls.append({"sentences": list(sentences), **kwargs})
         return {
-            "dense_vecs": [[0.5] * self.dim for _ in sentences],
+            "dense_vecs": [[1.0 / math.sqrt(self.dim)] * self.dim for _ in sentences],
             "lexical_weights": [{"12": 0.5, "34": 0.25} for _ in sentences],
         }
 
@@ -210,6 +211,22 @@ def test_条数对不上时报错而不是按短的截齐():
 
     assert "稠密向量有 1 条" in str(excinfo.value)
     assert "2 条" in str(excinfo.value)
+
+
+def test_没归一化的稠密向量当场报错():
+    """归一化一丢，IP 度量就不再等价于余弦——分数悄悄变了意思，检索侧毫无察觉。"""
+
+    class _NotNormalized(_StubM3):
+        def encode(self, sentences, **kwargs):
+            result = super().encode(sentences, **kwargs)
+            return {**result, "dense_vecs": [[0.5] * self.dim for _ in sentences]}
+
+    embedder, _, _ = _embedder(_NotNormalized())
+
+    with pytest.raises(ModelOutputError) as excinfo:
+        embedder.embed(["二郎神怎么打"])
+
+    assert "没有归一化" in str(excinfo.value)
 
 
 def test_没装_FlagEmbedding_时说清怎么装(monkeypatch):

@@ -26,6 +26,9 @@ from typing import Protocol, runtime_checkable
 #: 稠密向量的维度（BGE-M3）。collection 的 `FLOAT_VECTOR` 与它对齐。
 DENSE_DIM = 1024
 
+#: 归一化向量的模长容差。float32 归一化完与 1 的偏差在 1e-7 量级，这里留宽几百倍。
+NORM_TOLERANCE = 1e-3
+
 
 class ModelError(Exception):
     """模型相关的失败。"""
@@ -65,6 +68,14 @@ class Embedding:
                     f"第 {index} 条稠密向量是 {len(vector)} 维，"
                     f"collection schema 要的是 {DENSE_DIM} 维"
                 )
+            # 归一化在这里兜住，而不是只写在文档里：没归一化的向量照样写进 Milvus、
+            # 照样检索得回来，只是 IP 从此不再等价于余弦——分数悄悄变了意思，不报错。
+            length = math.sqrt(sum(value * value for value in vector))
+            if abs(length - 1.0) > NORM_TOLERANCE:
+                raise ModelOutputError(
+                    f"第 {index} 条稠密向量没有归一化（模长 {length:g}）："
+                    "配 IP 度量才算得了余弦相似度"
+                )
 
     def __len__(self) -> int:
         return len(self.dense)
@@ -94,8 +105,9 @@ class Reranker(Protocol):
 def normalize_dense(vector: Sequence[float]) -> tuple[float, ...]:
     """把稠密向量缩到单位长度，与 IP 度量配合等价于余弦相似度（坑 #2）。
 
-    零向量原样返回：它的方向没有定义，除法会得到 NaN，而 NaN 进了 Milvus
-    既排不上序也不报错——还不如留着这个明显异常的零向量。
+    零向量原样返回：它的方向没有定义，除法只会得到 NaN，而 NaN 进了 Milvus
+    既排不上序也不报错。留着这个明显不正常的零向量，下一步构造 :class:`Embedding`
+    时就会被拦下——那是期望的失败方式。
     """
     length = math.sqrt(sum(value * value for value in vector))
     if length == 0.0:

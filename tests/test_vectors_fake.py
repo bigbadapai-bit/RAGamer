@@ -21,6 +21,8 @@ from ragamer.vectors import (
     Reranker,
 )
 
+from .conftest import make_chunk
+
 
 def test_两个假件满足各自的协议():
     assert isinstance(FakeEmbedder(), Embedder)
@@ -86,6 +88,14 @@ def test_维度与_collection_对不上时当场报错():
         Embedding(dense=((0.0, 0.0),), sparse=({},))
 
 
+def test_没归一化的稠密向量当场报错():
+    """归一化没做的话，IP 度量就不再等价于余弦——分数悄悄变了意思，不报错。"""
+    with pytest.raises(ModelOutputError) as excinfo:
+        Embedding(dense=((1.0,) * DENSE_DIM,), sparse=({},))
+
+    assert "没有归一化" in str(excinfo.value)
+
+
 def test_精排分数与候选一一对应且同序():
     docs = [
         "二郎神怎么打：先躲技能再反击",
@@ -129,3 +139,23 @@ def test_内存版的组合根里换的就是这两个假件(memory_container):
 
     assert len(memory_container.embedder.embed(["二郎神怎么打"])) == 1
     assert memory_container.reranker.rerank("二郎神", ["二郎神"]) == [1.0]
+
+
+def test_两路向量直接放得进切片并检索得回来(memory_container):
+    """向量化与入库之间的接缝。
+
+    `Chunk` 要的正是「归一化的稠密 tuple + int 键的稀疏 Mapping」，对不上的话
+    要么在这里炸、要么在写 Milvus 时炸；后者得等到真跑一次云端才知道。
+    """
+    embedding = memory_container.embedder.embed(["二郎神怎么打"])
+    chunk = make_chunk(
+        1,
+        content="二郎神怎么打：先躲技能再反击",
+        dense_vector=embedding.dense[0],
+        sparse_vector=embedding.sparse[0],
+    )
+
+    memory_container.chunks.upsert("black_myth", [chunk])
+    hits = memory_container.chunks.search("black_myth", dense=embedding.dense[0])
+
+    assert [hit.chunk.chunk_id for hit in hits] == [1]
