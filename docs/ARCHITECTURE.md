@@ -324,7 +324,7 @@ cache:{game}:{version}:{sha1(rewritten_query)}
 | 2 | BGE-M3 开 `normalize_embeddings=True` + Milvus 用 **IP** 度量 | 归一化后 IP 等价余弦，省掉余弦的计算开销 |
 | 3 | 稀疏向量索引用 `SPARSE_INVERTED_INDEX` + `DAAT_MAXSCORE` | 默认配置下稀疏检索性能差 |
 | 4 | Mongo 客户端设 `serverSelectionTimeoutMS=5000` | 远端不可达时快速失败而非长时间阻塞 |
-| 5 | MinIO 卷要**预建并修正属主** | Milvus 容器以固定非 root uid 运行，属主不对直接起不来 |
+| 5 | ~~MinIO 卷要预建并修正属主~~ **本项目不适用** | 成因是上游镜像以固定非 root uid 运行；本项目部署以 root 运行，不存在属主问题。应用侧只做「确保桶存在」（启动自检里） |
 | 6 | MinerU 上传要 `session.trust_env=False` | 大文件走代理会超时 |
 | 7 | MinerU 轮询：**超时 600s / 间隔 3s / 5xx 重试 / `failed` 抛错** | 原项目标定过的值 |
 | 8 | Milvus 服务端 `user.yaml` 开鉴权 | 不要裸奔 |

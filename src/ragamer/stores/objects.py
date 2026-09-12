@@ -4,9 +4,6 @@
 
 对象 key 与前缀共用 :func:`~ragamer.stores.base.normalize_prefix` 这一个归一函数，
 所以写进去的 key 与列出来的 key 永远对得上。
-
-MinIO 容器的卷属主不归这一层管——卷是部署时挂的，属主不对容器直接起不来，
-应用只能看到"连不上"。启动自检会把这表现为超时，见 `Container.check`。
 """
 
 from __future__ import annotations
