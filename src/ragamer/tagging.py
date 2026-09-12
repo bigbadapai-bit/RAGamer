@@ -1,20 +1,21 @@
 """打标：给切片补上两层正交的标签——主体（文档级）与内容性质（切片级）。
 
 粒度不同是有意的：「背景故事」和「打法」在同一个页面里，文档级统一就废了——
-理由见 [ADR-0003](../docs/adr/0003-two-orthogonal-tag-fields.md)。生产顺序是
-**结构优先、模型兜底**：
+理由见 ADR-0003。生产顺序是**结构优先、模型兜底**：
 
 - **主体名 / 主体类型**（文档级）：语料有结构就读 MediaWiki 分类与 Infobox 类型，
-  **不调模型**；没有才让模型读开头若干切片总结，回写全文档。
+  **不调模型**；读不出来的那一部分才让模型读开头若干切片总结，回写全文档。
 - **内容性质**（切片级）：语料有结构就按该切片的标题归一，**不调模型**；
   没有才让模型逐切片判断，带上切片位置作弱上下文。
 
-两条路各自独立降级：主体结构读不出来只影响主体字段，标题认不出的切片只问它自己
-那一片。**打标失败一律不阻断入库**——标签留空、正文照常返回，见每一处 `except`。
-这里只接 `LlmError`：语言模型客户端对外承诺的就是它，宽泛地吞异常会把真 bug 也吞掉
-（旧项目的反向清单里正有一条「按批吞异常」）。
+两条路各自独立降级，而且**逐字段降级**：主体名读得出来、类型读不出来，就只问类型，
+不把已经读到的名字扔掉。**打标失败一律不阻断入库**——标签留空、正文照常返回，
+见每一处 `except`。这里只接 `LlmError`：语言模型客户端对外承诺的就是它，宽泛地吞
+异常会把真 bug 也吞掉（旧项目的反向清单里正有一条「按批吞异常」）。
 
-已知的限：结构读取按行扫，围栏代码块里的 `[[Category:…]]` 会被当成真的分类。
+已知的限：结构读取按行扫，围栏代码块里的 `[[Category:…]]` 会被当成真的分类；
+Infobox 字段里若嵌了模板（`| 类型 = {{tt|角色}}`），值会被嵌套的竖线截断而认不出，
+这一条同样落回模型兜底。
 """
 
 from __future__ import annotations
@@ -86,36 +87,6 @@ CONTENT_NATURE_LABELS: Mapping[ContentNature, str] = {
     ContentNature.REVIEW: "好不好／哪个强",
 }
 
-#: 一级词表收的通用叫法（架构文档 §2.3 里每一类后面列的那几个词）。
-#: 它让**没配术语映射的自定义库**也能直接读中文 wiki 的分类，不必先问一遍模型。
-#: 键是 `_normalize` 之后的形态，查表前也要过一遍 `_normalize`。
-GLOBAL_TERMS: Mapping[str, SubjectType] = {
-    "角色": SubjectType.CHARACTER,
-    "怪物": SubjectType.CHARACTER,
-    "boss": SubjectType.CHARACTER,
-    "组织势力": SubjectType.CHARACTER,
-    "物品": SubjectType.ITEM,
-    "装备": SubjectType.ITEM,
-    "道具": SubjectType.ITEM,
-    "素材": SubjectType.ITEM,
-    "地图": SubjectType.PLACE,
-    "场景": SubjectType.PLACE,
-    "关卡": SubjectType.PLACE,
-    "任务": SubjectType.QUEST,
-    "副本": SubjectType.QUEST,
-    "活动": SubjectType.QUEST,
-    "技能": SubjectType.SKILL,
-    "法术": SubjectType.SKILL,
-    "招式": SubjectType.SKILL,
-    "心法": SubjectType.SKILL,
-    "世界观": SubjectType.BACKGROUND,
-    "剧情": SubjectType.BACKGROUND,
-    "设定": SubjectType.BACKGROUND,
-    "机制": SubjectType.SYSTEM,
-    "规则": SubjectType.SYSTEM,
-    "玩法": SubjectType.SYSTEM,
-}
-
 #: 内容性质的判定词表：标题里含哪个词就算哪一类，含几个算几个。
 #: 词之间用空格分开。表里的次序就是结果里各类的先后——越具体的越靠前，
 #: 「属性说明」这类两头都沾的标题，数值排在介绍前头。
@@ -155,8 +126,9 @@ class TagVocabulary:
     两者都来自知识库自己的配置（存 MongoDB、GUI 可编辑），不来自环境变量——
     它是每个库一份的数据，不是进程级的配置。
 
-    不传就是**全部主体类型 + 一级词表的通用叫法**：用户自定义库没配映射时默认全开，
-    标签会稀疏但不会漏，是安全的降级路径（架构文档 §2.3）。
+    不传就是**全部主体类型、映射为空**：用户自定义库没配映射时默认全开，标签会稀疏
+    但不会漏，是安全的降级路径（架构文档 §2.3）。映射为空时语料里的叫法一个也认不出，
+    于是统一落到模型兜底那条路——这正是 §2.3 给未配映射的自定义库安排的降级。
     """
 
     #: 这个库启用的主体类型，是七类的一个子集。没启用的类一律不落标。
@@ -189,13 +161,15 @@ class TagVocabulary:
         return cls(subject_types, term_mapping)
 
     def resolve(self, term: str) -> SubjectType | None:
-        """把一种叫法归到主体类型：先查该游戏的术语映射，再查一级词表的通用叫法。"""
-        key = _normalize(term)
-        found = self.term_mapping.get(key)
-        return found if found is not None else GLOBAL_TERMS.get(key)
+        """把一种叫法归到主体类型。认不出返回 `None`，交给模型兜底。
+
+        只认这个库配了的术语映射：一级词表统一的是「有哪些类」，不是「哪些词算哪一类」。
+        「妖王」「心法」这类本地叫法本来就因游戏而异，写死在代码里既配不全也改不动。
+        """
+        return self.term_mapping.get(_normalize(term))
 
     def is_game_term(self, term: str) -> bool:
-        """这个叫法是不是该游戏自己的术语，而不是一级词表的通用叫法。"""
+        """这个叫法是不是该游戏自己的术语（即配在映射里的那些）。"""
         return _normalize(term) in self.term_mapping
 
     def enabled(self, kind: SubjectType) -> bool:
@@ -272,8 +246,8 @@ def tag_document(
 def read_document_structure(markdown: str, vocabulary: TagVocabulary) -> DocumentStructure:
     """读语料自身的结构：MediaWiki 分类、Infobox 的类型与名称、文档大标题。
 
-    认出的叫法按术语映射归到通用主体类型，映射里没有的再查一级词表；**两者都认不
-    出、或归到的类型这个库没启用，就丢掉**——宁缺勿错，模型兜底那条路还在。
+    认出的叫法按这个库的术语映射归到通用主体类型；**映射里没有、或归到的类型这个库
+    没启用，就丢掉**——宁缺勿错，模型兜底那条路还在。
 
     值必须能归到某个主体类型，那个模板才算数：`{{cite|type=web}}` 里的 `web`
     归不出来，于是连它的 `title` 也不会被当成主体名。
@@ -305,7 +279,7 @@ def natures_for_heading(path: str) -> tuple[ContentNature, ...]:
     """按切片的标题归一内容性质。认不出返回空元组，交给模型。
 
     从最靠里的一段往外找：「二郎神 › 打法 › 第二阶段」里末段没有信息量，要能落到
-    父标题「打法」上。一段里命中几类就留几类——「掉落与属性」确实是两类。
+    祖先路径的上一段「打法」上。一段里命中几类就留几类——「掉落与属性」确实是两类。
     """
     segments = [segment.strip() for segment in path.split(PATH_SEPARATOR) if segment.strip()]
     for segment in reversed(segments):
@@ -328,20 +302,42 @@ class _Tagger:
     llm: LlmClient | None
     #: 文档大标题。用来认出词条页的开篇——它的路径只有标题这一段。
     title: str = ""
+    #: 文档确实分了小节。由 `__post_init__` 从切片路径算出来，见 `nature`。
+    has_sections: bool = field(init=False, default=False)
+
+    def __post_init__(self) -> None:
+        # 要求标题非空：没有大标题就谈不上「挂在大标题下的那一段」，`has_sections`
+        # 为真必须蕴含标题为真，`nature` 才敢拿它当开篇的判据
+        deeper = self.title + PATH_SEPARATOR if self.title else ""
+        object.__setattr__(
+            self,
+            "has_sections",
+            bool(deeper) and any(chunk.ancestor_path.startswith(deeper) for chunk in self.chunks),
+        )
 
     def subject(self, structure: DocumentStructure) -> tuple[str, tuple[SubjectType, ...]]:
-        """主体名与主体类型。读到结构就直接用，读不到才问模型。"""
-        if structure.subject_types:
+        """主体名与主体类型。结构读得出来的那部分直接用，缺的那部分才问模型。
+
+        逐字段判，不是整组判：只有分类没有大标题的文档，名字要能问回来；只有大标题
+        没有分类的文档，读到手的名字也不该因为类型没读到就被扔掉。
+        """
+        if structure.subject_name and structure.subject_types:
             return structure.subject_name, structure.subject_types
-        return self._ask_subject()
+        name, kinds = self._ask_subject()
+        return structure.subject_name or name, structure.subject_types or kinds
 
     def nature(self, chunk: Chunk) -> tuple[ContentNature, ...]:
-        """内容性质。标题认得出来就归一，认不出才问模型。"""
+        """内容性质。标题认得出来就归一，认不出才问模型。
+
+        路径只有文档大标题那一段时算作开篇，答的正是「是什么」——但**只在文档确实分了
+        小节时**才算。整篇只有一个大标题的文档，每个切片的路径都等于标题，那不是开篇，
+        是一整篇没结构可依的正文；一律盖成 `intro` 就正好踩中 ADR-0003 不许的
+        「读完前几块、回写全文档」，所以那种情形老老实实逐切片问。
+        """
         matched = natures_for_heading(chunk.ancestor_path)
         if matched:
             return matched
-        if chunk.ancestor_path and chunk.ancestor_path == self.title:
-            # 路径只有文档大标题这一段：这是词条页的开篇，答的正是「是什么」
+        if self.has_sections and chunk.ancestor_path == self.title:
             return (ContentNature.INTRO,)
         return self._ask_nature(chunk)
 

@@ -98,16 +98,15 @@ def _nature_reply(*natures: ContentNature) -> dict:
     return {"content_nature": [nature.value for nature in natures]}
 
 
-class _打不通的模型:
-    """每次调用都失败。用来验「打标失败不阻断入库」这条。"""
+class _打不通的模型(FakeLlm):
+    """每次调用都失败。用来验「打标失败不阻断入库」这条。
 
-    def complete(self, request: LlmRequest) -> str:
-        raise LlmError("模型服务连不上")
+    用假件排一串 `LlmError` 脚本也行，但调用几次就得排几条，调用次数一变脚本就
+    对不上了——这样写调用几次都一样。
+    """
 
-    def stream(self, request: LlmRequest):
-        raise LlmError("模型服务连不上")
-
-    def complete_structured(self, request: LlmRequest, schema):
+    def _reply(self, request: LlmRequest) -> str:
+        self.calls.append(request)
         raise LlmError("模型服务连不上")
 
 
@@ -129,19 +128,20 @@ def test_术语映射把游戏本地叫法归到通用主体类型():
     assert structure.game_terms == ("妖王",)
 
 
-def test_没配映射的库靠一级词表也能读通用叫法():
-    """自定义库不配术语映射时不该因为缺配置就读不出结构。"""
-    structure = read_document_structure("[[Category:物品]]", TagVocabulary())
+def test_没配映射的库认不出叫法_交给模型兜底():
+    """自定义库不配映射就读不出结构，这是 §2.3 给它安排的降级，不是漏洞。"""
+    vocabulary = TagVocabulary()
 
-    assert structure.subject_types == (SubjectType.ITEM,)
-    # 通用叫法不是「游戏术语」，不该记进 game_terms
-    assert structure.game_terms == ()
+    assert read_document_structure("[[Category:物品]]", vocabulary).subject_types == ()
+    assert vocabulary.resolve("物品") is None
 
 
 def test_Infobox_的类型字段也算结构():
     markdown = "# 三尖两刃刀\n\n{{物品信息框\n| 名称 = 三尖两刃刀\n| 类型 = 装备\n}}\n"
 
-    structure = read_document_structure(markdown, TagVocabulary())
+    structure = read_document_structure(
+        markdown, TagVocabulary(term_mapping={"装备": SubjectType.ITEM})
+    )
 
     assert structure.subject_name == "三尖两刃刀"
     assert structure.subject_types == (SubjectType.ITEM,)
@@ -187,7 +187,7 @@ def test_按标题归一内容性质():
     assert natures_for_heading("二郎神 › 打法") == (ContentNature.GUIDE,)
 
 
-def test_末段没有信息量时落到父标题():
+def test_末段没有信息量时落到祖先路径的上一段():
     assert natures_for_heading("二郎神 › 打法 › 第二阶段") == (ContentNature.GUIDE,)
 
 
@@ -227,6 +227,36 @@ def test_内容性质逐切片判定_同一文档里两种性质并存():
         (ContentNature.STATS,),
         (ContentNature.GUIDE,),
     ]
+
+
+def test_整篇只有一个大标题时逐切片问模型而不是一律盖成介绍():
+    """ADR-0003 的红线：同一文档里「数值」和「打法」并存，不许文档级统一。
+
+    整篇没有小节时每个切片的路径都等于文档大标题，那不是「开篇」，是一整篇没有结构
+    可依的正文——盖成 `intro` 就正好踩中「读完前几块、回写全文档」那条禁令。
+    """
+    body = "\n\n".join(
+        (
+            "血量 12000，抗性偏高，打之前先把等级练够，不然第一阶段就会被秒。" * 4,
+            "先定身再贴身输出，横扫之后有硬直，看到收刀就往侧面翻滚。" * 4,
+        )
+    )
+    markdown = f"# 二郎神\n\n{body}\n"
+    chunks = _chunks(markdown)
+
+    assert len(chunks) > 1  # 确实切出了多片，这条才验得到东西
+    assert {chunk.ancestor_path for chunk in chunks} == {"二郎神"}  # 全挂在大标题下
+
+    llm = FakeLlm(
+        _subject_reply("二郎神", SubjectType.CHARACTER),  # 没有分类，主体类型得问
+        *[_nature_reply(ContentNature.STATS)] * len(chunks),
+    )
+
+    tagged = tag_document(markdown, chunks, llm=llm)
+
+    # 每片各问一次。少一次就说明有切片被那条捷径盖成了 intro
+    assert len(llm.calls) == 1 + len(chunks)
+    assert not any(ContentNature.INTRO in item.content_nature for item in tagged)
 
 
 def test_切片顺序与正文原样保留():
@@ -317,9 +347,12 @@ def test_模型给出的没启用的主体类型被丢掉():
 def test_两个字段都能装多个值():
     """「二郎神的技能」同时属于角色与技能，一段内容也可以既是数值又是获取。"""
     markdown = "# 二郎神\n\n[[Category:角色]]\n[[Category:技能]]\n\n## 琐事\n\n不知道该算哪一类。\n"
+    vocabulary = TagVocabulary(
+        term_mapping={"角色": SubjectType.CHARACTER, "技能": SubjectType.SKILL}
+    )
     llm = FakeLlm(_nature_reply(ContentNature.STATS, ContentNature.WHERE))
 
-    tagged = tag_document(markdown, _chunks(markdown), llm=llm)
+    tagged = tag_document(markdown, _chunks(markdown), vocabulary=vocabulary, llm=llm)
 
     assert tagged[0].subject_type == (SubjectType.CHARACTER, SubjectType.SKILL)
     # 开篇按结构归成介绍；问模型的那一片才拿回两个性质
@@ -349,16 +382,30 @@ def test_没给模型客户端时结构读不出的标签留空():
     assert tagged[0].chunk.content  # 正文照常返回
 
 
-def test_主体读不出结构但标题认得出来_只留空主体那一半():
-    """两条兜底路各自独立：主体走模型失败，不该连内容性质一起丢掉。"""
+def test_标题读出的主体名不因类型没读到就被扔掉():
+    """逐字段降级：类型问模型失败了，结构读到手的名字照留。"""
     tagged = tag_document(HEADINGS_ONLY, _chunks(HEADINGS_ONLY), llm=_打不通的模型())
 
+    assert all(item.subject_name == "二郎神" for item in tagged)
     assert all(item.subject_type == () for item in tagged)
-    assert all(item.subject_name == "" for item in tagged)
     assert [item.content_nature for item in tagged] == [
         (ContentNature.INTRO,),  # 开篇
         (ContentNature.WHERE,),  # 靠标题归一，没碰模型
     ]
+
+
+def test_只有分类没有大标题时主体名问模型补上():
+    """结构给了类型、给不出名字，缺的那一个字段单独问回来。"""
+    markdown = "[[Category:妖王]]\n\n二郎神是隐藏 BOSS。\n"
+    llm = FakeLlm(
+        _subject_reply("二郎神", SubjectType.CHARACTER),
+        _nature_reply(ContentNature.INTRO),  # 没有标题可归一，性质那一问也落回模型
+    )
+
+    tagged = tag_document(markdown, _chunks(markdown), vocabulary=BLACK_MYTH, llm=llm)
+
+    assert tagged[0].subject_name == "二郎神"
+    assert tagged[0].subject_type == (SubjectType.CHARACTER,)  # 结构给的，没被模型覆盖
 
 
 # --- 词表从配置读入 ---
@@ -378,10 +425,8 @@ def test_术语映射从配置读入():
 
     assert vocabulary.subject_types == (SubjectType.CHARACTER, SubjectType.SKILL)
     assert vocabulary.resolve("妖王") is SubjectType.CHARACTER
-    assert vocabulary.resolve("心法") is SubjectType.SKILL  # 一级词表的通用叫法
-    assert vocabulary.resolve("没这个词") is None
+    assert vocabulary.resolve("没配过的叫法") is None
     assert vocabulary.is_game_term("妖王")
-    assert not vocabulary.is_game_term("心法")
 
 
 def test_配置里写了不认识的主体类型要报错():
