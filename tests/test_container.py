@@ -8,19 +8,16 @@ from __future__ import annotations
 import pytest
 
 from ragamer.config import load_settings
-from ragamer.container import Container, build_container
+from ragamer.container import build_container
 from ragamer.stores import (
     ChunkStore,
     DocStore,
-    InMemoryChunkStore,
-    InMemoryDocStore,
-    InMemoryObjectStore,
     ObjectStore,
     StoreCheckError,
 )
-from ragamer.vectors import Embedder, FakeEmbedder, FakeReranker, Reranker
+from ragamer.vectors import Embedder, Reranker
 
-from .conftest import FailingStore
+from .conftest import FailingStore, make_container
 
 
 class RecordingStore:
@@ -33,16 +30,6 @@ class RecordingStore:
 
     def check(self) -> None:
         self.checks += 1
-
-
-def _container(chunks=None, docs=None, objects=None) -> Container:
-    return Container(
-        chunks=chunks or InMemoryChunkStore(),
-        docs=docs or InMemoryDocStore(),
-        objects=objects or InMemoryObjectStore(),
-        embedder=FakeEmbedder(),
-        reranker=FakeReranker(),
-    )
 
 
 def test_组合根按配置构造全部外部依赖(settings_env):
@@ -70,13 +57,7 @@ def test_自检把三个服务都查一遍(settings_env):
     两个模型不在自检里：它们的权重几个 G，等第一次真的要用时才加载。
     """
     stores = [RecordingStore(f"服务{index}") for index in range(3)]
-    container = Container(
-        chunks=stores[0],
-        docs=stores[1],
-        objects=stores[2],
-        embedder=FakeEmbedder(),
-        reranker=FakeReranker(),
-    )
+    container = make_container(chunks=stores[0], docs=stores[1], objects=stores[2])
 
     container.check()
 
@@ -85,7 +66,7 @@ def test_自检把三个服务都查一遍(settings_env):
 
 def test_自检一次报出全部不通的服务(settings_env):
     """启动时一次看清全部问题，而不是修一个重启一次。"""
-    container = _container(
+    container = make_container(
         chunks=FailingStore("Milvus", "milvus.test:19530"),
         docs=FailingStore("MongoDB", "mongo.test:27017"),
     )
@@ -102,7 +83,7 @@ def test_自检一次报出全部不通的服务(settings_env):
 
 def test_只有对象存储不通时也报出来(settings_env):
     """桶建不出来（没权限、卷属主不对）就是在这一条上暴露。"""
-    container = _container(objects=FailingStore("MinIO", "minio.test:9000", "Access Denied"))
+    container = make_container(objects=FailingStore("MinIO", "minio.test:9000", "Access Denied"))
 
     with pytest.raises(StoreCheckError) as excinfo:
         container.check()

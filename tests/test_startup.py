@@ -8,11 +8,8 @@ from pydantic import BaseModel, SecretStr
 from ragamer import __main__ as startup
 from ragamer.__main__ import main
 from ragamer.config import Settings
-from ragamer.container import Container
-from ragamer.stores import InMemoryDocStore, InMemoryObjectStore
-from ragamer.vectors import FakeEmbedder, FakeReranker
 
-from .conftest import FailingStore
+from .conftest import FailingStore, make_container
 
 
 @pytest.fixture(autouse=True)
@@ -104,13 +101,7 @@ def test_存储连不上时退出码为_3_并点名服务与地址(settings_env,
     monkeypatch.setattr(
         startup,
         "build_container",
-        lambda settings: Container(
-            chunks=FailingStore("Milvus", "milvus.test:19530"),
-            docs=InMemoryDocStore(),
-            objects=InMemoryObjectStore(),
-            embedder=FakeEmbedder(),
-            reranker=FakeReranker(),
-        ),
+        lambda settings: make_container(chunks=FailingStore("Milvus", "milvus.test:19530")),
     )
 
     # 退出码把"存储不通"与"配置有问题"分开，脚本里能分别处理

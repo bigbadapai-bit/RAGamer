@@ -57,19 +57,27 @@ def settings_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[di
     get_settings.cache_clear()
 
 
+def make_container(chunks=None, docs=None, objects=None, embedder=None, reranker=None) -> Container:
+    """造一个容器：五个依赖默认都是假件，测试只覆盖自己关心的那几个。
+
+    内存假件与真实实现实现的是同一组协议，所以"应用跑起来"的测试都可以从它起步。
+    """
+    return Container(
+        chunks=chunks if chunks is not None else InMemoryChunkStore(),
+        docs=docs if docs is not None else InMemoryDocStore(),
+        objects=objects if objects is not None else InMemoryObjectStore(),
+        embedder=embedder if embedder is not None else FakeEmbedder(),
+        reranker=reranker if reranker is not None else FakeReranker(),
+    )
+
+
 @pytest.fixture
 def memory_container() -> Container:
     """整条链路的内存版：三个客户端与两个模型全换成假件，一行云端代码、一个权重都不碰。
 
     需要"应用跑起来"的测试（启动自检、将来的 HTTP 缝）都从这里拿容器。
     """
-    return Container(
-        chunks=InMemoryChunkStore(),
-        docs=InMemoryDocStore(),
-        objects=InMemoryObjectStore(),
-        embedder=FakeEmbedder(),
-        reranker=FakeReranker(),
-    )
+    return make_container()
 
 
 def fake_vector(seed: int, dim: int = 4) -> tuple[float, ...]:
