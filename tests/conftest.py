@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -37,6 +38,13 @@ COMPLETE_ENV: dict[str, str] = {
     "RAGAMER_LLM_MAX_ATTEMPTS": "5",
     "RAGAMER_LLM_BACKOFF_BASE": "0.25",
     "RAGAMER_LLM_BACKOFF_MAX": "4",
+    "RAGAMER_VISION_BASE_URL": "https://vision.test/v1",
+    "RAGAMER_VISION_API_KEY": "test-vision-api-key",
+    "RAGAMER_VISION_MODEL": "test-vision-model",
+    "RAGAMER_VISION_TIMEOUT": "30",
+    "RAGAMER_VISION_MAX_ATTEMPTS": "2",
+    "RAGAMER_VISION_BACKOFF_BASE": "0.5",
+    "RAGAMER_VISION_BACKOFF_MAX": "2",
     "RAGAMER_MINERU_BASE_URL": "https://mineru.test",
     "RAGAMER_MINERU_API_KEY": "test-mineru-api-key",
     "RAGAMER_MINERU_MODEL_VERSION": "pipeline",
@@ -70,7 +78,15 @@ def settings_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[di
 
 
 def make_container(
-    chunks=None, docs=None, objects=None, embedder=None, reranker=None, llm=None, parser=None
+    chunks=None,
+    docs=None,
+    objects=None,
+    embedder=None,
+    reranker=None,
+    llm=None,
+    parser=None,
+    vision=None,
+    ocr=None,
 ) -> Container:
     """造一个容器：依赖默认都是假件，测试只覆盖自己关心的那几个。
 
@@ -86,8 +102,40 @@ def make_container(
         embedder=embedder if embedder is not None else FakeEmbedder(),
         reranker=reranker if reranker is not None else FakeReranker(),
         llm=llm if llm is not None else FakeLlm(),
+        # 默认不接视觉模型：没配时组合根给的就是 None（补图只做二次 OCR）
+        vision=vision,
+        # 默认的 OCR 引擎一被调用就炸——排了脚本的测试才该走到它
+        ocr=ocr if ocr is not None else FailingOcr(),
         parser=parser if parser is not None else ParserRouter((MarkdownParser(),)),
     )
+
+
+class FailingOcr:
+    """一调就炸的 OCR。默认的二次 OCR：真被用到说明这个测试接线接错了。"""
+
+    def read(self, data: bytes) -> str:
+        raise AssertionError("这个测试没排 OCR：补图那一层不该走到这里")
+
+
+class FakeOcr:
+    """按图逐张回话的假 OCR。记下每一张喂进来的字节。
+
+    脚本里也可以排异常（`OcrError` / `OcrUnavailable`），用来验失败那两条路。
+    脚本排空之后再被调用会当场炸——测试少排了一条时立刻看得见，不是静默给空串。
+    """
+
+    def __init__(self, *texts: Any) -> None:
+        self.texts = list(texts)
+        self.images: list[bytes] = []
+
+    def read(self, data: bytes) -> str:
+        self.images.append(data)
+        if not self.texts:
+            raise AssertionError("假 OCR 没有更多脚本回复了 —— 测试少排了一条")
+        text = self.texts.pop(0)
+        if isinstance(text, Exception):
+            raise text
+        return text
 
 
 @pytest.fixture

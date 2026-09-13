@@ -29,7 +29,9 @@ logger = get_logger(__name__)
 #: 图片引用的两种形式。取地址，供补图那一层去取原图。
 #: **两种都要认**：MinerU 把表格内嵌的图片导成 HTML 的 `<img>`，只认 Markdown 那种
 #: 会把它们静默漏掉——补图那一层于是取不到这些原图，而且不报错。
-_MD_IMAGE = re.compile(r"!\[[^\]]*\]\(\s*([^)\s]+)")
+#: Markdown 那种分三段是因为补图要往替代文本里写摘要（见 `set_image_alt`）：
+#: 空着才写，作者已经写好的不动。
+_MD_IMAGE = re.compile(r"!\[([^\]]*)\]\((\s*)([^)\s]+)")
 _HTML_IMAGE = re.compile(r"(<img\b[^>]*?\bsrc=[\"'])([^\"']+)([\"'])", re.IGNORECASE)
 
 
@@ -107,7 +109,12 @@ class ImageEnricher(Protocol):
     """
 
     def enrich(self, doc: NormalizedDoc) -> NormalizedDoc:
-        """读不了某张图时抛 :class:`SourceError`，由导入编排器按文件兜住。"""
+        """补完还是同一份 :class:`NormalizedDoc`。
+
+        单张图补不上（取不到原图、识别失败、摘要调用失败）留一条日志接着走，
+        不断整份资料的路；**整层用不了**（OCR 依赖没装）才抛异常，
+        由导入编排器按文件兜住——那种情况下每一张图都会补不上。
+        """
         ...
 
 
@@ -171,11 +178,53 @@ def _unsupported(source: SourceDocument, suffixes: Sequence[str]) -> Unsupported
     )
 
 
+@dataclass(frozen=True)
+class ImageRef:
+    """正文里的一处图片引用。补图那一层按它取原图、按位置落笔。"""
+
+    #: 引用地址：Markdown 的 `![](…)` 取括号里那段，HTML 的 `<img src="…">` 取 `src`。
+    ref: str
+    #: 这段引用在正文里**结束**的位置。二次 OCR 的文字插在它之后。
+    end: int
+    #: 替代文本。Markdown 的 `![alt](…)` 取方括号里那段，可能是空串——
+    #: 空着就是「还没有人说明过这张图」，补图往这里写摘要。
+    #: HTML 的 `<img>` 给 `None`：那里没有可写摘要的位置，这一段不往那写。
+    alt: str | None = None
+
+
+def image_refs_in(markdown: str) -> tuple[ImageRef, ...]:
+    """正文里的图片引用，按出现顺序。两种形式都认。"""
+    found = [
+        ImageRef(match.group(3), match.end(), match.group(1))
+        for match in _MD_IMAGE.finditer(markdown)
+    ]
+    found += [ImageRef(match.group(2), match.end()) for match in _HTML_IMAGE.finditer(markdown)]
+    return tuple(sorted(found, key=lambda item: item.end))
+
+
 def image_refs(markdown: str) -> tuple[str, ...]:
     """正文里引用到的图片地址，按出现顺序、去重前原样。"""
-    found = [(match.start(), match.group(1)) for match in _MD_IMAGE.finditer(markdown)]
-    found += [(match.start(), match.group(2)) for match in _HTML_IMAGE.finditer(markdown)]
-    return tuple(ref for _, ref in sorted(found))
+    return tuple(item.ref for item in image_refs_in(markdown))
+
+
+def set_image_alt(markdown: str, alt_by_ref: Mapping[str, str]) -> str:
+    """给替代文本空着的 Markdown 图片引用写上替代文本。
+
+    **不覆盖已经写好的替代文本**：那是作者或解析器给的说明，比模型现补的一段准，
+    覆盖掉等于拿一个可能更差的描述换掉一个已经能用的。
+
+    认不出的引用原样留着：一张图缺了不该让整份资料进不了库。
+    """
+
+    def markdown_ref(match: re.Match[str]) -> str:
+        alt, spaces, ref = match.group(1), match.group(2), match.group(3)
+        written = alt_by_ref.get(ref)
+        if alt.strip() or not written:
+            return match.group(0)
+        # 地址在这一段匹配的末尾之后，`![…](` 与空格原样拼回去
+        return f"![{written}]({spaces}{ref}"
+
+    return _MD_IMAGE.sub(markdown_ref, markdown)
 
 
 def rewrite_image_refs(markdown: str, mapping: Mapping[str, str]) -> str:
@@ -186,7 +235,7 @@ def rewrite_image_refs(markdown: str, mapping: Mapping[str, str]) -> str:
     """
 
     def markdown_ref(match: re.Match[str]) -> str:
-        ref = match.group(1)
+        ref = match.group(3)
         key = mapping.get(ref)
         if key is None:
             return _unmapped(match.group(0), ref)
