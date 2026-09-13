@@ -39,11 +39,16 @@ from html import unescape
 
 #: 图片命名空间的别名。中文站写「文件」，繁体站写「檔案」，都要认。
 _IMAGE_NAMESPACES = ("File", "Image", "文件", "图像", "圖片", "档案", "檔案")
+
 #: 分类命名空间。**输出必须原样留着**——打标器从它读主体类型。
-_CATEGORY_NAMESPACES = ("Category", "分类", "分類")
+#:
+#: 这个清单是**唯一一份**：`ragamer.tagging` 认分类用的正则也从它拼。两处各写一份的
+#: 话迟早会漂——漂掉的那一边不报错，只是繁体站的词条页标签悄悄变空（本模块加上
+#: `分類` 而打标器没跟上，就是已经发生过的一次）。
+CATEGORY_NAMESPACES = ("Category", "分类", "分類")
 
 _IMAGE_NAMESPACES_LOWER = {name.lower() for name in _IMAGE_NAMESPACES}
-_CATEGORY_NAMESPACES_LOWER = {name.lower() for name in _CATEGORY_NAMESPACES}
+_CATEGORY_NAMESPACES_LOWER = {name.lower() for name in CATEGORY_NAMESPACES}
 
 #: 占位符：`\\x00序号\\x00`。正文里不会出现空字符，拿它当掩码是安全的。
 _PLACEHOLDER = re.compile("\x00(\\d+)\x00")
@@ -151,8 +156,7 @@ def to_markdown(
     :param image_urls: 图片名（:func:`normalize_file_name` 的形态）→ 地址。
         查不到的那张图**原样留着**，不编一条空地址的链接。
     """
-    urls = image_urls or {}
-    images: list[str] = []
+    images = _Images(image_urls or {})
     shield = _Shield()
     lines = _strip(wikitext, shield).splitlines()
 
@@ -160,19 +164,41 @@ def to_markdown(
     index = 0
     while index < len(lines):
         if lines[index].lstrip().startswith("{|"):
-            table, index = _table(lines, index, images=images, image_urls=urls)
+            table, index = _table(lines, index, images=images)
             if table:
                 # 表格两侧各留一个空行：紧贴着上一段时，`|` 会被当成上一段的一部分
                 out.extend(["", *table, ""])
             continue
-        out.append(_line(lines[index], images=images, image_urls=urls))
+        out.append(_line(lines[index], images=images))
         index += 1
-    return WikiPage(markdown=shield.restore(_tidy(out)), images=tuple(images))
+    return WikiPage(markdown=shield.restore(_tidy(out)), images=tuple(images.found))
 
 
 def _remember(names: list[str], name: str) -> None:
     if name and name not in names:
         names.append(name)
+
+
+class _Images:
+    """图片那两件事：查地址用的对照表 + 正文里实际落到的地址。
+
+    两者要一起穿过每一层转换（标题、列表、表格的格子里都可能有图），成对出现在
+    七八个签名里；收成一个对象，那些签名就只剩一个参数。
+
+    `found` 是**按实际落到正文的**顺序记的，而不是源文里出现的顺序——查不到地址的
+    那张图不进正文（原样留着原始写法），也就没有地址可记。
+    """
+
+    def __init__(self, urls: Mapping[str, str]) -> None:
+        self._urls = urls
+        self.found: list[str] = []
+
+    def address(self, name: str) -> str:
+        """文件名（可带命名空间）→ 地址。查不到返回空串。"""
+        return self._urls.get(normalize_file_name(name), "")
+
+    def keep(self, url: str) -> None:
+        self.found.append(url)
 
 
 class _Shield:
@@ -297,14 +323,14 @@ def _closing(text: str, start: int, opener: str, closer: str) -> int:
     return -1
 
 
-def _inline(text: str, *, images: list[str], image_urls: Mapping[str, str]) -> str:
+def _inline(text: str, *, images: _Images) -> str:
     """一行里的行内标记。"""
     parts: list[str] = []
     for protected, segment in _segments(text):
         if not protected:
             parts.append(_plain(segment))
         elif segment.startswith("[["):
-            parts.append(_link(segment[2:-2], images=images, image_urls=image_urls))
+            parts.append(_link(segment[2:-2], images=images))
         else:
             parts.append(segment)
     return "".join(parts)
@@ -324,7 +350,7 @@ def _external(match: re.Match[str]) -> str:
     return f"[{label.strip()}]({url})" if label else f"<{url}>"
 
 
-def _link(inner: str, *, images: list[str], image_urls: Mapping[str, str]) -> str:
+def _link(inner: str, *, images: _Images) -> str:
     """`[[…]]` 里的内容。图片、分类、普通内链三种走向。"""
     parts = _split_top(inner)
     target = parts[0]
@@ -333,7 +359,7 @@ def _link(inner: str, *, images: list[str], image_urls: Mapping[str, str]) -> st
     if namespace in _CATEGORY_NAMESPACES_LOWER:
         return f"[[{inner}]]"
     if namespace in _IMAGE_NAMESPACES_LOWER:
-        return _image(target, parts[1:], images=images, image_urls=image_urls)
+        return _image(target, parts[1:], images=images)
     # `[[目标|显示]]`：显示文字要能读；`[[目标]]` 直接拿目标当文字。
     # 目标带 `#小节` 时整段留着——那一段本身就是读者要找的锚点
     return parts[1].strip() if len(parts) > 1 and parts[1].strip() else target.strip()
@@ -343,8 +369,7 @@ def _image(
     target: str,
     params: Sequence[str],
     *,
-    images: list[str],
-    image_urls: Mapping[str, str],
+    images: _Images,
 ) -> str:
     """`[[File:X.jpg|缩略图|说明]]` → `![说明](地址)`。
 
@@ -352,7 +377,7 @@ def _image(
     后者一眼就知道这张图没取到。
     """
     name = target.partition(":")[2]
-    url = image_urls.get(normalize_file_name(name), "")
+    url = images.address(name)
     if not url:
         return f"[[{target}{''.join(f'|{param}' for param in params)}]]"
     caption = ""
@@ -363,35 +388,33 @@ def _image(
             alternative = text[4:].strip()
         elif text and not _IMAGE_OPTION.match(text):
             caption = text
-    images.append(url)
+    images.keep(url)
     # 说明文字优先于 `alt=`：前者是图上看得见的那行字，检索时它比 alt 更像正文
     alt = caption or alternative or name.rsplit(".", 1)[0]
-    return f"![{_inline(alt, images=images, image_urls=image_urls)}]({url})"
+    return f"![{_inline(alt, images=images)}]({url})"
 
 
-def _line(line: str, *, images: list[str], image_urls: Mapping[str, str]) -> str:
+def _line(line: str, *, images: _Images) -> str:
     """一行（表格之外）。"""
     heading = _HEADING.match(line)
     if heading is not None:
-        title = _inline(heading.group(2), images=images, image_urls=image_urls).strip()
+        title = _inline(heading.group(2), images=images).strip()
         return f"{'#' * len(heading.group(1))} {title}"
     if _HRULE.match(line):
         # 夹在空行里：`----` 紧贴上一段时是 setext 标题，不是分隔线
         return "\n---\n"
     listed = _LIST.match(line)
     if listed is not None:
-        return _list_item(listed.group(1), listed.group(2), images=images, image_urls=image_urls)
-    return _inline(line, images=images, image_urls=image_urls)
+        return _list_item(listed.group(1), listed.group(2), images=images)
+    return _inline(line, images=images)
 
 
-def _list_item(
-    markers: str, content: str, *, images: list[str], image_urls: Mapping[str, str]
-) -> str:
+def _list_item(markers: str, content: str, *, images: _Images) -> str:
     """`*` 与 `#` 转成 Markdown 列表；`;` 与 `:` 只去掉记号（见模块开头那两条取舍）。"""
     if markers.strip("#") == "" and _REDIRECT.match(content.strip()):
         # `#REDIRECT [[目标]]`：接口带 `redirects=1` 时不会有它，留着是防没带上那一趟
-        return _inline(content, images=images, image_urls=image_urls)
-    text = _inline(content, images=images, image_urls=image_urls)
+        return _inline(content, images=images)
+    text = _inline(content, images=images)
     if markers.strip(";") == "":
         return f"**{text}**" if text else ""
     if markers.strip(":") == "":
@@ -406,8 +429,7 @@ def _table(
     lines: Sequence[str],
     start: int,
     *,
-    images: list[str],
-    image_urls: Mapping[str, str],
+    images: _Images,
 ) -> tuple[list[str], int]:
     """从 `{|` 起到配平的 `|}` 止，返回渲染好的 Markdown 表格行与下一个下标。
 
@@ -466,7 +488,7 @@ def _table(
             current[-1] = f"{current[-1]} {parts[0]}".strip()
             current += [_cell(part) for part in parts[1:]]
     flush()
-    return _render_table(caption, header, rows, images=images, image_urls=image_urls), index
+    return _render_table(caption, header, rows, images=images), index
 
 
 def _cells(text: str, separator: str) -> list[str]:
@@ -490,21 +512,20 @@ def _render_table(
     header: Sequence[str],
     rows: Sequence[Sequence[str]],
     *,
-    images: list[str],
-    image_urls: Mapping[str, str],
+    images: _Images,
 ) -> list[str]:
     width = max([len(header), *(len(row) for row in rows)], default=0)
     if width == 0:
         return []
 
     def render(row: Sequence[str]) -> str:
-        cells = [_inline(cell, images=images, image_urls=image_urls) for cell in row]
+        cells = [_inline(cell, images=images) for cell in row]
         cells += [""] * (width - len(cells))
         return "| " + " | ".join(cells) + " |"
 
     lines = []
     if caption:
-        lines.append(f"**{_inline(caption, images=images, image_urls=image_urls)}**")
+        lines.append(f"**{_inline(caption, images=images)}**")
     # 没有表头行时补一行空的，而不是把第一行数据提上来当表头——提上来那一行就重复了
     lines.append(render(header if header else [""] * width))
     lines.append("| " + " | ".join(["---"] * width) + " |")
@@ -517,29 +538,28 @@ def _split_top(text: str, separator: str = "|") -> list[str]:
 
     模板参数里再嵌模板是常态（`{{甲|{{乙|x}}}}`），不按层数跳过去，会在内层那个 `|`
     上切一刀——而这一刀切出来的参数看着还挺像回事，不报错。
+
+    括号的配平交给 :func:`_closing`：这里的活是「找到一段完整的内链／模板块然后跳过去」，
+    与那边是同一件事，各写一遍迟早会漂成两个口径。
     """
     parts: list[str] = []
-    current: list[str] = []
-    depth = 0
+    start = 0
     index = 0
     while index < len(text):
         pair = text[index : index + 2]
         if pair in ("[[", "{{"):
-            depth += 1
-        elif pair in ("]]", "}}"):
-            depth = max(0, depth - 1)
-        elif depth == 0 and text.startswith(separator, index):
-            parts.append("".join(current))
-            current = []
+            end = _closing(text, index, pair, "]]" if pair == "[[" else "}}")
+            if end < 0:
+                break  # 没配平：剩下的整段都算这一份
+            index = end + 2
+            continue
+        if text.startswith(separator, index):
+            parts.append(text[start:index])
             index += len(separator)
+            start = index
             continue
-        if pair in ("[[", "{{", "]]", "}}"):
-            current.append(pair)
-            index += 2
-            continue
-        current.append(text[index])
         index += 1
-    parts.append("".join(current))
+    parts.append(text[start:])
     return parts
 
 

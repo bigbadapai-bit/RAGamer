@@ -269,7 +269,7 @@ def test_失败信息带文件名与失败阶段():
         vocabulary=BLACK_MYTH,
     )
 
-    assert results[0].filename == "攻略.pdf"
+    assert results[0].source == "攻略.pdf"
     assert results[0].stage is ImportStage.NORMALIZE
     assert "攻略.pdf" in results[0].error
 
@@ -304,7 +304,7 @@ def test_每进入一个阶段上报一次():
     seen: list[tuple[str, ImportStage, int, int]] = []
     make_importer(
         on_progress=lambda event: seen.append(
-            (event.filename, event.stage, event.file_number, event.file_total)
+            (event.source, event.stage, event.file_number, event.file_total)
         )
     ).batch([markdown("甲.md"), markdown("乙.md")], game_id=GAME, vocabulary=BLACK_MYTH)
 
@@ -353,7 +353,7 @@ def test_结果里带着这个文件走过的阶段():
 
     assert [event.stage for event in result.progress][-1] is ImportStage.STORE
     first = result.progress[0]
-    assert (first.filename, first.file_number, first.file_total) == ("二郎神.md", 1, 1)
+    assert (first.source, first.file_number, first.file_total) == ("二郎神.md", 1, 1)
 
 
 # --- 跳过的条数 ---
@@ -482,7 +482,7 @@ def test_抓取失败落在归一化那一步():
 
     assert not result.ok
     assert result.stage is ImportStage.NORMALIZE
-    assert PAGE_URL in result.filename
+    assert PAGE_URL in result.source
     assert stored(chunks) == []
 
 
@@ -496,7 +496,7 @@ def test_网址导入的进度事件里报的是地址():
     ).import_url(PAGE_URL, game_id=GAME)
 
     assert events
-    assert {event.filename for event in events} == {PAGE_URL}
+    assert {event.source for event in events} == {PAGE_URL}
 
 
 def test_一批网址逐个独立():

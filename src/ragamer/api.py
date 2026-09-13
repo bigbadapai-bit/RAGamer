@@ -113,7 +113,7 @@ def _log_progress(event: ProgressEvent) -> None:
     """
     logger.info(
         "导入 %s：[%d/%d] %s",
-        event.filename,
+        event.source,
         event.file_number,
         event.file_total,
         STAGE_LABELS[event.stage],
@@ -158,7 +158,7 @@ def _vocabulary(container: Container, game_id: str) -> TagVocabulary:
 def _result_payload(result: ImportResult) -> dict[str, Any]:
     """一个文件的结果。失败时 `stage` 与 `error` 一起给出：界面要能说清卡在哪一步。"""
     return {
-        "filename": result.filename,
+        "source": result.source,
         "doc_title": result.doc_title,
         "chunk_count": result.chunk_count,
         "skipped": result.skipped,
@@ -171,7 +171,7 @@ def _result_payload(result: ImportResult) -> dict[str, Any]:
 
 def _event_payload(event: ProgressEvent) -> dict[str, Any]:
     return {
-        "filename": event.filename,
+        "source": event.source,
         "stage": event.stage.value,
         "stage_label": STAGE_LABELS[event.stage],
         "file_number": event.file_number,

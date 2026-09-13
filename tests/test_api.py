@@ -192,7 +192,7 @@ def test_某个文件失败时其余正常入库_失败信息带文件名与阶�
 
     assert (payload["imported"], payload["failed"]) == (2, 1)
     failed = payload["results"][1]
-    assert failed["filename"] == "攻略.pdf"
+    assert failed["source"] == "攻略.pdf"
     assert failed["stage"] == "normalize"
     assert failed["error"]
     assert saved(container)
@@ -248,7 +248,7 @@ def test_一批的条数按文件算(client):
     payload = import_articles(client, upload("甲.md"), upload("乙.md"))
 
     assert (payload["imported"], payload["failed"]) == (2, 0)
-    assert [result["filename"] for result in payload["results"]] == ["甲.md", "乙.md"]
+    assert [result["source"] for result in payload["results"]] == ["甲.md", "乙.md"]
 
 
 # --- 库与游戏 ---
@@ -352,7 +352,7 @@ def test_某个地址抓不到时其余照常入库(client, container):
 
     assert (payload["imported"], payload["failed"]) == (1, 1)
     failed = payload["results"][1]
-    assert failed["filename"] == MISSING_URL
+    assert failed["source"] == MISSING_URL
     assert failed["stage"] == "normalize"  # 抓取属于归一化那一步
     assert failed["error"]
     assert saved(container)  # 失败的那一条没有牵连成功的那一条

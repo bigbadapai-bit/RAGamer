@@ -77,7 +77,7 @@ class ProgressEvent:
     """一次阶段推进。每进入一个阶段发一条，阶段本身是「将要开始做」而不是「已经做完」。"""
 
     #: 这一条是从哪来的：文件名，或网址。
-    filename: str
+    source: str
     stage: ImportStage
     #: 这一批里的第几个文件，从 1 起。
     file_number: int
@@ -108,7 +108,7 @@ class ImportResult:
     """一个文件的导入结果。**失败也是结果**——一批里它失败了，其余照跑。"""
 
     #: 这一条是从哪来的：文件名，或网址。
-    filename: str
+    source: str
     #: 存进库里叫什么。同时是「重导时替换掉哪一批切片」的依据。
     doc_title: str
     #: 入库的切片数。
@@ -275,7 +275,7 @@ class Importer:
     ) -> ImportResult:
         """抓一个网址再导入。**抓完之后走的是同一条链路**：切分与打标不知道这份资料从哪来。
 
-        结果与进度事件里的 `filename` 报的是这个地址——网页没有文件名，
+        结果与进度事件里的 `source` 报的是这个地址——网页没有文件名，
         而「这一批里是哪一条失败了」总得有个能指认的东西。
         """
         crawler = self.crawler
@@ -293,7 +293,7 @@ class Importer:
 
     def _run(
         self,
-        name: str,
+        source: str,
         normalize: Callable[[], NormalizedDoc],
         *,
         game_id: str,
@@ -313,7 +313,7 @@ class Importer:
         def enter(stage: ImportStage) -> None:
             nonlocal current
             current = stage
-            event = ProgressEvent(name, stage, file_number, file_total)
+            event = ProgressEvent(source, stage, file_number, file_total)
             reported.append(event)
             if self.on_progress is not None:
                 self.on_progress(event)
@@ -322,7 +322,7 @@ class Importer:
         try:
             enter(ImportStage.NORMALIZE)
             doc = normalize()
-            doc_title = document_title(doc.markdown, name)
+            doc_title = document_title(doc.markdown, source)
             if self.enricher is not None:
                 enter(ImportStage.ENRICH)
                 doc = self.enricher.enrich(doc)
@@ -346,13 +346,13 @@ class Importer:
         except Exception as exc:
             logger.error(
                 "导入失败：%s · %s：%s",
-                name,
+                source,
                 STAGE_LABELS[current],
                 exc,
                 exc_info=True,
             )
             return ImportResult(
-                filename=name,
+                source=source,
                 doc_title=doc_title,
                 chunk_count=0,
                 skipped=0,
@@ -362,7 +362,7 @@ class Importer:
                 progress=tuple(reported),
             )
         return ImportResult(
-            filename=name,
+            source=source,
             doc_title=doc_title,
             chunk_count=len(rows),
             skipped=skipped,
@@ -468,12 +468,12 @@ def _warn_on_repeated_documents(results: Sequence[ImportResult], *, version: str
     for result in results:
         if not result.ok:
             continue
-        first = claimed.setdefault(result.doc_title, result.filename)
-        if first != result.filename:
+        first = claimed.setdefault(result.doc_title, result.source)
+        if first != result.source:
             logger.warning(
                 "同一批里 %s 与 %s 切出了同一个文档标题 %r（版本 %r）：后写的覆盖了前一份",
                 first,
-                result.filename,
+                result.source,
                 result.doc_title,
                 version,
             )

@@ -529,13 +529,101 @@ def test_抓下来的文档带来源地址():
 def test_跟过重定向之后记的是最终地址():
     """地址是引用的落点：记成中途那一跳，用户点回去看到的是另一页。"""
     site = page_site()
-    site.route(
-        "https://page.test/old",
-        lambda request: httpx.Response(301, headers={"location": "https://page.test/new"}),
-    )
+    site.route("https://page.test/old", redirect_to("https://page.test/new"))
     site.route("https://page.test/new", PAGE_HTML)
 
     assert make_crawler(site).crawl("https://page.test/old").source_url == ("https://page.test/new")
+
+
+# ── 重定向不能成为绕过合规的口子 ──────────────────────────
+
+
+def redirect_to(target: str) -> Any:
+    return lambda request: httpx.Response(301, headers={"location": target})
+
+
+def test_重定向到别的主机时那一跳也要过_robots():
+    """跳过去之后就是对那台主机的一次新请求，它同样受对方 robots 的约束。
+
+    跟着 httpx 一次跳到底会绕过这一层：robots.txt 里只写了入口那个地址。
+    """
+    site = page_site(**{"https://page.test/hop": redirect_to("https://other.test/offlimits")})
+    site.route("https://other.test/robots.txt", "User-agent: *\nDisallow: /offlimits\n")
+    site.route("https://other.test/", PAGE_HTML)
+
+    with pytest.raises(RobotsDisallowedError) as excinfo:
+        make_crawler(site).crawl("https://page.test/hop")
+
+    assert "other.test" in str(excinfo.value)
+    # 对方主机的 robots 读了，那一页本体没请求
+    assert "/robots.txt" in site.paths()
+    assert site.paths().count("/offlimits") == 0
+
+
+def test_重定向到别的主机时那一跳也要限频():
+    """限频按主机算：跳过去之后，那一跳与对方主机上此前那一次请求之间同样要隔开。"""
+    site = page_site(**{"https://page.test/hop": redirect_to("https://other.test/page")})
+    site.route("https://other.test/robots.txt", "User-agent: *\nDisallow:\n")
+    site.route("https://other.test/", PAGE_HTML)
+
+    make_crawler(site).crawl("https://page.test/hop")
+
+    other = [(path, at) for host, path, at in site.requests if host == "other.test"]
+    # 对方主机上先读 robots（不同主机，紧接着发），跳过去的那一跳则等满一秒
+    assert other == [("/robots.txt", 1.0), ("/page", 2.0)]
+
+
+def test_重定向有上限():
+    """转圈圈的站点不该把这一趟挂住。"""
+    site = page_site(**{"https://page.test/a1": redirect_to("https://page.test/a2")})
+    site.route("https://page.test/a2", redirect_to("https://page.test/a1"))
+
+    with pytest.raises(CrawlError) as excinfo:
+        make_crawler(site).crawl("https://page.test/a1")
+
+    assert "重定向" in str(excinfo.value)
+
+
+def test_robots_文件自己重定向时跟着走():
+    """`http://` 的地址被站点 301 到 `https://` 是常态，robots.txt 也一样——
+    跟不过去就会把一份其实读得到的规则当成「读不到」，按全禁处理。"""
+    site = FakeSite()
+    site.route("http://page.test/robots.txt", redirect_to("https://page.test/robots.txt"))
+    site.route("https://page.test/robots.txt", "User-agent: *\nDisallow: /private\n")
+    site.route("http://page.test/", PAGE_HTML)
+
+    crawler = make_crawler(site)
+    assert crawler.crawl("http://page.test/a").markdown  # 放行的那一页照抓
+
+    # 跳过去读到的规则确实生效了，不只是「读到了」而已
+    with pytest.raises(RobotsDisallowedError):
+        crawler.crawl("http://page.test/private")
+
+
+# ── 编码 ──────────────────────────────────────────────────
+
+
+def test_头里没说编码时按页面自己声明的读():
+    """中文老站把 `charset=gbk` 写在 `meta` 里、响应头什么都不写是常态。
+
+    按 UTF-8 硬读会让整篇正文变成乱码进库，而乱码的向量照样算得出来——查不出来也不报错。
+    """
+    html = (
+        '<html><head><meta charset="gbk"><title>二郎神</title></head><body>'
+        + "<h2>打法</h2><p>"
+        + "二郎神第二阶段要注意闪避。" * 8
+        + "</p>"
+        + "</body></html>"
+    ).encode("gbk")
+    site = page_site()
+    site.routes["https://page.test/"] = lambda request: httpx.Response(
+        200, content=html, headers={"content-type": "text/html"}
+    )
+
+    markdown = make_crawler(site).crawl("https://page.test/a").markdown
+
+    assert "闪避" in markdown
+    assert "�" not in markdown  # 一个替换字符都不该有
 
 
 # ── 两个纯函数 ────────────────────────────────────────────

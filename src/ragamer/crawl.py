@@ -11,9 +11,12 @@ MediaWiki 的声明，看一眼 HTML 就知道：
 - **普通网页**走正文抽取：导航、页脚、侧边栏这些 boilerplate 由 trafilatura 识别并丢掉，
   正文直接转成 Markdown。
 
-**合规的三件事全落在 :meth:`HttpCrawler._fetch` 一处**，因为任何一次出网都得经过它：
-先读该主机的 robots.txt、同一主机两次请求之间留足间隔、请求头里标明自己是谁。
-少走一处，那条路径就静默地不受约束——所以不给出网留第二条路。
+**出网只有一条路**（`_get` 查 robots、`_fetch` 限频与标明身份），因为合规的三件事都得
+落在这一条路上：先读该主机的 robots.txt、同一主机两次请求之间留足间隔、请求头里标明
+自己是谁。少走一处，那条路径就静默地不受约束——所以不给出网留第二条路。
+
+重定向也不例外：**每一跳都重新过一遍 robots 与限频**，跟着 httpx 一次跳到底会绕过这层
+（`robots.txt` 只写了入口那个地址）。
 
 🔴 **已知限制：不拦内网地址。** 这个端点收的是用户给的网址，多用户部署时它就是一个
 SSRF 面（`http://169.254.169.254/…`、`http://<内网服务>/`）。本项目现在是自己给自己
@@ -45,6 +48,13 @@ logger = get_logger(__name__)
 
 #: 一次 `prop=imageinfo` 最多问几个文件名。接口自己限 50。
 _IMAGE_BATCH = 50
+
+#: 一个地址最多跟几跳重定向。有上限，转圈圈的站点不会把这一趟挂住。
+_MAX_REDIRECTS = 5
+
+#: 响应头没说编码时，到正文开头这么多字节里找 `<meta charset>`。
+_CHARSET_SNIFF = 4096
+_META_CHARSET = re.compile(rb"""<meta[^>]+charset\s*=\s*["']?\s*([a-zA-Z0-9_\-]+)""", re.IGNORECASE)
 
 #: 站点的接口地址发现方式（RSD）。MediaWiki 每个页面都会在 head 里声明它，
 #: 脚本路径是 `/w/` 还是根目录、语言子域占了几段路径，它一律说得准。
@@ -83,10 +93,16 @@ class RobotsDisallowedError(AccessDeniedError):
 
 @dataclass(frozen=True)
 class _Fetched:
-    """一次出网的产物。`url` 是跟过重定向之后的最终地址。"""
+    """一次出网的产物。
+
+    一次请求只走一跳：`redirect` 非空时 `text` 是空的，调用方拿着 `redirect`
+    再走一跳——**每一跳都要重新过 robots 与限频**，所以跟随的动作留在调用方。
+    """
 
     text: str
     url: str
+    #: 这一跳指向哪里（`Location` 头的原样值）；不是重定向时是空串。
+    redirect: str = ""
 
 
 class HttpCrawler:
@@ -130,35 +146,62 @@ class HttpCrawler:
     # ── 出网 ──────────────────────────────────────────────
 
     def _get(self, url: str) -> _Fetched:
-        """先问 robots 再出网。**业务代码一律走它。**"""
-        rules = self._robots_for(_origin(url))
-        if rules is not None and not rules.can_fetch(self._config.user_agent, url):
-            raise RobotsDisallowedError(
-                f"{url}：该站点的 robots.txt 不允许抓这个地址。"
-                "换个允许抓的来源，或直接找站点要 dump"
-            )
-        return self._fetch(url)
+        """先问 robots 再出网。**业务代码一律走它。**
+
+        重定向在这里一跳一跳地跟着走，**每一跳都重新过一遍 robots**：跳到另一台主机之后，
+        那一跳就是对那台主机的一次新请求，它同样受对方 robots 的约束。让 httpx 一次跟到底
+        会绕过这一层——`robots.txt` 只写了入口那个地址，跳过去的地方未必允许抓，
+        而这种事不报错，只是悄悄多抓了几页。
+        """
+        start = url
+        for _ in range(_MAX_REDIRECTS + 1):
+            rules = self._robots_for(_origin(url))
+            if rules is not None and not rules.can_fetch(self._config.user_agent, url):
+                raise RobotsDisallowedError(
+                    f"{url}：该站点的 robots.txt 不允许抓这个地址。"
+                    "换个允许抓的来源，或直接找站点要 dump"
+                )
+            fetched = self._fetch(url)
+            if not fetched.redirect:
+                return fetched
+            url = urljoin(url, fetched.redirect)
+        raise CrawlError(f"{start}：重定向超过 {_MAX_REDIRECTS} 次还没到头")
 
     def _fetch(self, url: str) -> _Fetched:
-        """真正出网的那一层：限频 + 标明身份的 UA。robots.txt 自己走这里，免得自指。"""
+        """真正出网的那一层：限频 + 标明身份的 UA + 字节上限。
+
+        **不跟随重定向**——每一跳都要重新过 robots 与限频，那是 `_get` 的事。
+        robots.txt 自己也走这里（它就是规则本身，不受自己约束），所以它另走
+        :meth:`_follow` 把跳转跟完。
+        """
         self._throttle(_origin(url))
         try:
-            # 重定向在这里显式跟随，不靠客户端的构造参数：注入的客户端（测试用的
-            # MockTransport）默认是不跟的，那样两处行为会不一样，而差别只在跳转过的页面上
-            # 才看得出来——地址记成中途那一跳，用户点回去看到的是另一页
             with self._client.stream(
                 "GET",
                 url,
                 headers={"User-Agent": self._config.user_agent},
-                follow_redirects=True,
+                follow_redirects=False,
             ) as response:
+                target = response.headers.get("location")
+                if response.is_redirect and target:
+                    return _Fetched(text="", url=str(response.url), redirect=target)
                 raise_for_status(response, url)
                 body = _read_capped(response, self._config.max_bytes, url)
-                return _Fetched(text=_decode(body, response.encoding), url=str(response.url))
+                return _Fetched(text=_decode_body(body, response.encoding), url=str(response.url))
         except httpx.HTTPError as exc:
             # 域名解析不了、连接被拒、读超时都落在这里。翻成一句话，别把 httpx 的
             # 异常类型甩给用户看
             raise SiteUnreachableError(f"{url}：连不上站点（{type(exc).__name__}：{exc}）") from exc
+
+    def _follow(self, url: str) -> _Fetched:
+        """跟完重定向，但**不查 robots**。只给 robots.txt 自己用。"""
+        start = url
+        for _ in range(_MAX_REDIRECTS + 1):
+            fetched = self._fetch(url)
+            if not fetched.redirect:
+                return fetched
+            url = urljoin(url, fetched.redirect)
+        raise CrawlError(f"{start}：重定向超过 {_MAX_REDIRECTS} 次还没到头")
 
     def _throttle(self, origin: str) -> None:
         """同一台主机两次请求之间至少隔 `min_interval` 秒。
@@ -189,7 +232,7 @@ class HttpCrawler:
     def _load_robots(self, origin: str) -> RobotFileParser | None:
         url = f"{origin}/robots.txt"
         try:
-            body = self._fetch(url).text
+            body = self._follow(url).text
         except PageNotFoundError:
             logger.info("%s 没有 robots.txt，按不限制处理", origin)
             return None
@@ -401,13 +444,14 @@ def _read_capped(response: httpx.Response, limit: int, url: str) -> bytes:
     return b"".join(chunks)
 
 
-def _decode(body: bytes, encoding: str | None) -> str:
-    """按响应头声明的编码读，读不了退回 UTF-8。
+def _decode_body(body: bytes, encoding: str | None) -> str:
+    """按响应头声明的编码读；头里没说就在正文开头的 `<meta charset>` 里找；再没有才按 UTF-8。
 
-    只认响应头、不去猜编码：猜错的中文正文会变成一片乱码进库，而乱码的向量照样算得出来，
-    查不出来也不报错。
+    **不猜编码**（不上字符集探测库）：猜错的中文正文会整篇变成乱码进库，而乱码的向量照样
+    算得出来，查不出来也不报错。但 `meta` 里声明的不算猜——那是页面自己写的，
+    而中文老站点把 `charset=gbk` 写在 `meta` 里、头里什么都不写是常态。
     """
-    for candidate in (encoding, "utf-8"):
+    for candidate in (encoding, _declared_charset(body), "utf-8"):
         if not candidate:
             continue
         try:
@@ -415,6 +459,12 @@ def _decode(body: bytes, encoding: str | None) -> str:
         except (UnicodeDecodeError, LookupError):
             continue
     return body.decode("utf-8", errors="replace")
+
+
+def _declared_charset(body: bytes) -> str:
+    """正文开头的 `<meta charset=…>` 声明的编码。没有则空串。"""
+    found = _META_CHARSET.search(body[:_CHARSET_SNIFF])
+    return found.group(1).decode("ascii", errors="ignore") if found else ""
 
 
 def _deny_all() -> RobotFileParser:
