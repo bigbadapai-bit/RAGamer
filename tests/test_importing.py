@@ -19,9 +19,9 @@ from ragamer.importing import (
     content_hash,
     document_title,
 )
-from ragamer.sources import NormalizedDoc, SourceDocument
-from ragamer.stores.base import UNVERSIONED
-from ragamer.stores.memory import InMemoryChunkStore
+from ragamer.sources import NormalizedDoc, SourceAsset, SourceDocument
+from ragamer.stores.base import UNVERSIONED, image_prefix
+from ragamer.stores.memory import InMemoryChunkStore, InMemoryObjectStore
 from ragamer.tagging import ContentNature, SubjectType, TagVocabulary
 from ragamer.vectors.base import ModelUnavailableError
 from ragamer.vectors.fake import FakeEmbedder
@@ -29,6 +29,9 @@ from ragamer.vectors.fake import FakeEmbedder
 RULES = ChunkRules(max_chars=200, min_chars=40, heading_density=0.02)
 
 GAME = "black_myth"
+
+#: 一份截图的字节。独立上传的攻略截图走的正是带附件那条路。
+SCREENSHOT = "截图".encode()
 
 #: 一份词条页：结构齐全，打标全部走结构那条路，一次模型都不调。
 WIKI_ARTICLE = """\
@@ -91,6 +94,31 @@ class RecordingEnricher:
     def enrich(self, doc: NormalizedDoc) -> NormalizedDoc:
         self.docs.append(doc)
         return doc
+
+
+class StubParser:
+    """直接给一份归一化文档的假解析器。
+
+    真去造 MinerU 的字节没有意义——这里验的是编排器拿到带附件的文档之后怎么接
+    （`tests/test_mineru.py` 验的是那份文档怎么来的）。
+    """
+
+    SUFFIXES = (".png",)
+
+    def __init__(self, doc: NormalizedDoc) -> None:
+        self.doc = doc
+
+    def parse(self, source: SourceDocument) -> NormalizedDoc:
+        return self.doc
+
+
+def scanned_doc() -> NormalizedDoc:
+    """一份带附件的归一化文档：独立上传的攻略截图就是这样。"""
+    return NormalizedDoc(
+        markdown="# 二郎神\n\n![立绘](images/a.png)\n\n打法：先定身。\n",
+        images=("images/a.png",),
+        assets=(SourceAsset("images/a.png", b"PNG", "image/png"),),
+    )
 
 
 def make_importer(chunks=None, *, embedder=None, **kwargs) -> Importer:
@@ -370,6 +398,47 @@ def test_没有正文的切片不入库并计入跳过(monkeypatch):
     assert result.ok
     assert (result.chunk_count, result.skipped) == (0, 1)
     assert stored(chunks) == []
+
+
+# --- 解析产物里的附件 ---
+
+
+def test_附件存进对象存储_正文里的引用改指对象_key():
+    """独立上传的截图走的正是这条路：图先落对象存储，切片正文里留的是它的 key。"""
+    chunks = InMemoryChunkStore()
+    objects = InMemoryObjectStore()
+    importer = make_importer(chunks, parser=StubParser(scanned_doc()), objects=objects)
+
+    result = importer.import_one(SourceDocument("攻略.png", SCREENSHOT), game_id=GAME)
+
+    assert result.ok
+    keys = objects.list_keys(image_prefix(GAME))
+    assert len(keys) == 1
+    assert objects.get(keys[0]) == b"PNG"
+    assert all(keys[0] in chunk.content for chunk in stored(chunks))
+
+
+def test_同一份资料重导_图片原样覆盖同一个对象():
+    """对象 key 取自来源文件的字节，与切片主键是同一套幂等思路。"""
+    objects = InMemoryObjectStore()
+    importer = make_importer(parser=StubParser(scanned_doc()), objects=objects)
+    source = SourceDocument("攻略.png", SCREENSHOT)
+
+    importer.import_one(source, game_id=GAME)
+    importer.import_one(source, game_id=GAME)
+
+    assert len(objects.list_keys(image_prefix(GAME))) == 1
+
+
+def test_有附件却没接对象存储时那个文件失败并说清原因():
+    """静默把图丢掉是最坏的结果：库里一堆指向不存在对象的引用，而且什么都不报。"""
+    result = make_importer(parser=StubParser(scanned_doc())).import_one(
+        SourceDocument("攻略.png", SCREENSHOT), game_id=GAME
+    )
+
+    assert not result.ok
+    assert result.stage is ImportStage.NORMALIZE
+    assert "对象存储" in (result.error or "")
 
 
 # --- 主键与摘要 ---

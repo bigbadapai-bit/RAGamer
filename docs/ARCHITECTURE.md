@@ -73,6 +73,8 @@ flowchart LR
 **这与原项目 `node_md_img` 的设计是同一件事的延伸**：那个节点本来就在做"给图片补一段可检索的文本"（把 VLM 摘要塞进 alt 文本），二次 OCR 只是给它补上另一路输入。
 
 > **上生产前必须做的实验**：拿 20 张真实攻略截图（长图 / Excel 截图 / wiki 截图各若干），分别用 `pipeline` 和 `vlm` 各跑一遍，统计 `type == "image"` 的条目中「有 `img_path` 但无 `content`」的比例 —— **这个比例就是必须依赖二次 OCR 的比例**。这比任何文档调研都准。
+>
+> 运行器已就位：`uv run python tools/mineru_ocr_experiment.py <截图目录> --out docs/experiments/mineru-ocr.md`。口径在脚本里写死成两条（条目自带 `text` / 正文里紧跟的 `<details>` 折叠块），比「无 `content`」严——正文里的图内文字按 §1.2 是落在折叠块里、不进 `content_list` 的，只按字段判会把 vlm 后端算成一条都没提到。**这个数字还没跑出来**（缺真实凭据与截图），T12 的范围因此未定。
 
 ⚠️ 另一个未确证项：`MAX_PAGE_ASPECT_RATIO = 10.0` + 200 DPI 重采样对**超长攻略图**的影响，无官方说明，需实测。
 

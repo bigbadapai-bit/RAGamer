@@ -17,6 +17,8 @@ from dataclasses import dataclass
 from ragamer.config import Settings
 from ragamer.llm import LlmClient, OpenAiLlm
 from ragamer.logging import get_logger
+from ragamer.mineru import MineruClient, MineruParser
+from ragamer.sources import MarkdownParser, ParserRouter, SourceParser
 from ragamer.stores.base import (
     ChunkStore,
     DocStore,
@@ -45,6 +47,8 @@ class Container:
     reranker: Reranker
     #: 语言模型。打标兜底、查询路由、多查询改写、生成都走它。
     llm: LlmClient
+    #: 解析适配器，按扩展名把一份资料交给唯一的那个（`ragamer.sources.ParserRouter`）。
+    parser: SourceParser
 
     def stores(self) -> tuple[Store, ...]:
         """三个存储服务，自检按这个顺序走。"""
@@ -90,4 +94,11 @@ def build_container(settings: Settings) -> Container:
         embedder=BgeM3Embedder(settings.embed, settings.models),
         reranker=BgeReranker(settings.rerank, settings.models),
         llm=OpenAiLlm(settings.llm),
+        parser=ParserRouter(
+            (
+                MarkdownParser(),
+                # PDF 与图片走云端解析；它拿到的原图由导入编排器送进对象存储
+                MineruParser(MineruClient(settings.mineru)),
+            )
+        ),
     )

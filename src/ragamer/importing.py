@@ -30,10 +30,13 @@ from ragamer.logging import get_logger
 from ragamer.sources import (
     ImageEnricher,
     MarkdownParser,
+    NormalizedDoc,
     SourceDocument,
+    SourceError,
     SourceParser,
+    publish_assets,
 )
-from ragamer.stores.base import UNVERSIONED, Chunk, ChunkStore
+from ragamer.stores.base import UNVERSIONED, Chunk, ChunkStore, ObjectStore
 from ragamer.tagging import TaggedChunk, TagVocabulary, tag_document
 from ragamer.vectors.base import Embedder, ModelOutputError
 
@@ -154,6 +157,15 @@ def content_hash(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
+def _source_digest(data: bytes) -> str:
+    """来源文件的摘要，进原图的对象 key（见 `ragamer.stores.base.image_key`）。
+
+    取前 16 位十六进制（64 bit）：同一份文件重导算出同一个 key，图片原地覆盖，
+    与切片主键由导入侧分配是同一套幂等思路；不同文件即使同名也各有各的一层。
+    """
+    return hashlib.sha256(data).hexdigest()[:16]
+
+
 @dataclass(frozen=True)
 class Importer:
     """一次导入的接线。外部依赖由组合根注入（见 `ragamer.container`）。
@@ -166,8 +178,11 @@ class Importer:
     embedder: Embedder
     #: 打标兜底用的模型。不传时结构读不出来的标签留空，不阻断入库。
     llm: LlmClient | None = None
-    #: 解析适配器。默认只认 md／txt，另外两条来源在后面的票里接上。
+    #: 解析适配器。默认只认 md／txt；PDF 与图片由组合根接上 MinerU（`ragamer.mineru`）。
     parser: SourceParser = field(default_factory=MarkdownParser)
+    #: 对象存储。解析产物里的原图存进它，正文里的引用改指对象 key。
+    #: 不传时 md／txt 照跑；真来了附件还没有它，那一步会当场报错而不是把图丢掉。
+    objects: ObjectStore | None = None
     #: 补图。没接上时这一步不做、也不上报——报了就是假进度。
     enricher: ImageEnricher | None = None
     #: 切分参数。不传用 `ChunkRules` 的默认值。
@@ -228,7 +243,7 @@ class Importer:
         doc_title = ""
         try:
             enter(ImportStage.NORMALIZE)
-            doc = self.parser.parse(source)
+            doc = self._publish(self.parser.parse(source), source, game_id)
             doc_title = document_title(doc.markdown, source.filename)
             if self.enricher is not None:
                 enter(ImportStage.ENRICH)
@@ -271,6 +286,24 @@ class Importer:
             skipped=skipped,
             tags=_covered(tagged),
             progress=tuple(reported),
+        )
+
+    def _publish(self, doc: NormalizedDoc, source: SourceDocument, game_id: str) -> NormalizedDoc:
+        """解析产物里的原图进对象存储，正文与条目级结构的引用改指对象 key（`sources`）。
+
+        没有附件（md／txt 来源）就直接过。**有附件却没接对象存储是接线错了**：
+        图片会连着正文里的引用一起悬空，而且整份资料照样报成功——宁可当场炸，
+        让那一个文件带着原因失败。
+        """
+        if not doc.assets:
+            return doc
+        if self.objects is None:
+            raise SourceError(
+                f"{source.filename}：解析产物里有 {len(doc.assets)} 个附件，但没有接对象存储，"
+                "它们会连同正文里的引用一起悬空"
+            )
+        return publish_assets(
+            doc, self.objects, game_id=game_id, digest=_source_digest(source.data)
         )
 
     def _vectorize(

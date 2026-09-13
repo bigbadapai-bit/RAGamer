@@ -31,6 +31,8 @@ _ADAPTERS = {
     "BgeM3Embedder",
     "BgeReranker",
     "OpenAiLlm",
+    "MineruClient",
+    "MineruParser",
 }
 
 #: 供应商库只允许出现在各自的适配器模块里：其余模块只认 ragamer.stores 与
@@ -64,6 +66,7 @@ def test_守则扫到了源码():
         "chunking.py",
         "tagging.py",
         "sources.py",
+        "mineru.py",
         "importing.py",
         "api.py",
         "logging.py",

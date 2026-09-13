@@ -73,7 +73,8 @@ uv run pytest -m integration     # 跑真模型的集成测试（首次会下载
 
 写入侧的入口是 `POST /api/kb/{game_id}/import`——上传若干份资料、每个文件独立处理。
 四个来源先归一为 Markdown（`ragamer.sources`），之后串起补图、切分、打标、向量化与入库
-（`ragamer.importing`）。现在只接上了 md／txt 一条来源，MinerU 与网页爬虫在后面两张票里接。
+（`ragamer.importing`）。按扩展名挑适配器：md／txt 直接读，**PDF 与图片走 MinerU 云端解析**
+（`ragamer.mineru`），网页爬虫在后面一张票里接。
 
 - **一批里某个文件失败不牵连其余**：响应的 `results` 逐文件给结果，失败的那个带
   `filename`、`stage`（卡在哪一步）与 `error`。整批都失败也是 200，不是 500。
@@ -84,14 +85,32 @@ uv run pytest -m integration     # 跑真模型的集成测试（首次会下载
 - 打标用的词表来自知识库元数据（MongoDB 的 `knowledge_bases` 集合，id 即游戏 id）。
   库不存在时 404，不静默按默认词表建内容。
 
+### PDF 与图片
+
+一份资料走四步：申请上传链接 → PUT 上传 → 轮询结果 → 下载结果包（`RAGAMER_MINERU_*` 那组配置）。
+
+- **不无限等**：轮询有间隔与总时长两个上限，到点报错并带上最后看到的状态；
+  任务本身 `failed` 当场抛错，不等满时长。5xx 会重试，凭据被拒不会。
+- **大文件不走系统代理**：客户端 `trust_env=False`——上传与下载都是几十上百 MB，
+  走代理会超时。
+- **凭据不外流**：Token 只发给 MinerU 的接口，上传与下载走预签名地址，单独不带它。
+- **原图进对象存储**：结果包里的图片存到 MinIO，正文与条目级结构里的引用一并改指
+  对象 key。key 是 `images/<游戏>/<来源文件摘要>/<文件名>`，**写入与清理共用
+  `ragamer.stores.base.image_key` 一个函数**——两处各拼一遍前缀就会对不上，
+  清旧图时静默失效（原项目踩过）。摘要取自来源文件的字节，所以重导同一份资料是原地覆盖。
+- **图内文字别指望它**：MinerU 不把图片区域里的文字 OCR 成正文，这是它的产品决策
+  （见 [§1.2](docs/ARCHITECTURE.md)）。二次 OCR 回填在下一张票里接；那之前先跑
+  `tools/mineru_ocr_experiment.py` 量出「必须依赖二次 OCR 的比例」。
+
 ## 目录
 
 ```
 src/ragamer/          应用代码（config 配置装载、logging 日志、llm 语言模型适配器、sources 归一化、
-                      chunking 切分器、tagging 打标、importing 导入编排器、api HTTP 端点、
-                      container 组合根、__main__ 启动自检）
+                      mineru PDF 与图片的云端解析、chunking 切分器、tagging 打标、
+                      importing 导入编排器、api HTTP 端点、container 组合根、__main__ 启动自检）
 src/ragamer/stores/   存储适配器：base 协议与共享类型、chunks Milvus、documents Mongo、objects MinIO、memory 内存假件
 src/ragamer/vectors/  向量化与精排：base 协议与共享类型、bge 真实模型、fake 确定性假件
 tests/                测试：行为测试 + 结构约束 + 集成测试
+tools/                一次性脚本：mineru_ocr_experiment 量图内文字提取率（不进包，需真实凭据与截图）
 docs/                 架构文档、ADR、给 agent 的说明
 ```

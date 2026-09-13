@@ -13,12 +13,19 @@ import pytest
 from fastapi.testclient import TestClient
 
 from ragamer.api import KB_COLLECTION, create_app
-from ragamer.stores.base import UNVERSIONED
+from ragamer.mineru import MineruParser
+from ragamer.sources import MarkdownParser, ParserRouter
+from ragamer.stores.base import UNVERSIONED, image_prefix
+from ragamer.stores.memory import InMemoryObjectStore
 
 from .conftest import make_container
+from .test_mineru import FakeMineru, FakeTime, make_client
 
 GAME = "black_myth"
 CHUNKS_URL = f"/api/kb/{GAME}/import"
+
+#: 假 MinerU 服务回的正文里的大标题，也就是入库时的文档标题。
+DOC_TITLE = "二郎神攻略"
 
 ARTICLE = """\
 # 二郎神
@@ -231,6 +238,62 @@ def test_一批的条数按文件算(client):
 
     assert (payload["imported"], payload["failed"]) == (2, 0)
     assert [result["filename"] for result in payload["results"]] == ["甲.md", "乙.md"]
+
+
+# --- PDF 与图片这条来源 ---
+
+
+def mineru_container() -> tuple[FakeMineru, object]:
+    """一个把 MinerU 接上的容器：假服务 + 内存对象存储，一次网络都不发。
+
+    解析器这一组照组合根那份配：md／txt 走 MarkdownParser，PDF 与图片走 MinerU。
+    """
+    fake = FakeMineru()
+    container = make_container(
+        objects=InMemoryObjectStore(),
+        parser=ParserRouter((MarkdownParser(), MineruParser(make_client(fake, FakeTime())))),
+    )
+    container.docs.put(KB_COLLECTION, GAME, KB)
+    return fake, container
+
+
+def screenshot() -> tuple[str, tuple[str, bytes, str]]:
+    return ("files", ("攻略.png", "截图".encode(), "image/png"))
+
+
+def test_上传截图走端点里接上的_MinerU_并完成入库():
+    """接上 MinerU 的是组合根那一步：`api` 要把 `container.parser` 与 `container.objects`
+    传进编排器。缺了这条线，截图与 PDF 会当场报「没有对应的解析适配器」——
+    默认那套解析器只认 md／txt，这条缝不测就看不出来。
+    """
+    _, container = mineru_container()
+    client = TestClient(create_app(container))
+
+    payload = import_articles(client, screenshot())
+
+    assert payload["imported"] == 1
+    stored = container.chunks.fetch_document(GAME, DOC_TITLE, version=UNVERSIONED)
+    assert payload["results"][0]["chunk_count"] == len(stored)
+    assert stored
+    # 图进了对象存储，正文里留的是它的 key
+    keys = container.objects.list_keys(image_prefix(GAME))
+    assert len(keys) == 2
+    assert all(any(key in chunk.content for chunk in stored) for key in keys)
+
+
+def test_一批里截图失败不牵连_markdown():
+    """MinerU 那边挂了是那一份资料的事，同一批里的 md 照常入库。"""
+    fake, container = mineru_container()
+    fake.states = ["failed"]
+    client = TestClient(create_app(container))
+
+    payload = import_articles(client, upload("二郎神.md"), screenshot())
+
+    assert (payload["imported"], payload["failed"]) == (1, 1)
+    failed = payload["results"][1]
+    assert failed["filename"] == "攻略.png"
+    assert failed["stage"] == "normalize"  # 卡在归一化那一步
+    assert saved(container)  # 另一份照常入库
 
 
 # --- 库与游戏 ---
