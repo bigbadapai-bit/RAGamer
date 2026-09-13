@@ -507,6 +507,25 @@ def test_没有消息的调用在发出前就被拦下():
 # ── 假件 ──
 
 
+def test_首条不是系统提示时结构化调用不丢消息(llm_config):
+    """一次调用可以只有一条 user 消息。系统提示要**插在它前面**，不是把它顶掉——
+    顶掉之后模型收到的是一段光秃秃的 schema 说明，问题本身没了，而且不报错。"""
+    payloads: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payloads.append(json.loads(request.content))
+        body = '{"subject_name":"二郎神","rewritten_query":"二郎神 打法","routes":[]}'
+        return httpx.Response(200, json=_reply(body))
+
+    _llm(handler, llm_config).complete_structured(
+        LlmRequest(messages=[Message("user", "二郎神怎么打")]), 联合输出
+    )
+
+    prompt = _messages_of(payloads[0])
+    assert "二郎神怎么打" in prompt
+    assert "JSON Schema" in prompt
+
+
 def test_假件与真实客户端是同一个接口(llm_config):
     assert isinstance(OpenAiLlm(llm_config), LlmClient)
     assert isinstance(FakeLlm("嗨"), LlmClient)

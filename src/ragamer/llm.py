@@ -419,14 +419,18 @@ def _with_schema(
     schema: type[BaseModel],
     repair: str | None,
 ) -> tuple[Message, ...]:
-    """把「要输出什么结构」并进系统提示；重试时再带上上一次的毛病。"""
+    """把「要输出什么结构」并进系统提示；重试时再带上上一次的毛病。
+
+    首条不是系统提示时**在它前面插一条**，不是把它顶掉——一次调用可以只有一条 user
+    消息，顶掉之后模型收到的是光秃秃的 schema 说明，问题本身没了，而且不报错。
+    """
     instruction = _schema_instruction(schema)
     if repair is not None:
         instruction = f"{instruction}\n\n{repair}"
     head, rest = messages[0], tuple(messages[1:])
     if head.role == "system":
         return (Message("system", f"{head.content}\n\n{instruction}"), *rest)
-    return (Message("system", instruction), *rest)
+    return (Message("system", instruction), head, *rest)
 
 
 def _schema_instruction(schema: type[BaseModel]) -> str:
