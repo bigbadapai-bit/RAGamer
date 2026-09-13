@@ -438,3 +438,13 @@ def test_配置里写了不认识的主体类型要报错():
 def test_一个主体类型都不启用要报错():
     with pytest.raises(ValueError, match="至少要启用一个主体类型"):
         TagVocabulary(subject_types=())
+
+
+def test_两条叫法归一之后是同一条要报错():
+    """只差大小写或首尾空白时，后写的那条会静默顶掉前一条——界面上看着两行都在，
+    实际只有一条生效。映射表是界面上手填的，这里拦下比让它躺进库里强。"""
+    with pytest.raises(ValueError, match="归一之后是同一条"):
+        TagVocabulary(term_mapping={"妖王": SubjectType.CHARACTER, " 妖王 ": SubjectType.ITEM})
+
+    with pytest.raises(ValueError, match="归一之后是同一条"):
+        TagVocabulary(term_mapping={"Buff": SubjectType.SYSTEM, "buff": SubjectType.ITEM})

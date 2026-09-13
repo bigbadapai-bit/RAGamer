@@ -163,6 +163,10 @@ class TagVocabulary:
             raise ValueError("至少要启用一个主体类型，否则全部切片都会漏标")
         # 叫法的比对形式在构造时定下来，查表时才不必指望调用方先洗干净
         normalized = {_normalize(term): kind for term, kind in self.term_mapping.items()}
+        if len(normalized) != len(self.term_mapping):
+            # 两条叫法只差大小写或首尾空白时，归一之后是同一条，后写的那条会静默顶掉前一条。
+            # 界面上两张行看起来都在，实际只有一条生效——在这里拦下，别让它在库里躺成谜
+            raise ValueError("术语映射里有两条叫法归一之后是同一条（只差大小写或首尾空白）")
         object.__setattr__(self, "term_mapping", normalized)
 
     @classmethod

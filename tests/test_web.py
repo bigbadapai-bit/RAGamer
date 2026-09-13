@@ -3,6 +3,9 @@
 只断言外部可观察的行为——HTTP 响应本身，以及通过存储适配器的查询接口能观察到的结果。
 这一票要的是「浏览器里能看见东西」，所以这里按验收条目逐条走一遍：建库 → 传 md →
 预览页列出切片。
+
+知识库管理那几条同样只看外部行为：改了配置之后**下一次导入**落下来的标签对不对，
+而不是去翻内存里那个 dict 长什么样——「保存后立即生效」要验的正是这条链路。
 """
 
 from __future__ import annotations
@@ -13,11 +16,16 @@ import pytest
 from fastapi.testclient import TestClient
 
 from ragamer.app import create_app
-from ragamer.knowledge import KB_COLLECTION, KnowledgeBase, create_knowledge_base
-from ragamer.stores.base import UNVERSIONED
+from ragamer.knowledge import (
+    KB_COLLECTION,
+    KnowledgeBase,
+    create_knowledge_base,
+    vocabulary_of,
+)
+from ragamer.stores.base import UNVERSIONED, image_key, image_prefix
 from ragamer.tagging import SubjectType
 
-from .conftest import make_container
+from .conftest import BrokenChunkStore, make_container
 
 GAME = "black_myth"
 DOC_TITLE = "二郎神"
@@ -330,3 +338,273 @@ def test_还没做的页面点进去是一句人话而不是_404(client, path):
 
     assert response.status_code == 200
     assert "这个页面还没做" in response.text
+
+
+# --- 验收：知识库管理页 ---
+
+CONFIG_URL = f"/kb/{GAME}"
+TERMS_URL = f"{CONFIG_URL}/terms"
+DELETE_URL = f"{CONFIG_URL}/delete"
+
+#: 另一份语料：它的分类「心法」不在 fixture 那个库的映射里，靠界面上加一条才能认出来。
+SKILL_ARTICLE = """\
+# 七十二变
+
+[[Category:心法]]
+
+变化之术，共七十二般。
+"""
+
+
+def kb_page(client, game_id: str = GAME):
+    return client.get(f"/kb/{game_id}")
+
+
+def save(client, game_id: str = GAME, **data):
+    """走一遍「保存基本配置」。缺的字段按 fixture 那个库的样子填。"""
+    data.setdefault("name", KB["name"])
+    data.setdefault("subject_types", ["character", "item"])
+    return client.post(f"/kb/{game_id}", data=data, follow_redirects=False)
+
+
+def add_term(client, term: str, kind: str, game_id: str = GAME):
+    return client.post(
+        f"/kb/{game_id}/terms", data={"term": term, "kind": kind}, follow_redirects=False
+    )
+
+
+def test_能改显示名与启用的类目(client, container):
+    response = save(client, name="黑神话·悟空（2025）", subject_types=["place"])
+
+    assert response.status_code == 303
+    stored = container.docs.get(KB_COLLECTION, GAME)
+    assert stored["name"] == "黑神话·悟空（2025）"
+    assert stored["subject_types"] == ["place"]
+    # 术语映射不在基本配置那张表单里，保存它不该把映射一起冲掉
+    assert stored["term_mapping"] == KB["term_mapping"]
+
+
+def test_能设置这个库的当前生效版本(client, container):
+    response = save(client, version="2.0")
+
+    assert response.status_code == 303
+    assert container.docs.get(KB_COLLECTION, GAME)["version"] == "2.0"
+    assert "2.0" in kb_page(client).text
+
+
+def test_一个类目都没勾时页面留住填过的值(client):
+    response = client.post(CONFIG_URL, data={"name": "新名字", "version": "3.0"})
+
+    assert response.status_code == 400
+    assert "至少要启用一个主体类型" in response.text
+    # 敲过的不用重来
+    assert 'value="新名字"' in response.text
+    assert 'value="3.0"' in response.text
+
+
+def test_加一条术语映射_下一次导入就认得出这个叫法(client, container):
+    """「保存后立即生效」验的是这条链路：改完配置再导一份语料，标签落对了。"""
+    save(client, subject_types=["character", "item", "skill"])
+    add_term(client, "心法", "skill")
+
+    do_import(client, ("files", ("七十二变.md", SKILL_ARTICLE.encode(), "text/markdown")))
+
+    chunks = container.chunks.fetch_document(GAME, "七十二变", version=UNVERSIONED)
+    assert chunks
+    assert "skill" in chunks[0].subject_type
+    assert "心法" in chunks[0].game_terms
+
+
+def test_能删掉一条术语映射(client, container):
+    response = client.post(f"{TERMS_URL}/delete", data={"term": "妖王"}, follow_redirects=False)
+
+    assert response.status_code == 303
+    assert "妖王" not in container.docs.get(KB_COLLECTION, GAME)["term_mapping"]
+    # 剩下的那条不受影响
+    assert container.docs.get(KB_COLLECTION, GAME)["term_mapping"] == {"根器": "item"}
+
+
+def test_映射里没填叫法时说一句(client, container):
+    response = add_term(client, "   ", "skill")
+
+    assert response.status_code == 400
+    assert "先填一个" in response.text
+    assert "心法" not in container.docs.get(KB_COLLECTION, GAME)["term_mapping"]
+
+
+def test_映射里写了不认识的主体类型时报错而不是静默丢掉(client, container):
+    response = add_term(client, "心法", "hero")
+
+    assert response.status_code == 400
+    assert "不认识的主体类型" in response.text
+    assert "心法" not in container.docs.get(KB_COLLECTION, GAME)["term_mapping"]
+
+
+def test_管理页不带脚本也能用(client):
+    """每条写入路径都是普通表单：没有 htmx 时浏览器自己提交，走的是同一段处理逻辑。"""
+    page = kb_page(client).text
+
+    for action in (CONFIG_URL, TERMS_URL, f"{TERMS_URL}/delete"):
+        assert f'action="{action}"' in page
+    assert 'method="post"' in page
+
+
+# --- 验收：自定义库未配置映射时默认启用全部主体类型 ---
+
+
+def test_没配过任何东西的库在界面与逻辑上都是七类全开(client, container):
+    """架构文档 §2.3 给未配置的自定义库安排的降级：标签会稀疏，但不会漏。"""
+    container.docs.put(KB_COLLECTION, "custom", {"name": "手工建的库"})
+
+    page = kb_page(client, "custom").text
+
+    assert page.count('name="subject_types"') == len(SubjectType)
+    assert page.count("checked>") == len(SubjectType)
+    assert vocabulary_of(container.docs, "custom").subject_types == tuple(SubjectType)
+
+
+def test_打开不存在的库回列表页_那儿正好能建一个(client):
+    response = kb_page(client, "zelda")
+
+    assert response.status_code == 404
+    assert "知识库 zelda 不存在" in response.text
+    assert "新建知识库" in response.text
+
+
+def test_配置读不了的库点得进去_存一次就修好了(client, container):
+    """列表里能看见它，就该点得进去修——这也是它不被藏起来的原因。"""
+    container.docs.put(KB_COLLECTION, GAME, {"name": "坏掉的库", "subject_types": ["这不是类目"]})
+    assert "读不了" in kb_page(client).text
+
+    response = save(client, name="坏掉的库", subject_types=["character"])
+
+    assert response.status_code == 303
+    assert vocabulary_of(container.docs, GAME).subject_types == (SubjectType.CHARACTER,)
+
+
+def test_配置读不了的库不让改术语映射(client, container):
+    """那份映射本来就没读出来，照着内存里的默认值写回去等于把它悄悄清空、
+    还顺手把启用的类目改成全开——两件事都不出声。"""
+    broken = {
+        "name": "坏掉的库",
+        "subject_types": ["这不是类目"],
+        "term_mapping": {"妖王": "character"},
+    }
+    container.docs.put(KB_COLLECTION, GAME, broken)
+
+    response = add_term(client, "心法", "skill")
+
+    assert response.status_code == 422
+    assert "配置读不了" in response.text
+    assert container.docs.get(KB_COLLECTION, GAME) == broken
+
+
+# --- 验收：删库前有确认，四处一并清理 ---
+
+
+def stocked(client, container) -> int:
+    """导一份资料、存两张原图，返回切片数。删库那几条要的就是「有东西可清」。"""
+    do_import(client)
+    for name in ("立绘.png", "地图.png"):
+        container.objects.put(image_key(GAME, "a1b2", name), b"PNG")
+    return len(stored(container))
+
+
+def test_删库前的确认页列出将要清理的东西与条数(client, container):
+    count = stocked(client, container)
+
+    page = client.get(DELETE_URL).text
+
+    assert "将要清理的数据" in page
+    assert f"<strong>{count}</strong> 条切片" in page
+    assert "<strong>2</strong> 个原图" in page
+    assert "knowledge_bases" in page
+    assert "术语映射" in page
+    assert "确认删除" in page
+
+
+def test_没勾确认不会删(client, container):
+    stocked(client, container)
+
+    response = client.post(DELETE_URL, data={})
+
+    assert response.status_code == 400
+    assert "先把那句确认勾上" in response.text
+    assert container.docs.get(KB_COLLECTION, GAME) is not None
+    assert stored(container)
+
+
+def test_删库把四处数据一并清掉_不留孤儿(client, container):
+    stocked(client, container)
+
+    response = client.post(DELETE_URL, data={"confirm": "yes"}, follow_redirects=False)
+
+    assert response.status_code == 303
+    assert response.headers["location"] == f"/kb?deleted={GAME}"
+    # 三处存储里都问不到这个库的东西了
+    assert container.chunks.count(GAME) == 0
+    assert container.objects.list_keys(image_prefix(GAME)) == []
+    assert container.docs.get(KB_COLLECTION, GAME) is None
+    # 列表页上也看不见了
+    assert GAME not in client.get("/kb").text
+
+
+def test_删完回列表页并说一句(client, container):
+    stocked(client, container)
+
+    response = client.post(DELETE_URL, data={"confirm": "yes"}, follow_redirects=True)
+
+    assert f"已删除知识库 {GAME}" in response.text
+    assert "还没有知识库" in response.text
+
+
+def test_配置读不了的库照样删得掉(client, container):
+    """读不出来正是要删它的理由之一：修不好就一了百了，别让它把 id 一直占着。"""
+    container.docs.put(KB_COLLECTION, GAME, {"name": "坏掉的库", "subject_types": ["这不是类目"]})
+
+    response = client.post(DELETE_URL, data={"confirm": "yes"}, follow_redirects=False)
+
+    assert response.status_code == 303
+    assert container.docs.get(KB_COLLECTION, GAME) is None
+
+
+def broken_store_client():
+    """一个向量库连不上的应用。容器是冻结的，所以连客户端一起另造一套。"""
+    chunks = BrokenChunkStore()
+    container = make_container(chunks=chunks)
+    create_knowledge_base(
+        container.docs,
+        KnowledgeBase.new(GAME, "黑神话·悟空", (SubjectType.CHARACTER, SubjectType.ITEM)),
+    )
+    container.docs.put(KB_COLLECTION, GAME, KB)
+    return chunks, container, TestClient(create_app(container))
+
+
+def test_删库失败时库还在_并且说清哪一处没清掉():
+    chunks, container, client = broken_store_client()
+    do_import(client)
+    container.objects.put(image_key(GAME, "a1b2", "立绘.png"), b"PNG")
+
+    response = client.post(DELETE_URL, data={"confirm": "yes"})
+
+    assert response.status_code == 500
+    assert "向量库" in response.text
+    # 配置是重来的凭据，不能跟着一起没
+    assert container.docs.get(KB_COLLECTION, GAME) is not None
+    # 没清掉的那一处不跳过其余：原图照清
+    assert container.objects.list_keys(image_prefix(GAME)) == []
+
+    # 修好了再删一次就成——上一轮已经清掉的那几处不妨碍重来
+    chunks.recover()
+    assert client.post(DELETE_URL, data={"confirm": "yes"}).status_code == 200
+    assert container.docs.get(KB_COLLECTION, GAME) is None
+
+
+def test_数不出来时不让确认():
+    """数都数不出来就别让人闭着眼睛删。"""
+    _, _, client = broken_store_client()
+
+    response = client.get(DELETE_URL)
+
+    assert response.status_code == 500
+    assert "确认删除" not in response.text

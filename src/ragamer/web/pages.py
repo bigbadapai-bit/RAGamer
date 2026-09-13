@@ -5,16 +5,22 @@
 htmx 在的时候把结果那一块换掉，人不用跳走。表单同时带 `action`／`method` 与 `hx-post`，
 服务端按 `HX-Request` 决定回整页还是回片段——两条路走的是同一段处理逻辑。
 
-这一层不构造任何适配器，数据全来自组合根注入的容器。写入只做两件事——建知识库、跑导入，
-两者都直接用写入侧已有的实现（`ragamer.knowledge` 与 `ragamer.importing`），页面自己不
-重做其中的判断。切分预览页是把库里存下来的东西读回来渲染，**没有任何编辑入口**。
+这一层不构造任何适配器，数据全来自组合根注入的容器。写入只做三件事——建库、改库、跑导入，
+三者都直接用写入侧已有的实现（`ragamer.knowledge` 与 `ragamer.importing`），页面自己不重做
+其中的判断。**删库同理**：页面只负责把「将要清掉什么」摆出来让人确认，清理本身走
+`purge_knowledge_base`，那条路上的四处数据不经过界面。切分预览页是把库里存下来的东西读回来
+渲染，**没有任何编辑入口**。
 
-几个页面在这里都只到骨架为止：知识库管理、导入、对话的完整形态是后面几张票的事。
+术语映射与删库这类会改数据的动作一律走「提交 → 重定向 → 重新渲染」，不直接回 200：
+刷新一下就把上一次的删除或改动再提交一遍，是这类页面上最容易踩的一个坑。
+
+对话与评测两个页面在这里只到占位为止，完整形态是后面几张票的事。
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import Annotated, Any
 from urllib.parse import urlencode
@@ -26,15 +32,26 @@ from fastapi.templating import Jinja2Templates
 from ragamer.container import Container
 from ragamer.importing import STAGE_LABELS, Importer, ImportResult
 from ragamer.knowledge import (
+    BrokenKnowledgeBase,
     KnowledgeBase,
     KnowledgeBaseError,
+    PurgeError,
     create_knowledge_base,
+    knowledge_base_of,
     list_knowledge_bases,
+    purge_inventory,
+    purge_knowledge_base,
+    update_knowledge_base,
     vocabulary_of,
 )
 from ragamer.sources import SourceDocument
-from ragamer.stores.base import UNVERSIONED, Chunk, collection_name
-from ragamer.tagging import CONTENT_NATURE_NAMES, SUBJECT_TYPE_NAMES, SubjectType
+from ragamer.stores.base import UNVERSIONED, Chunk, collection_name, image_prefix
+from ragamer.tagging import (
+    CONTENT_NATURE_NAMES,
+    SUBJECT_TYPE_NAMES,
+    SubjectType,
+    TagVocabulary,
+)
 
 #: 模板目录。跟着包走，装成 wheel 也在。
 TEMPLATES = Path(__file__).parent / "templates"
@@ -69,9 +86,17 @@ def create_router(container: Container) -> APIRouter:
         return RedirectResponse("/kb")
 
     @router.get("/kb")
-    def knowledge_bases(request: Request) -> Response:
-        """知识库列表与新建表单。术语映射与删库在后面的票里。"""
-        return _knowledge_bases_page(request, container)
+    def knowledge_bases(request: Request, deleted: str = "") -> Response:
+        """知识库列表与新建表单。每个库点进去配术语映射与版本，或者删掉它。"""
+        return _knowledge_bases_page(
+            request,
+            container,
+            message=(
+                f"已删除知识库 {deleted}：它在向量库、对象存储与 MongoDB 里的数据都清掉了。"
+                if deleted
+                else ""
+            ),
+        )
 
     @router.post("/kb")
     def create_kb(
@@ -96,6 +121,140 @@ def create_router(container: Container) -> APIRouter:
                 status_code=400,
             )
         return RedirectResponse(f"/import?{urlencode({'game_id': game_id})}", status_code=303)
+
+    @router.get("/kb/{game_id}")
+    def knowledge_base_page(request: Request, game_id: str, saved: bool = False) -> Response:
+        """单个库的配置页：名称、启用的类目、术语映射、当前生效版本，以及删库入口。"""
+        return _knowledge_base_page(
+            request,
+            container,
+            game_id,
+            message="已保存。下一次打标与检索读的就是这一份。" if saved else "",
+        )
+
+    @router.post("/kb/{game_id}")
+    def save_kb(
+        request: Request,
+        game_id: str,
+        name: Annotated[str, Form()] = "",
+        version: Annotated[str, Form()] = "",
+        subject_types: Annotated[list[str] | None, Form()] = None,
+    ) -> Response:
+        """保存基本配置。**保存后立即生效**。
+
+        术语映射不在这张表单里：它是一张可增可删的表，混进来就得靠 JavaScript 加行，
+        而这里每条写入路径都要是不带脚本也能用的。映射那两条走 `/terms`，同样是存完即生效。
+        """
+        name = name.strip()
+        version = version.strip()
+        # 存回表单：出错时人不必把敲过的名字与版本重来一遍
+        draft = {
+            "name": name or game_id,
+            "version": version,
+            "checked": set(subject_types or ()),
+        }
+        try:
+            existing = knowledge_base_of(container.docs, game_id)
+            update_knowledge_base(
+                container.docs,
+                replace(
+                    existing,
+                    name=draft["name"],
+                    version=version,
+                    vocabulary=TagVocabulary(
+                        _subject_types(subject_types), existing.vocabulary.term_mapping
+                    ),
+                ),
+            )
+        except (ValueError, KnowledgeBaseError) as exc:
+            return _knowledge_base_page(
+                request,
+                container,
+                game_id,
+                error=str(exc),
+                draft=draft,
+                status_code=_status_of(exc),
+            )
+        return RedirectResponse(f"/kb/{game_id}?saved=1", status_code=303)
+
+    @router.post("/kb/{game_id}/terms")
+    def add_term(
+        request: Request,
+        game_id: str,
+        term: Annotated[str, Form()] = "",
+        kind: Annotated[str, Form()] = "",
+    ) -> Response:
+        """给术语映射加一条。叫法已经在表里时改掉它的归类，不报错——那是同一条映射。"""
+        term = term.strip()
+        if not term:
+            return _knowledge_base_page(
+                request, container, game_id, error="先填一个这个游戏里的叫法", status_code=400
+            )
+        try:
+            existing = _readable_knowledge_base(container, game_id)
+            mapping = {**existing.vocabulary.term_mapping, term: _subject_type(kind)}
+            update_knowledge_base(
+                container.docs,
+                replace(
+                    existing,
+                    vocabulary=TagVocabulary(existing.vocabulary.subject_types, mapping),
+                ),
+            )
+        except (ValueError, KnowledgeBaseError) as exc:
+            return _knowledge_base_page(
+                request, container, game_id, error=str(exc), status_code=_status_of(exc)
+            )
+        return RedirectResponse(f"/kb/{game_id}", status_code=303)
+
+    @router.post("/kb/{game_id}/terms/delete")
+    def delete_term(request: Request, game_id: str, term: Annotated[str, Form()] = "") -> Response:
+        """从术语映射里去掉一条。去掉之后语料里的这个叫法就只剩模型兜底那条路了。"""
+        try:
+            existing = _readable_knowledge_base(container, game_id)
+            remaining = {
+                name: kind
+                for name, kind in existing.vocabulary.term_mapping.items()
+                if name != term
+            }
+            update_knowledge_base(
+                container.docs,
+                replace(
+                    existing,
+                    vocabulary=TagVocabulary(existing.vocabulary.subject_types, remaining),
+                ),
+            )
+        except (ValueError, KnowledgeBaseError) as exc:
+            return _knowledge_base_page(
+                request, container, game_id, error=str(exc), status_code=_status_of(exc)
+            )
+        return RedirectResponse(f"/kb/{game_id}", status_code=303)
+
+    @router.get("/kb/{game_id}/delete")
+    def delete_kb_page(request: Request, game_id: str) -> Response:
+        """删库前的确认页：先把将要清掉的东西逐条列出来，再让人决定。"""
+        return _delete_page(request, container, game_id)
+
+    @router.post("/kb/{game_id}/delete")
+    def delete_kb(request: Request, game_id: str, confirm: Annotated[str, Form()] = "") -> Response:
+        """真删。四处数据一并清，知识库配置排在最后（见 `purge_knowledge_base`）。"""
+        try:
+            knowledge_base = knowledge_base_of(container.docs, game_id)
+        except (ValueError, KnowledgeBaseError) as exc:
+            return _knowledge_bases_page(
+                request, container, error=str(exc), status_code=_status_of(exc)
+            )
+        if not confirm:
+            # 删除不可逆，确认那一勾不是装饰：没勾就退回去，别把它当成手滑
+            return _delete_page(
+                request, container, game_id, error="先把那句确认勾上，再点删除", status_code=400
+            )
+        try:
+            purge_knowledge_base(container.chunks, container.docs, container.objects, game_id)
+        except PurgeError as exc:
+            return _delete_page(request, container, game_id, error=str(exc), status_code=exc.status)
+        return RedirectResponse(
+            f"/kb?{urlencode({'deleted': knowledge_base.game_id})}", status_code=303
+        )
 
     @router.get("/import")
     def import_page(request: Request, game_id: str = "") -> Response:
@@ -234,12 +393,13 @@ def _knowledge_bases_page(
     request: Request,
     container: Container,
     *,
+    message: str = "",
     error: str = "",
     form: Mapping[str, str] | None = None,
     checked: set[str] | None = None,
     status_code: int = 200,
 ) -> Response:
-    options = [{"value": kind.value, "label": SUBJECT_TYPE_NAMES[kind]} for kind in SubjectType]
+    options = _subject_type_options()
     if checked is None:  # 刚打开时七类全勾上
         checked = {option["value"] for option in options}
     return _page(
@@ -250,8 +410,117 @@ def _knowledge_bases_page(
         bases=_knowledge_base_rows(list_knowledge_bases(container.docs)),
         subject_types=options,
         checked=checked,
+        message=message,
         error=error,
         form=form or {"game_id": "", "name": ""},
+        status_code=status_code,
+    )
+
+
+def _knowledge_base_page(
+    request: Request,
+    container: Container,
+    game_id: str,
+    *,
+    message: str = "",
+    error: str = "",
+    draft: Mapping[str, Any] | None = None,
+    status_code: int = 200,
+) -> Response:
+    """单个库的配置页。
+
+    库不存在、或者 id 不合法时**回列表页**并把原因写在上面，而不是丢一张光秃秃的 404：
+    列表页上正好能建一个，那多半就是人本来要做的事。
+
+    `draft` 是刚提交上来的那份值，出错时用它覆盖页面上显示的内容——名字与勾选不必重来。
+    传了空集合就是空集合，不能跟「没传」混为一谈：一个类目都没勾正是一种要报出来的错。
+    """
+    try:
+        knowledge_base = knowledge_base_of(container.docs, game_id)
+    except (ValueError, KnowledgeBaseError) as exc:
+        return _knowledge_bases_page(
+            request, container, error=str(exc), status_code=_status_of(exc)
+        )
+    fields: dict[str, Any] = {
+        "name": knowledge_base.name,
+        "version": knowledge_base.version,
+        "checked": {kind.value for kind in knowledge_base.vocabulary.subject_types},
+        **(draft or {}),
+    }
+    return _page(
+        request,
+        "knowledge_base.html",
+        knowledge_base.name,
+        "/kb",
+        game_id=game_id,
+        problem=knowledge_base.problem,
+        subject_types=_subject_type_options(),
+        # 加映射时只列这个库启用的类目：归到一个没启用的类目上，那条映射永远落不进标签
+        mapping_kinds=[
+            {"value": kind.value, "label": SUBJECT_TYPE_NAMES[kind]}
+            for kind in knowledge_base.vocabulary.subject_types
+        ],
+        rows=_mapping_rows(knowledge_base),
+        message=message,
+        error=error,
+        status_code=status_code,
+        **fields,
+    )
+
+
+def _readable_knowledge_base(container: Container, game_id: str) -> KnowledgeBase:
+    """读一个库，并且要求它的配置是读得出来的。
+
+    配置坏掉的库**不让改术语映射**：那份映射本来就没读出来，照着内存里的默认值写回去
+    等于把它悄悄清空，还顺手把启用的类目改成全开——两件事都不会出声。
+    先把基本配置存好，配置就从坏变好了。
+
+    :raises UnknownKnowledgeBase: 没有这个库。
+    :raises BrokenKnowledgeBase: 库在，但配置读不了。
+    """
+    knowledge_base = knowledge_base_of(container.docs, game_id)
+    if knowledge_base.problem:
+        raise BrokenKnowledgeBase(game_id, knowledge_base.problem)
+    return knowledge_base
+
+
+def _delete_page(
+    request: Request,
+    container: Container,
+    game_id: str,
+    *,
+    error: str = "",
+    status_code: int = 200,
+) -> Response:
+    """删库确认页。
+
+    条数取自 `purge_inventory`，与实际清理**同一份数法**：页面上写「12 张原图」而真删掉
+    15 张，那份确认就成了摆设。数不出来时干脆不让人确认——闭着眼睛删不是确认。
+    """
+    try:
+        knowledge_base = knowledge_base_of(container.docs, game_id)
+    except (ValueError, KnowledgeBaseError) as exc:
+        return _knowledge_bases_page(
+            request, container, error=str(exc), status_code=_status_of(exc)
+        )
+    try:
+        inventory = purge_inventory(container.chunks, container.objects, game_id)
+    except Exception as exc:
+        # 条数报不出来就不让人确认：闭着眼睛删不是确认。兜住全部异常的理由与
+        # `purge_knowledge_base` 那边一样——适配器只把「连不上」包成 StoreError
+        return _knowledge_bases_page(
+            request, container, error=f"清点不出这个库占用的数据：{exc}", status_code=500
+        )
+    return _page(
+        request,
+        "knowledge_base_delete.html",
+        f"删除知识库 {knowledge_base.name}",
+        "/kb",
+        game_id=game_id,
+        name=knowledge_base.name,
+        inventory=inventory,
+        prefix=image_prefix(game_id),
+        error=error,
         status_code=status_code,
     )
 
@@ -326,6 +595,7 @@ def _knowledge_base_rows(bases: Sequence[KnowledgeBase]) -> list[dict[str, Any]]
         {
             "game_id": base.game_id,
             "name": base.name,
+            "version": base.version,
             "subject_types": _names(
                 SUBJECT_TYPE_NAMES, (kind.value for kind in base.vocabulary.subject_types)
             ),
@@ -333,6 +603,36 @@ def _knowledge_base_rows(bases: Sequence[KnowledgeBase]) -> list[dict[str, Any]]
         }
         for base in bases
     ]
+
+
+def _mapping_rows(knowledge_base: KnowledgeBase) -> list[dict[str, Any]]:
+    """术语映射表，按叫法排列。
+
+    `enabled` 为假的那几条落不进标签——映射归到的类目这个库没启用，`_classify` 会丢掉它。
+    表上照旧列出来（那是库里真有的数据），但标一句，免得人对着一条永远不生效的映射发呆。
+    """
+    enabled = set(knowledge_base.vocabulary.subject_types)
+    return [
+        {
+            "term": term,
+            "kind": SUBJECT_TYPE_NAMES[kind],
+            "enabled": kind in enabled,
+        }
+        for term, kind in sorted(knowledge_base.vocabulary.term_mapping.items())
+    ]
+
+
+def _subject_type_options() -> list[dict[str, str]]:
+    return [{"value": kind.value, "label": SUBJECT_TYPE_NAMES[kind]} for kind in SubjectType]
+
+
+def _status_of(exc: Exception) -> int:
+    """这个异常该报哪个状态码。
+
+    `KnowledgeBaseError` 自己带着状态码（见 `ragamer.knowledge`），两个 HTTP 面从这里取，
+    翻法才一致；`ValueError` 那几个是表单填错，400。
+    """
+    return int(getattr(exc, "status", 400))
 
 
 def _import_result(
@@ -386,20 +686,26 @@ def _preview_url(game_id: str, doc_title: str, version: str) -> str:
     return f"/kb/{game_id}/preview?{urlencode({'doc_title': doc_title, 'version': version})}"
 
 
+def _subject_type(value: str) -> SubjectType:
+    """表单里的一个类目取值 → 枚举。认不出的当场报错，不静默丢掉。
+
+    静默丢掉的后果是标签少一片，而页面上看不出任何异样——这个词表是用户自己填的，
+    填错了要当场告诉他。
+    """
+    try:
+        return SubjectType(value)
+    except ValueError as exc:
+        known = "、".join(kind.value for kind in SubjectType)
+        raise ValueError(f"不认识的主体类型 {value!r}。可用的有：{known}") from exc
+
+
 def _subject_types(values: Sequence[str] | None) -> tuple[SubjectType, ...]:
-    """表单里勾选的类目 → 枚举。认不出的取值当场报错，不静默丢掉。
+    """表单里勾选的类目 → 枚举。
 
     一个都没勾时返回空元组，由 `TagVocabulary` 报「至少要启用一个主体类型」——
     这里不替它兜底成「全开」。
     """
-    kinds: list[SubjectType] = []
-    for value in values or ():
-        try:
-            kinds.append(SubjectType(value))
-        except ValueError as exc:
-            known = "、".join(kind.value for kind in SubjectType)
-            raise ValueError(f"不认识的主体类型 {value!r}。可用的有：{known}") from exc
-    return tuple(kinds)
+    return tuple(_subject_type(value) for value in values or ())
 
 
 def _names(labels: Mapping[Any, str], values: Iterable[str]) -> list[str]:

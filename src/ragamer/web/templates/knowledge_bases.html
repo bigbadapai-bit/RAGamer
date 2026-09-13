@@ -50,6 +50,7 @@
       <tr class="border-b border-slate-300 text-left text-slate-500">
         <th class="py-2 pr-4 font-medium">游戏 id</th>
         <th class="py-2 pr-4 font-medium">名称</th>
+        <th class="py-2 pr-4 font-medium">当前生效版本</th>
         <th class="py-2 pr-4 font-medium">启用的主体类型</th>
         <th class="py-2 font-medium"></th>
       </tr>
@@ -57,8 +58,17 @@
     <tbody>
       {% for base in bases %}
       <tr class="border-b border-slate-200 align-top">
-        <td class="py-2 pr-4 font-mono">{{ base.game_id }}</td>
+        <td class="py-2 pr-4 font-mono">
+          <a class="underline" href="/kb/{{ base.game_id }}">{{ base.game_id }}</a>
+        </td>
         <td class="py-2 pr-4">{{ base.name }}</td>
+        <td class="py-2 pr-4">
+          {% if base.version %}
+          <span class="font-mono">{{ base.version }}</span>
+          {% else %}
+          <span class="text-slate-500">未标注版本</span>
+          {% endif %}
+        </td>
         <td class="py-2 pr-4">
           {% if base.problem %}
           <span class="text-red-700">读不了：{{ base.problem }}</span>
@@ -66,7 +76,10 @@
           {{ base.subject_types | join("、") }}
           {% endif %}
         </td>
-        <td class="py-2"><a class="underline" href="/import?game_id={{ base.game_id }}">导入资料</a></td>
+        <td class="space-x-3 py-2 whitespace-nowrap">
+          <a class="underline" href="/kb/{{ base.game_id }}">管理</a>
+          <a class="underline" href="/import?game_id={{ base.game_id }}">导入资料</a>
+        </td>
       </tr>
       {% endfor %}
     </tbody>

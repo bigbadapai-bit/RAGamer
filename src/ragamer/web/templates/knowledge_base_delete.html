@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+{% block content %}
+
+<p class="mb-6 text-sm text-slate-500">
+  <a class="underline" href="/kb/{{ game_id }}">← 取消，回到 {{ name }}</a>
+</p>
+
+<section class="rounded border border-red-300 bg-white p-5">
+  <h2 class="mb-1 text-lg font-medium text-red-800">将要清理的数据</h2>
+  <p class="mb-4 text-sm text-slate-500">
+    四处的数据一并清掉，删完不会留下孤儿。清单里的条数是刚才数出来的。
+  </p>
+
+  <ul class="mb-5 space-y-2 text-sm">
+    <li class="rounded border border-slate-200 px-4 py-3">
+      <span class="font-medium">向量库</span>
+      <span class="text-slate-500">Milvus 里名为 <span class="font-mono text-slate-900">{{ game_id }}</span> 的集合</span>
+      ——该库全部 <strong>{{ inventory.chunk_count }}</strong> 条切片（正文、向量、标签）
+    </li>
+    <li class="rounded border border-slate-200 px-4 py-3">
+      <span class="font-medium">对象存储</span>
+      <span class="text-slate-500">MinIO 里前缀 <span class="font-mono text-slate-900">{{ prefix }}/</span> 下的对象</span>
+      ——<strong>{{ inventory.image_count }}</strong> 个原图
+    </li>
+    <li class="rounded border border-slate-200 px-4 py-3">
+      <span class="font-medium">MongoDB</span>
+      <span class="text-slate-500">集合 <span class="font-mono text-slate-900">knowledge_bases</span> 里 id 为
+        <span class="font-mono text-slate-900">{{ game_id }}</span> 的那份文档</span>
+      ——名称、启用的主体类型、术语映射、当前生效版本。另有一处会话，会话存储还没接上，
+      眼下没有可清的数据。
+    </li>
+    <li class="rounded border border-slate-200 px-4 py-3">
+      <span class="font-medium">缓存</span>
+      <span class="text-slate-500">这个库此前的问答缓存</span>
+      ——缓存层还没接上，眼下没有可清的数据。
+    </li>
+  </ul>
+
+  <p class="mb-5 rounded border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+    删掉就取不回来了。资料可以重新导，但每一份都要重新解析、重新向量化。
+    这个 id 会空出来，之后可以用同一个 id 建一个新库——新库里不会有今天这些数据。
+  </p>
+
+  <form method="post" action="/kb/{{ game_id }}/delete" class="space-y-4">
+    <label class="flex items-start gap-2 text-sm">
+      <input type="checkbox" name="confirm" value="yes" class="mt-1">
+      <span>我知道这会一并清掉上面列出的数据，而且取不回来。</span>
+    </label>
+    <div class="flex items-center gap-4">
+      <button type="submit" class="rounded bg-red-700 px-4 py-2 text-sm font-medium text-white">
+        确认删除
+      </button>
+      <a class="text-sm underline" href="/kb/{{ game_id }}">取消</a>
+    </div>
+  </form>
+</section>
+
+{% endblock %}

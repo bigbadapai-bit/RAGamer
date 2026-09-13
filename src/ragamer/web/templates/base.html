@@ -28,6 +28,10 @@
   <main class="mx-auto max-w-5xl px-4 py-8">
     <h1 class="mb-6 text-2xl font-semibold tracking-tight">{{ title }}</h1>
 
+    {% if message %}
+    <p class="mb-6 rounded border border-emerald-300 bg-emerald-50 px-4 py-3 text-sm text-emerald-800">{{ message }}</p>
+    {% endif %}
+
     {% if error %}
     <p class="mb-6 rounded border border-red-300 bg-red-50 px-4 py-3 text-sm text-red-800">{{ error }}</p>
     {% endif %}
