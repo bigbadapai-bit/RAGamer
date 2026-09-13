@@ -18,7 +18,13 @@ from fastapi.testclient import TestClient
 from ragamer.api import KB_COLLECTION, create_app
 from ragamer.llm import FakeLlm
 
-from .conftest import HalfwayLlm, chunk_store, make_chunk, make_container
+from .conftest import (
+    HalfwayLlm,
+    RecordingChunkStore,
+    chunk_store,
+    make_chunk,
+    make_container,
+)
 
 GAME = "black_myth"
 #: 这个库的元数据。`name` 是显示名——它同时是给模型的游戏候选。
@@ -32,9 +38,12 @@ QUESTION = "二郎神掉什么"
 REPLY = "掉的是三尖两刃刀[1]。"
 
 
-def said(rewritten: str, game: str = "") -> dict[str, str]:
-    """提问理解那一步的脚本：一次联合输出。"""
-    return {"game": game, "version": "", "rewritten_query": rewritten}
+def said(rewritten: str, game: str = "", route: str = "") -> dict[str, str]:
+    """提问理解那一步的脚本：一次联合输出。
+
+    路由标签默认留空（判不出）：这些用例要证的不是选路，留空让它们走默认组合即可。
+    """
+    return {"game": game, "version": "", "rewritten_query": rewritten, "route": route}
 
 
 def client_with(llm, *chunks) -> TestClient:
@@ -42,6 +51,15 @@ def client_with(llm, *chunks) -> TestClient:
     container = make_container(llm=llm, chunks=chunk_store(GAME, *chunks))
     container.docs.put(KB_COLLECTION, GAME, KB)
     return TestClient(create_app(container))
+
+
+def recording_client(llm, kb: dict, *chunks) -> tuple[TestClient, RecordingChunkStore]:
+    """同上，但切片存储记下每次检索收到的参数——用来看这一轮走了哪几路。"""
+    store = RecordingChunkStore()
+    store.upsert(GAME, list(chunks))
+    container = make_container(llm=llm, chunks=store)
+    container.docs.put(KB_COLLECTION, GAME, kb)
+    return TestClient(create_app(container)), store
 
 
 def start(client: TestClient) -> str:
@@ -191,6 +209,48 @@ def test_生成中途失败时发错误事件且不写进历史():
     assert events[-1] == "error"
     assert "done" not in events
     assert client.get(f"/api/chat/sessions/{session_id}").json()["turns"] == []
+
+
+# --- 选路 ---
+
+
+def test_知识库里的路由表覆盖默认选路():
+    """组合住在知识库元数据里（与打标词表同一个姿势）：界面改的是「走哪几路」。
+
+    默认表里事实型走两路，这份配置把它改成只走主检索——检索次数就是这件事在外面
+    唯一看得见的证据。
+    """
+    kb = {**KB, "route_table": {"factual": ["main"]}}
+    client, store = recording_client(FakeLlm(said(QUESTION, route="事实型"), REPLY), kb, DOC)
+    session_id = start(client)
+
+    ask(client, session_id, QUESTION)
+
+    assert len(store.searches) == 1
+
+
+def test_没配路由表时走默认组合():
+    """没写 `route_table` 是最常见的一种——它不是错误，是走默认。"""
+    client, store = recording_client(FakeLlm(said(QUESTION, route="事实型"), REPLY), KB, DOC)
+    session_id = start(client)
+
+    ask(client, session_id, QUESTION)
+
+    assert len(store.searches) == 2
+
+
+def test_路由表配坏了当场422():
+    """配置写坏时静默按默认值跑，会让人以为「改配置没用」，查无可查。"""
+    client, _ = recording_client(
+        FakeLlm(said(QUESTION, route="事实型"), REPLY),
+        {**KB, "route_table": {"factual": ["算命"]}},
+        DOC,
+    )
+    session_id = start(client)
+
+    response = client.get(f"/api/chat/sessions/{session_id}/ask", params={"question": QUESTION})
+
+    assert response.status_code == 422
 
 
 # --- 边界 ---

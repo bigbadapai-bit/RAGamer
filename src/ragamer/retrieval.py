@@ -1,16 +1,27 @@
-"""主检索路：取候选、精排、按分数落差截断，再按文档聚合父块。
+"""召回、精排、按分数落差截断，再按文档聚合父块。
 
-这是 `docs/ARCHITECTURE.md` §3 那条链路里的 P1，四段依次是：混合检索召回一批候选、
-精排重新打分、断崖截断决定交多少条给生成、按文档聚合父块决定每条交出去多少内容。
-其余五路召回、RRF 融合与查询路由在后面几张票里接，那时复用的是中间两段，
-所以这里把它们各自切开。
+这是 `docs/ARCHITECTURE.md` §3 那条链路的中间几段：**各路召回取回候选 → RRF 融合 →
+精排重新打分 → 断崖截断决定交多少条给生成 → 按文档聚合父块决定每条交出去多少内容**。
+走哪几路由 `ragamer.routing` 决定，这一层只负责把选中的路跑出来。
 
-四处容易做错、做错了又不报错的：
+现在接了两路召回：
+
+- **主混合检索路**：稠密与稀疏向量在同一批数据上融合（§3.2 的混合检索）。
+- **元数据过滤路**：按主体类型、内容性质、版本直接取候选，单路稠密检索。
+  它要的是「按标签取」，再叠一路稀疏会把标签之外的近义内容也捞进来，正好抵消过滤。
+
+其余四条（多查询改写、HyDE、结构化表格路、联网兜底）在后面几张票里接，复用的正是
+这一层的融合与截断两段——所以它们各自切开，不与取候选揉在一起。
+
+五处容易做错、做错了又不报错的：
 
 - **两路必须同一次产出**。稠密与稀疏出自同一个模型、同一批文本，所以向量化只调一次
   （`:meth:`~ragamer.vectors.base.Embedder.embed``），融合交给存储适配器做——那是
   「同一批数据上融合两路」（§3.2 的混合检索），不是多路召回。分两次调向量化，
-  两批文本对不上号既不报错也查不出来。
+  两批文本对不上号既不报错也查不出来。多条召回路径同理：它们共用这一次向量化的结果，
+  各调一次向量化等于让各路检索的不是同一个问题。
+- **多路之间比名次，不比分数**。主检索路的分数是稠密与稀疏加权之后的，元数据路的是
+  单路稠密的，两者量纲不可比。直接比大小等于让量纲决定谁进上下文（§3.3 的 RRF）。
 - **精排吃正文，不吃 `content_meta`**。后者按设计不参与向量化（§2.2），打分同理：
   表格里整列降级进去的长文本会把分数带偏。
 - **截断按分数落差，不取固定前 K**（§3.3、坑 #14）。凑数凑进来的那几条会把上下文
@@ -26,12 +37,13 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from ragamer.chunking import DEFAULT_MAX_CHARS
 from ragamer.logging import get_logger
+from ragamer.routing import WIRED_PATHS, RecallPath, Route
 from ragamer.stores.base import Chunk, ChunkFilter, ChunkHit, ChunkStore
-from ragamer.vectors.base import Embedder, ModelOutputError, Reranker
+from ragamer.vectors.base import Embedder, Embedding, ModelOutputError, Reranker
 
 logger = get_logger(__name__)
 
@@ -51,8 +63,13 @@ CLIFF_RELATIVE = 0.5
 #: 乘出来的池子大小还要够存储一次取回，所以按上界的倍数给，不写死一个数。
 CANDIDATE_FACTOR = 3
 
-#: 一次检索取回多少条候选。数值由 `MAX_CHUNKS` 与 `CANDIDATE_FACTOR` 推出来。
+#: **每一路**一次取回多少条候选。数值由 `MAX_CHUNKS` 与 `CANDIDATE_FACTOR` 推出来；
+#: 融合之后的池子按路的条数翻倍，两路就是两倍——融合后仍远大于截断上界，前提没变。
 CANDIDATE_LIMIT = MAX_CHUNKS * CANDIDATE_FACTOR
+
+#: RRF 融合里的那个 `k`（§3.3）。作用见 :func:`rrf`——**它不是随手取的默认值**，
+#: 调它等于改「头部名次值多少」，与调断崖阈值是同一类事，都要先有评测集。
+RRF_K = 60
 
 #: 父块的长度上限（字符数）。整篇文档超过它就按命中切片所在的小节收敛（§2.5）。
 #:
@@ -71,33 +88,126 @@ def retrieve(
     embedder: Embedder,
     reranker: Reranker,
     where: ChunkFilter | None = None,
+    route: Route | None = None,
 ) -> tuple[ChunkHit, ...]:
-    """主检索路：一批候选进，截断后的一批进生成。
+    """按 `route` 选中的那几路取候选，融合、精排、截断后交给生成。
 
     返回的分数是**精排分**，顺序即交出去的顺序。一条都没检索到时返回空元组——
     由调用方决定没有内容时怎么办，这一层不编造内容。
 
-    候选池固定取 :data:`CANDIDATE_LIMIT`，不做成入参：池子一旦可以被调小到上界以内，
-    上界就会把候选全保下来，断崖等于没生效，而两个参数看上去都还写在那里。
+    候选池固定取 :data:`CANDIDATE_LIMIT`（每路），不做成入参：池子一旦可以被调小到
+    上界以内，上界就会把候选全保下来，断崖等于没生效，而两个参数看上去都还写在那里。
 
     :param query: 用来向量化与精排的文本。改写（`ragamer.query`）在外面做完再进来。
     :param where: 结构化过滤条件，版本那一条由 `ragamer.query.version_filter` 给出。
+        多路共用同一份——各路各自过滤，融合之后就分不清哪条候选是按哪套条件取的了。
+    :param route: 这次走哪几路，由 `ragamer.routing` 按问题类型给出。**不给就只走
+        主检索路**：这一层不替调用方选路。选中了还没接上的路会跳过并留痕。
     :raises ModelOutputError: 向量化或精排的条数与候选对不上。宁可当场炸：
         按短的一边截齐会得到一个静默错位的排序，查不出、也不报错。
     """
     embedding = embedder.embed([query])
     if len(embedding) != 1:
         raise ModelOutputError(f"向量化返回了 {len(embedding)} 条，喂进去的是一个问题")
-    found = chunks.search(
-        game_id,
-        dense=embedding.dense[0],
-        sparse=embedding.sparse[0],
-        where=where,
-        limit=CANDIDATE_LIMIT,
+    found = rrf(
+        [
+            _recall(path, embedding, game_id=game_id, chunks=chunks, where=where, route=route)
+            for path in _paths(route)
+        ]
     )
     if not found:
         return ()  # 空候选上白调一次精排
     return cliff_cut(_reranked(query, found, reranker))
+
+
+def _paths(route: Route | None) -> tuple[RecallPath, ...]:
+    """这次真正要跑的路。**没接上的跳过，一条都不剩时退回主检索路。**
+
+    不给 `route` 就是只走主检索——选路是 `ragamer.routing` 的事，这一层不替调用方决定。
+
+    跳过要留痕：静默跳过会让「这条路还没做」与「路由表配错了」在日志里长得一模一样，
+    而两者的处理方式完全相反（等下一张票 / 现在去改配置）。**一条都不剩时退回主检索**
+    则是兜底：真按空组合跑，这一类问题会一条候选都取不到，对外只说一句「知识库里没有
+    找到相关资料」——把一次配置事故说成了语料问题。
+    """
+    wanted = (RecallPath.MAIN,) if route is None else route.paths
+    wired = tuple(path for path in wanted if path in WIRED_PATHS)
+    skipped = [path.value for path in wanted if path not in WIRED_PATHS]
+    if skipped:
+        logger.warning("这些召回路径还没接上，本次跳过：%s", "、".join(skipped))
+    if not wired:
+        logger.warning("选中的路一条都没接上，退回主检索路")
+        return (RecallPath.MAIN,)
+    return wired
+
+
+def _recall(
+    path: RecallPath,
+    embedding: Embedding,
+    *,
+    game_id: str,
+    chunks: ChunkStore,
+    where: ChunkFilter | None,
+    route: Route | None,
+) -> list[ChunkHit]:
+    """跑一路召回。**向量化在调用方做过一次，这里只取用**——各路检索的必须是同一个问题。
+
+    只有两条路会走到这里（`_paths` 已经把没接上的滤掉了）。
+    """
+    metadata = path is RecallPath.METADATA
+    return chunks.search(
+        game_id,
+        dense=embedding.dense[0],
+        sparse=None if metadata else embedding.sparse[0],
+        where=_metadata_filter(where, route) if metadata else where,
+        limit=CANDIDATE_LIMIT,
+    )
+
+
+def _metadata_filter(where: ChunkFilter | None, route: Route | None) -> ChunkFilter:
+    """元数据过滤路的过滤条件：**版本沿用检索那一条**，再叠上路由给的那两维。
+
+    `where` 是 `ragamer.query.version_filter` 给的那份，必须整个带上——这一路另立一套
+    版本口径等于把版本判错两次，而错的那次是静默的（ADR-0004）。路由那两维为空时
+    同样不动调用方已经给的：空的意思是「不限」，不是「清空」。
+    """
+    base = where or ChunkFilter()
+    if route is None:
+        return base
+    return replace(
+        base,
+        subject_types=route.subject_types or base.subject_types,
+        content_natures=route.content_natures or base.content_natures,
+    )
+
+
+def rrf(lists: Sequence[Sequence[ChunkHit]]) -> list[ChunkHit]:
+    """RRF 融合多路召回，返回按融合分降序的那一批（§3.3）。
+
+    **多路之间只能比名次**：主检索路的分数是稠密与稀疏加权之后的，元数据路的是单路
+    稠密的，两者量纲不可比。放在一起比大小，等于让量纲决定谁进上下文。RRF 只看名次
+    ——一路里排第几就贡献 `1 / (k + 名次)`——两路的分数各自怎么算都不影响结果。
+
+    `k = 60` 的作用是**削弱头部名次的绝对优势**（§3.3、坑 #11）：k 越小，第一名与
+    第二名的差距越大，融合结果越接近「哪一路的第一名更靠前」；k 大到一定程度，各路
+    名次之间的差异被抹平。这个值取自原项目标定过的数，不是随手取的默认值。
+
+    同一个切片在多路里出现只留一条，取**第一次见到的那个**（坑 #10）。两路带回来的
+    是同一份切片数据，留哪个都一样，但「哪一路先见到的」在调试时是个有用的信号。
+
+    这里给出的分数是**融合分，只用来排序**：出去之前 `_reranked` 会用精排分整个换掉，
+    交到生成那一步的仍然是精排分。
+    """
+    scores: dict[int, float] = {}
+    seen: dict[int, Chunk] = {}
+    for hits in lists:
+        for rank, hit in enumerate(hits, start=1):
+            chunk_id = hit.chunk.chunk_id
+            seen.setdefault(chunk_id, hit.chunk)
+            scores[chunk_id] = scores.get(chunk_id, 0.0) + 1.0 / (RRF_K + rank)
+    fused = [ChunkHit(chunk=seen[chunk_id], score=score) for chunk_id, score in scores.items()]
+    fused.sort(key=lambda hit: (-hit.score, hit.chunk.chunk_id))
+    return fused
 
 
 def _reranked(query: str, found: Sequence[ChunkHit], reranker: Reranker) -> list[ChunkHit]:

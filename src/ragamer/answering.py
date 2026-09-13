@@ -1,7 +1,7 @@
 """生成：把检索到的资料交给模型，产出一段**能核对**的答案。
 
-读取侧到这一步为止：问题进，答案与引用出来。中间是主检索路（`ragamer.retrieval`）
-——取候选、精排、断崖截断、按文档聚合父块。
+读取侧到这一步为止：问题进，答案与引用出来。中间是检索（`ragamer.retrieval`）
+——按路由走选中的那几路取候选、融合、精排、断崖截断、按文档聚合父块。
 
 **两种给法**：:meth:`Answerer.answer` 一次给全，:meth:`Answerer.stream` 逐字给。
 两者共用同一段检索与同一份提示词（:meth:`Answerer._sources`），差别只在正文怎么出来；
@@ -43,6 +43,7 @@ from ragamer.llm import LlmClient, LlmRequest, Message
 from ragamer.logging import get_logger
 from ragamer.query import version_filter
 from ragamer.retrieval import ParentBlock, aggregate_parents, retrieve
+from ragamer.routing import Route
 from ragamer.stores.base import Chunk, ChunkStore
 from ragamer.vectors.base import Embedder, Reranker
 
@@ -199,8 +200,9 @@ class Answerer:
         game_id: str,
         version: str = "",
         current_version: str = "",
+        route: Route | None = None,
     ) -> Answer:
-        """读一个问题，给出答案与它的来源。**只走主检索路**。
+        """读一个问题，给出答案与它的来源。
 
         截断之后按文档聚合父块，交给生成的是整页而不是命中那几句（§2.5）。
         没有检索到内容时返回 `NOT_FOUND` 与空引用，不调模型。
@@ -209,12 +211,19 @@ class Answerer:
         :param version: 这次按哪个版本检索。空串表示没点名（回落 `current_version`）。
         :param current_version: 知识库标着的现行版本。两个都是空串时不做版本过滤，
             并留一条 warning——见 `ragamer.query.version_filter`。
+        :param route: 这次走哪几路召回。**不给就只走主检索路**——选路要的是问题类型，
+            而那是 `ragamer.query.understand` 的产物，这一层拿不到也不该假装拿得到
+            （`ragamer.conversations` 那边判出来再传进来）。
         :raises ValueError: 问题为空。空问题会让检索查出任意一批切片。
         :raises ragamer.llm.LlmError: 生成失败。没有答案就是没有答案，不降级。
         """
         require_question(question)
         sources = self._sources(
-            question, game_id=game_id, version=version, current_version=current_version
+            question,
+            game_id=game_id,
+            version=version,
+            current_version=current_version,
+            route=route,
         )
         if not sources:
             return Answer(NOT_FOUND, ())
@@ -229,6 +238,7 @@ class Answerer:
         game_id: str,
         version: str = "",
         current_version: str = "",
+        route: Route | None = None,
     ) -> AnswerStream:
         """与 :meth:`answer` 同一套检索与提示，只是正文逐字产出。
 
@@ -243,13 +253,18 @@ class Answerer:
         :param game_id: 进哪个游戏知识库检索。
         :param version: 这次按哪个版本检索。空串表示没点名（回落 `current_version`）。
         :param current_version: 知识库标着的现行版本。
+        :param route: 这次走哪几路召回。理由同 :meth:`answer`。
         :raises ValueError: 问题为空。空问题会让检索查出任意一批切片。
         :raises ragamer.llm.LlmError: 生成失败。`deltas` 迭代到一半才炸是常事——
             这时已经吐出去的内容是收不回的，调用方应当把整轮丢掉而不是记半句。
         """
         require_question(question)
         sources = self._sources(
-            question, game_id=game_id, version=version, current_version=current_version
+            question,
+            game_id=game_id,
+            version=version,
+            current_version=current_version,
+            route=route,
         )
         if not sources:
             return AnswerStream((), iter((NOT_FOUND,)))
@@ -262,6 +277,7 @@ class Answerer:
         game_id: str,
         version: str,
         current_version: str,
+        route: Route | None,
     ) -> tuple[_Source, ...]:
         """检索、聚合父块、编号。**一条内容都没有时返回空元组**，不编造内容。
 
@@ -276,6 +292,7 @@ class Answerer:
             embedder=self.embedder,
             reranker=self.reranker,
             where=where,
+            route=route,
         )
         if not found:
             logger.info("提问 %r 没检索到内容，回明确回复，不调模型", question)

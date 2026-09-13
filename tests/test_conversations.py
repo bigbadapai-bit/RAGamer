@@ -29,6 +29,8 @@ from ragamer.conversations import (
     Sources,
 )
 from ragamer.llm import FakeLlm, LlmTimeout
+from ragamer.routing import RouteTable
+from ragamer.tagging import ContentNature
 from ragamer.vectors.fake import FakeReranker
 
 from .conftest import (
@@ -52,9 +54,12 @@ DOC = make_chunk(
 )
 
 
-def said(rewritten: str, game: str = "", version: str = "") -> dict[str, str]:
-    """提问理解那一步的脚本：一次联合输出。"""
-    return {"game": game, "version": version, "rewritten_query": rewritten}
+def said(rewritten: str, game: str = "", version: str = "", route: str = "") -> dict[str, str]:
+    """提问理解那一步的脚本：一次联合输出。
+
+    路由标签默认留空（判不出）：这些用例要证的不是选路，留空让它们走默认组合即可。
+    """
+    return {"game": game, "version": version, "rewritten_query": rewritten, "route": route}
 
 
 def setup_chat(llm, *chunks, reranker=None) -> Chat:
@@ -143,6 +148,58 @@ def test_没有候选时回落会话选定的知识库():
     asked(chat, conversation, "那它掉什么")
 
     assert chunks.searches[0]["game_id"] == GAME
+
+
+# --- 选路 ---
+
+
+def test_问题类型决定走哪几路():
+    """判成事实型就走主检索 + 元数据过滤：第二条是单路稠密检索，还带着内容性质过滤。
+
+    选路的失效是静默的（照样出答案，只是依据偏了），所以这里断的是「检索收到了什么」。
+    """
+    llm = FakeLlm(said("二郎神掉什么", route="事实型"), "掉的是三尖两刃刀[1]。")
+    chat, chunks = recording_chat(llm)
+    conversation = chat.start(game_id=GAME)
+
+    asked(chat, conversation, "二郎神掉什么")
+
+    assert len(chunks.searches) == 2
+    main, metadata = chunks.searches
+    assert main["sparse"] is not None
+    assert metadata["sparse"] is None
+    assert metadata["where"].content_natures == (ContentNature.STATS,)
+
+
+def test_知识库的路由表覆盖默认选路():
+    """路由表是每个库一份的配置：把事实型改成只走主检索，这一轮就只检索一次。"""
+    llm = FakeLlm(said("二郎神掉什么", route="事实型"), "掉的是三尖两刃刀[1]。")
+    chat, chunks = recording_chat(llm)
+    conversation = chat.start(game_id=GAME)
+
+    asked(
+        chat,
+        conversation,
+        "二郎神掉什么",
+        routes=RouteTable.from_mapping({"route_table": {"factual": ["main"]}}),
+    )
+
+    assert len(chunks.searches) == 1
+
+
+def test_判不出类型时照默认组合继续作答():
+    """路由判定失败不该让整个提问失败：按事实型那一行走，答案照出。"""
+    llm = FakeLlm(said("二郎神掉什么"), "掉的是三尖两刃刀[1]。")
+    chat, chunks = recording_chat(llm)
+    conversation = chat.start(game_id=GAME)
+
+    asked(chat, conversation, "二郎神掉什么")
+
+    assert len(chunks.searches) == 2
+    assert [turn.content for turn in chat.open(conversation.session_id).turns] == [
+        "二郎神掉什么",
+        "掉的是三尖两刃刀[1]。",
+    ]
 
 
 # --- 刷新之后 ---

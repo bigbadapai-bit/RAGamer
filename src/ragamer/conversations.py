@@ -10,6 +10,9 @@
   从上一轮看出来——所以历史进 `ragamer.query.understand`，检索用它吐出来的
   `rewritten_query`（「二郎神掉什么」）。会话里记下的仍是**用户的原话**：历史要给人看，
   改写是给检索用的中间产物。**版本不参与这一步的判定**，理由见 :meth:`Chat.ask`。
+- **走哪几路召回由问题类型决定**，类型是 `ragamer.query.understand` 那一次调用的产物
+  （多吐一个字段，不多一次调用）。组合本身是知识库里的一份配置（`ragamer.routing`），
+  这一层只负责把「判出来的类型」对到「这一类的组合」上再传下去。
 - **历史只进提问理解，不进生成**。生成拿到的是一句已经补全的问题加一批原文父块，
   引用因此永远指向语料。把上一轮的**答案**也塞进提示词，模型就有了一处引用不到的
   来源可以顺着往下编，而它看起来与真答案一模一样。
@@ -44,6 +47,7 @@ from ragamer.answering import Answerer, Citation, require_question
 from ragamer.llm import LlmClient, Message
 from ragamer.logging import get_logger
 from ragamer.query import understand
+from ragamer.routing import DEFAULT_TABLE, QUERY_TYPE_LABELS, QueryType, RouteTable
 from ragamer.stores.base import DocStore
 
 logger = get_logger(__name__)
@@ -191,6 +195,7 @@ class Chat:
         version: str = "",
         current_version: str = "",
         games: Sequence[Game] = (),
+        routes: RouteTable = DEFAULT_TABLE,
     ) -> Iterator[Reply]:
         """问一句，逐字拿回答案：若干条 :class:`Status`，一个 :class:`Sources`，
         然后若干个 :class:`Delta`。
@@ -219,6 +224,8 @@ class Chat:
             问句里会出现的那种写法**——知识库 id 是 collection 名，只能是英文标识符，
             拿 id 当候选，模型只会把「黑神话」判成不在候选里。判出来的显示名在这里换回
             id；没有候选、或者判不出来，都回落会话选定的知识库。
+        :param routes: 这个知识库的路由表（`ragamer.routing`）。库里配了就传配的那份，
+            不传就用默认表——组合是每个库一份的配置，与打标词表同一个姿势。
         :raises ConversationNotFound: 没有这个会话。
         :raises ValueError: 问题为空。空问题会让检索查出任意一批切片。
         """
@@ -230,6 +237,7 @@ class Chat:
             version=version or conversation.version,
             current_version=current_version,
             games=games,
+            routes=routes,
         )
 
     def _replies(
@@ -240,12 +248,15 @@ class Chat:
         version: str,
         current_version: str,
         games: Sequence[Game],
+        routes: RouteTable,
     ) -> Iterator[Reply]:
         """把这一轮从头做到尾，**每一步之前先报一条进度**，最后收完正文才落库。
 
         进度那三条与这一轮真正干的事一一对应，顺序也一致：理解问题 → 检索资料 →
         生成答案。夹在中间的是来源——它比正文早得多，一拿到就先交出去，界面可以
         先列出来再等字。
+
+        选路夹在理解与检索之间，**没有自己的进度条**：它是一次字典查表，不是一段等待。
 
         迭代器被丢掉时（客户端断开）最后那一行写不进会话——这正是要的效果：
         已经吐出去的那半句与它那批引用一起消失，历史里不留痕迹。
@@ -258,17 +269,21 @@ class Chat:
             history=_history(conversation.turns),
         )
         yield Status("正在检索资料")
+        route = routes.route_for(understanding.query_type)
         stream = self.answerer.stream(
             understanding.rewritten_query,
             game_id=_game_id(understanding.game, games) or conversation.game_id,
             version=version,
             current_version=current_version,
+            route=route,
         )
         logger.info(
-            "会话 %s 提问 %r（改写为 %r），用上 %d 条来源",
+            "会话 %s 提问 %r（改写为 %r，类型 %s），走 %s，用上 %d 条来源",
             conversation.session_id,
             question,
             understanding.rewritten_query,
+            _type_name(understanding.query_type),
+            "、".join(path.value for path in route.paths),
             len(stream.citations),
         )
         yield Sources(stream.citations)
@@ -288,6 +303,15 @@ def _history(turns: Sequence[Turn]) -> tuple[Message, ...]:
     担心切出半轮——会话里本来就是成对写的（见 `_appended`）。
     """
     return tuple(Message(turn.role, turn.content) for turn in turns[-HISTORY_TURNS * 2 :])
+
+
+def _type_name(query_type: QueryType | None) -> str:
+    """日志里那个类型名的写法。
+
+    「判不出」与「判成了事实型」要分得开：两者的走法一样（都按事实型那一行），
+    但一个是提示词没判出来、一个是真的判成了这一类，排查时看的是不同的地方。
+    """
+    return "判不出" if query_type is None else QUERY_TYPE_LABELS[query_type]
 
 
 def _game_id(picked: str, games: Sequence[Game]) -> str:

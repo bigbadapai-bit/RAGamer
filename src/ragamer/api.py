@@ -14,8 +14,9 @@ SSE 事件。**「这一轮算不算问完」「要不要写进历史」在 `rag
 
 知识库元数据从 MongoDB 读（`knowledge_bases` 集合，id 就是游戏 id）：打标要用的词表
 ——启用了哪些主体类型、这个游戏的术语映射——就在它里面（docs/ARCHITECTURE.md §2.3），
-检索回落哪个版本也从它取（§2.4）。知识库列表同时是**游戏候选**：给模型的是显示名，
-拿回来再换回 id，理由见 `_games`。
+检索回落哪个版本也从它取（§2.4），**这次走哪几路召回**同样由它覆盖（§3.1 的默认路由表
+是出厂值，库里配了 `route_table` 就用配的）。知识库列表同时是**游戏候选**：给模型的是
+显示名，拿回来再换回 id，理由见 `_games`。
 本层**一个适配器都不构造**，全部来自组合根（`ragamer.container`），缝因此立得住。
 """
 
@@ -44,6 +45,7 @@ from ragamer.conversations import (
 from ragamer.importing import STAGE_LABELS, Importer, ImportResult, ProgressEvent
 from ragamer.llm import LlmError
 from ragamer.logging import get_logger
+from ragamer.routing import RouteTable
 from ragamer.sources import SourceDocument
 from ragamer.stores.base import UNVERSIONED, StoreError, collection_name
 from ragamer.tagging import TagVocabulary
@@ -155,13 +157,15 @@ def create_app(container: Container) -> FastAPI:
         # 先读一次会话：不存在当场 404，顺带拿到它绑的知识库（现行版本要从那里取）。
         # `chat.ask` 自己还会再读一次，那是它的事——会话是上一次请求写下的，
         # 这一层手里这一份只用来决定「去哪个库问」。
-        knowledge = _kb_document(container, _conversation(chat, session_id).game_id)
+        conversation = _conversation(chat, session_id)
+        knowledge = _kb_document(container, conversation.game_id)
         replies = chat.ask(
             session_id,
             question,
             version=version,
             current_version=str(knowledge.get("version", "")),
             games=_games(container),
+            routes=_route_table(knowledge, game_id=conversation.game_id),
         )
         return StreamingResponse(
             _events(replies), media_type="text/event-stream", headers=SSE_HEADERS
@@ -294,6 +298,21 @@ def _vocabulary(container: Container, game_id: str) -> TagVocabulary:
         # 也不该长成一个 500——那样界面上只会看见「服务器错误」，查无可查
         raise HTTPException(
             status_code=422, detail=f"知识库 {game_id} 的配置读不了：{exc}"
+        ) from exc
+
+
+def _route_table(knowledge: Mapping[str, Any], *, game_id: str) -> RouteTable:
+    """这个知识库的查询路由表。
+
+    配置里没写的类型一律走默认值（`ragamer.routing`）——与打标词表同一个姿势：
+    库里只写改过的那几行，默认值以后才改得动。而**读不了就是 422**：路由表决定这次
+    检索走哪几路，配置写坏时静默按默认值跑，会让人以为「改配置没用」，查无可查。
+    """
+    try:
+        return RouteTable.from_mapping(knowledge)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422, detail=f"知识库 {game_id} 的路由表读不了：{exc}"
         ) from exc
 
 

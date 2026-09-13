@@ -1,11 +1,12 @@
-"""主检索路：混合检索取候选、精排、按分数落差截断。
+"""多路召回、融合、精排与按分数落差截断。
 
 截断这一段全是纯函数，直接摆分断言——**它是这一层的核心**：取固定前 K 条是凑数，
 凑进来的那几条会把上下文稀释掉，而稀释不报错，只让答案悄悄变差。
 两个口径（绝对落差、相对落差）与上界各有一条边界用例。
 
-取候选与精排那一段接内存假件：本层要验的是接线（两路是否同一次产出、精排吃的是
-正文还是元数据、过滤条件有没有透传），不是语义相似度。
+取候选、融合与精排那一段接内存假件：本层要验的是接线（各路是否同一次向量化、精排吃的是
+正文还是元数据、过滤条件有没有透传到该到的那一路、没接上的路有没有被跳过），
+不是语义相似度。
 """
 
 from __future__ import annotations
@@ -19,12 +20,16 @@ from ragamer.retrieval import (
     CANDIDATE_LIMIT,
     MAX_CHUNKS,
     MAX_PARENT_CHARS,
+    RRF_K,
     aggregate_parents,
     cliff_cut,
     retrieve,
+    rrf,
 )
+from ragamer.routing import RecallPath, Route
 from ragamer.stores.base import UNVERSIONED, ChunkFilter, ChunkHit
 from ragamer.stores.memory import InMemoryChunkStore
+from ragamer.tagging import ContentNature, SubjectType
 from ragamer.vectors.base import Embedding, ModelOutputError
 from ragamer.vectors.fake import FakeEmbedder
 
@@ -257,6 +262,254 @@ def test_向量化一条都没产出就报错():
             embedder=SilentEmbedder(),
             reranker=ScriptedReranker({"正文1": 0.9}),
         )
+
+
+# --- 多路召回 ---
+
+
+def test_不给路由时只走主检索路():
+    """选路是 `ragamer.routing` 的事：不给组合就只走主检索，这一层不替调用方决定。"""
+    store = RecordingChunkStore()
+    store.upsert(GAME, [make_chunk(1)])
+
+    retrieve(
+        "二郎神",
+        game_id=GAME,
+        chunks=store,
+        embedder=FakeEmbedder(),
+        reranker=ScriptedReranker({"正文1": 0.9}),
+    )
+
+    assert len(store.searches) == 1
+    assert store.searches[0]["sparse"] is not None
+
+
+def test_各路共用同一次向量化():
+    """两条路检索的必须是同一个问题。各调一次向量化，两路问的就不是一回事了。"""
+    store = RecordingChunkStore()
+    store.upsert(GAME, [make_chunk(1)])
+    embedder = FakeEmbedder()
+
+    retrieve(
+        "二郎神血量多少",
+        game_id=GAME,
+        chunks=store,
+        embedder=embedder,
+        reranker=ScriptedReranker({"正文1": 0.9}),
+        route=Route((RecallPath.MAIN, RecallPath.METADATA)),
+    )
+
+    assert len(store.searches) == 2
+    assert embedder.calls == [["二郎神血量多少"]]
+
+
+def test_元数据过滤路是单路检索():
+    """它要的是「按标签直接取候选」：再叠一路稀疏，会把标签之外的近义内容也捞进来，
+    正好把这次过滤抵消掉。"""
+    store = RecordingChunkStore()
+    store.upsert(GAME, [make_chunk(1)])
+
+    retrieve(
+        "二郎神血量多少",
+        game_id=GAME,
+        chunks=store,
+        embedder=FakeEmbedder(),
+        reranker=ScriptedReranker({"正文1": 0.9}),
+        route=Route((RecallPath.MAIN, RecallPath.METADATA)),
+    )
+
+    main, metadata = store.searches
+    assert main["sparse"] is not None
+    assert metadata["sparse"] is None
+    # 两路取的是同一批数据上的同一个问题，稠密那一路因此完全一样
+    assert metadata["dense"] == main["dense"]
+
+
+def test_元数据过滤路按主体类型与内容性质取回候选():
+    """第二路召回的立身之本：按标签直接取，不靠向量相似度。
+
+    过滤是存储的事，这里断言的是**条件原样透传**——透传错了的表现是候选里混进别的
+    主体类型或别的性质，而它不报错，只是答案的依据悄悄换了。
+    """
+    store = RecordingChunkStore()
+    store.upsert(
+        GAME,
+        [
+            make_chunk(1, subject_type=("character",), content_nature=("stats",)),
+            make_chunk(2, subject_type=("item",), content_nature=("stats",)),
+            make_chunk(3, subject_type=("character",), content_nature=("intro",)),
+        ],
+    )
+
+    found = retrieve(
+        "二郎神血量多少",
+        game_id=GAME,
+        chunks=store,
+        embedder=FakeEmbedder(),
+        reranker=ScriptedReranker({"正文1": 0.9, "正文2": 0.5, "正文3": 0.5}),
+        route=Route(
+            (RecallPath.METADATA,),
+            content_natures=(ContentNature.STATS,),
+            subject_types=(SubjectType.CHARACTER,),
+        ),
+    )
+
+    where = store.searches[0]["where"]
+    assert where.subject_types == (SubjectType.CHARACTER,)
+    assert where.content_natures == (ContentNature.STATS,)
+    # 三条都在库里，过滤之后只剩一条——透传对了才有的结果
+    assert [item.chunk.chunk_id for item in found] == [1]
+
+
+def test_元数据过滤路的过滤条件不影响主检索路():
+    """两路各自过滤，条件混用会让主检索路也少掉一批候选，而它不报错。"""
+    store = RecordingChunkStore()
+    store.upsert(GAME, [make_chunk(1, content_nature=("stats",))])
+
+    retrieve(
+        "二郎神血量多少",
+        game_id=GAME,
+        chunks=store,
+        embedder=FakeEmbedder(),
+        reranker=ScriptedReranker({"正文1": 0.9}),
+        where=ChunkFilter(version="1.0"),
+        route=Route((RecallPath.MAIN, RecallPath.METADATA), content_natures=(ContentNature.STATS,)),
+    )
+
+    main, metadata = store.searches
+    assert main["where"].version == "1.0"
+    assert main["where"].content_natures == ()
+    assert metadata["where"].version == "1.0"
+    assert metadata["where"].content_natures == (ContentNature.STATS,)
+
+
+def test_元数据过滤路也带上版本条件():
+    """这一路另立一套版本口径，等于把版本判错两次——而错的那次是静默的（ADR-0004）。"""
+    store = RecordingChunkStore()
+    store.upsert(GAME, [make_chunk(1)])
+
+    retrieve(
+        "二郎神血量多少",
+        game_id=GAME,
+        chunks=store,
+        embedder=FakeEmbedder(),
+        reranker=ScriptedReranker({"正文1": 0.9}),
+        where=ChunkFilter(version="1.0"),
+        route=Route((RecallPath.METADATA,), content_natures=(ContentNature.STATS,)),
+    )
+
+    assert store.searches[0]["where"].version == "1.0"
+
+
+def test_两路都取到的切片只精排一次():
+    """同一个切片在多路里出现只算一条：按两条送进精排，上下文里就多一份重复内容。"""
+    store = chunk_store(GAME, make_chunk(1))
+    reranker = ScriptedReranker({"正文1": 0.9})
+
+    found = retrieve(
+        "二郎神血量多少",
+        game_id=GAME,
+        chunks=store,
+        embedder=FakeEmbedder(),
+        reranker=reranker,
+        route=Route((RecallPath.MAIN, RecallPath.METADATA), content_natures=()),
+    )
+
+    assert reranker.calls[0][1] == ["正文1"]
+    assert [item.chunk.chunk_id for item in found] == [1]
+
+
+def test_还没接上的路跳过并留痕(caplog):
+    """静默跳过会让「这条路还没做」与「路由表配错了」在日志里长得一模一样，
+    而两者的处理方式完全相反（等下一张票 / 现在去改配置）。"""
+    store = chunk_store(GAME, make_chunk(1))
+
+    with caplog.at_level(logging.WARNING, logger="ragamer.retrieval"):
+        found = retrieve(
+            "二郎神怎么打",
+            game_id=GAME,
+            chunks=store,
+            embedder=FakeEmbedder(),
+            reranker=ScriptedReranker({"正文1": 0.9}),
+            route=Route((RecallPath.MAIN, RecallPath.HYDE)),
+        )
+
+    assert [item.chunk.chunk_id for item in found] == [1]
+    warnings = [
+        record.getMessage() for record in caplog.records if record.levelno == logging.WARNING
+    ]
+    assert any("hyde" in message for message in warnings)
+
+
+def test_选中的路一条都没接上时退回主检索(caplog):
+    """真按空组合跑，这一类问题会一条候选都取不到，对外只说一句「知识库里没有找到
+    相关资料」——把一次配置事故说成了语料问题。"""
+    store = chunk_store(GAME, make_chunk(1))
+
+    with caplog.at_level(logging.WARNING, logger="ragamer.retrieval"):
+        found = retrieve(
+            "寒江雪的属性",
+            game_id=GAME,
+            chunks=store,
+            embedder=FakeEmbedder(),
+            reranker=ScriptedReranker({"正文1": 0.9}),
+            route=Route((RecallPath.TABLE,)),
+        )
+
+    assert [item.chunk.chunk_id for item in found] == [1]
+    warnings = [
+        record.getMessage() for record in caplog.records if record.levelno == logging.WARNING
+    ]
+    assert any("退回主检索" in message for message in warnings)
+
+
+# --- RRF 融合 ---
+
+
+def test_融合只看名次不看分数():
+    """两路的分数是两套量纲，放在一起比大小等于让量纲决定谁进上下文。
+
+    融合分整个由名次算出来：把分数换成一万倍，排出来的顺序一模一样。
+    """
+    assert [item.chunk.chunk_id for item in rrf([[hit(1, 0.9), hit(2, 0.8)]])] == [1, 2]
+    assert [item.chunk.chunk_id for item in rrf([[hit(1, 900.0), hit(2, 800.0)]])] == [1, 2]
+
+
+def test_多路都取到的切片排在只被一路取到的前面():
+    """两路都排得上名次，说明两边都认为它相关——这条信号只有融合看得到，
+    单看哪一路的分数都看不出来。"""
+    fused = rrf([[hit(1, 0.9), hit(2, 0.1)], [hit(2, 0.1)]])
+
+    assert [item.chunk.chunk_id for item in fused] == [2, 1]
+
+
+def test_融合的分数就是_k_加名次的倒数和():
+    """`k = 60` 钉在这里（§3.3）。它调的是「头部名次值多少」，改它要先有评测集。"""
+    fused = rrf([[hit(1, 0.9), hit(2, 0.8)], [hit(2, 0.7)]])
+
+    scores = {item.chunk.chunk_id: item.score for item in fused}
+    assert scores[1] == pytest.approx(1 / (RRF_K + 1))
+    assert scores[2] == pytest.approx(1 / (RRF_K + 2) + 1 / (RRF_K + 1))
+
+
+def test_融合之后同分按切片序号定序():
+    """名次剖面一样的两条会被融合成同一个分数：顺序不定，截断位置就会在它们之间挪。"""
+    fused = rrf([[hit(1, 0.9), hit(2, 0.8)], [hit(2, 0.9), hit(1, 0.8)]])
+
+    assert [item.chunk.chunk_id for item in fused] == [1, 2]
+
+
+def test_融合同一路里出现两次也只算一条():
+    """切片序号是同一个，多出来的那一条会把它的融合分抬高。"""
+    fused = rrf([[hit(1, 0.9)], [hit(1, 0.8)]])
+
+    assert len(fused) == 1
+    assert fused[0].score == pytest.approx(1 / (RRF_K + 1) + 1 / (RRF_K + 1))
+
+
+def test_没有候选时融合出空():
+    assert rrf([]) == []
+    assert rrf([[], []]) == []
 
 
 # --- 聚合父块 ---
