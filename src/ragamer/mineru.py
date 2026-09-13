@@ -100,7 +100,7 @@ class MineruParser:
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._config = config
-        self._base = config.base_url.rstrip("/")
+        self._base = _service_root(config.base_url)
         self._headers = {"Authorization": f"Bearer {config.api_key.get_secret_value()}"}
         self._client = (
             client
@@ -259,6 +259,19 @@ class MineruParser:
         if response.status_code >= 400:
             raise _status_error(source, url, response)
         return response
+
+
+def _service_root(base_url: str) -> str:
+    """服务根地址。配置里带不带 `/api/v4` 都认。
+
+    老项目那份 `.env` 里存的就是 `https://mineru.net/api/v4`（带这一层）。本项目自己
+    还要再拼一次，两处各拼一遍的结果是 `…/api/v4/api/v4/…`，服务端回 404——
+    与 MinIO 那处「list 与 put 各拼一遍前缀」是同一个坑，所以在入口收一次口。
+    """
+    root = base_url.rstrip("/")
+    if root.endswith(API_PREFIX):
+        root = root[: -len(API_PREFIX)]
+    return root.rstrip("/")
 
 
 def _status_error(source: SourceDocument, url: str, response: httpx.Response) -> MineruError:

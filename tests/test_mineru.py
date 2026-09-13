@@ -236,6 +236,23 @@ def test_PDF_不开_OCR():
     assert fake.is_ocr is False
 
 
+@pytest.mark.parametrize(
+    "base_url",
+    ["https://mineru.net", "https://mineru.net/", "https://mineru.net/api/v4"],
+)
+def test_服务根地址带不带_api_v4_都认(base_url):
+    """老项目那份 .env 里存的就是带 `/api/v4` 的写法；再拼一次会打成 404。"""
+    fake = FakeMineru()
+    parser = MineruParser(
+        make_settings(base_url=base_url),
+        client=httpx.Client(transport=httpx.MockTransport(fake), trust_env=False),
+    )
+
+    parser.parse(make_source())
+
+    assert str(fake.calls("POST")[0].url) == "https://mineru.net/api/v4/file-urls/batch"
+
+
 def test_结果包放在子目录里也能解出来():
     fake = FakeMineru(make_bundle(prefix="二郎神/vlm/"))
     parser = make_parser(fake, FakeTime())
