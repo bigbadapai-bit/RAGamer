@@ -5,20 +5,23 @@
 
 三件事在这里定死：
 
-- **答案必须带引用来源**：交给模型的每一条资料都编了号，编号连同「文档标题 + 祖先标题
+- **答案必须带引用来源**：交给模型的每一条切片都编了号，编号连同「文档标题 + 祖先标题
   路径」一起进提示词，也一起随答案交回。没有引用的答案是一段无从核对的话——
-  用户没法知道它是资料里写的还是模型编的。编号对不对得上由「引用与资料同批同序」
-  保证：两边是从同一个序列里出来的，不是各算一遍。
-- **检索不到就直说**。候选一条都没有时**不调模型**：没有资料可依据，让它自由发挥
+  用户没法知道它是切片里写的还是模型编的。编号对不对得上由「引用与切片同批同序」
+  保证：两者绑在同一个 :class:`_Source` 里，不是两个各排一遍的序列。
+- **检索不到就直说**。候选一条都没有时**不调模型**：没有内容可依据，让它自由发挥
   只会得到一段编造的游戏攻略，而且看起来和真答案一样。回复是这里的常量。
 - **生成失败照抛**：没有答案就是没有答案。降级成一段「抱歉我答不上来」会把故障
   伪装成结果，比报错难查得多（与 `ragamer.query` 那一步的降级不同——那一步降级之后
   整条链路还能继续，这一步降级之后没有东西可以继续）。
 
-引用里的编号是**人看的编号，从 1 起**，与提示词里资料的编号一致；列表下标那套不出现
+引用里的编号是**人看的编号，从 1 起**，与提示词里的编号一致；列表下标那套不出现
 在答案里。模型有没有真的在正文里引用某一条，v1 不做校验——那属于忠实度评测要做的事
 （架构文档 §8）。能做的机械检查只有一条：正文里出现了范围之外的编号就留痕，
 那种答案指向不存在的来源。
+
+提示词里管这批切片叫「资料」是给模型看的说法，代码里不引这个词——
+`ragamer.importing` 那边「资料」指的是一份源文件，两个意思撞在一起会读岔。
 """
 
 from __future__ import annotations
@@ -64,9 +67,9 @@ _MARKER = re.compile(r"\[(\d+)\]")
 class Citation:
     """答案的一个来源。
 
-    `index` 是**正文里 [n] 指的那个编号**，从 1 起；引用在元组里的顺序就是资料交给
-    模型的顺序，两者一一对应。文档标题与祖先标题路径都要给出来——只给标题的话，
-    一份长词条里是「打法」那一段还是「获取方式」那一段，读的人仍然对不上。
+    `index` 是**正文里 [n] 指的那个编号**，从 1 起；引用在元组里的顺序就是交给模型的
+    顺序，两者一一对应。文档标题与祖先标题路径都要给出来——只给标题的话，一份长词条
+    里是「打法」那一段还是「获取方式」那一段，读的人仍然对不上。
     """
 
     index: int
@@ -78,7 +81,8 @@ class Citation:
         """给人和模型看的一行来源。
 
         祖先标题路径通常以文档标题开头（一级标题就是文档标题，它是标题树的第一层），
-        所以对得上时不再重复念一遍。《》是给路径里可能出现的分隔符留的边界。
+        所以对得上时不再重复念一遍。比对前缀时要落在分隔符上：文档「二郎神」与文档
+        「二郎神外传」是两份文档，只按字面前缀比会把后者误当成前者的一部分。
         """
         if not self.ancestor_path:
             return self.doc_title
@@ -87,6 +91,18 @@ class Citation:
         ):
             return self.ancestor_path
         return f"{self.doc_title}{PATH_SEPARATOR}{self.ancestor_path}"
+
+
+@dataclass(frozen=True)
+class _Source:
+    """编号好的一条切片：引用 + 它的内容。
+
+    两者绑在一个类型里而不是两个平行序列：编号与内容本来就是同一件事的两面，
+    分开放就得靠调用方保证两边同长同序，对不上时是静默的（编号指向另一条内容）。
+    """
+
+    citation: Citation
+    chunk: Chunk
 
 
 @dataclass(frozen=True)
@@ -101,8 +117,8 @@ class Answer:
     citations: tuple[Citation, ...]
 
 
-def passage_text(chunk: Chunk) -> str:
-    """一条资料交给模型的全文：正文 + 不参与向量化的附加文本。
+def _prompt_text(chunk: Chunk) -> str:
+    """一条切片交给模型时的全文：正文 + 不参与向量化的附加文本。
 
     `content_meta` **必须带上**：表格里那些长文本列整列降级在那里（§2.5），
     只给正文等于把整列说明丢掉——它本来就是「随结果返回但不打分」的那部分（§2.2）。
@@ -157,36 +173,36 @@ class Answerer:
         if not found:
             logger.info("提问 %r 没检索到内容，回明确回复，不调模型", question)
             return Answer(NOT_FOUND, ())
-        citations = tuple(
-            Citation(index, hit.chunk.doc_title, hit.chunk.ancestor_path)
+        sources = tuple(
+            _Source(Citation(index, hit.chunk.doc_title, hit.chunk.ancestor_path), hit.chunk)
             for index, hit in enumerate(found, start=1)
         )
-        logger.info("提问 %r 检索到 %d 条，交给生成", question, len(found))
-        text = self.llm.complete(_request(question, [hit.chunk for hit in found], citations))
-        _warn_on_unknown_citations(text, len(citations))
-        return Answer(text, citations)
+        logger.info("提问 %r 检索到 %d 条，交给生成", question, len(sources))
+        text = self.llm.complete(_request(question, sources))
+        _warn_on_unknown_citations(text, len(sources))
+        return Answer(text, tuple(source.citation for source in sources))
 
 
-def _request(question: str, chunks: Sequence[Chunk], citations: Sequence[Citation]) -> LlmRequest:
-    """一次生成调用：资料在系统提示里，问题在用户消息里。"""
+def _request(question: str, sources: Sequence[_Source]) -> LlmRequest:
+    """一次生成调用：来源在系统提示里，问题在用户消息里。"""
     return LlmRequest(
         messages=[
-            Message("system", _sources(chunks, citations)),
+            Message("system", _sources(sources)),
             Message("user", question),
         ],
         temperature=TEMPERATURE,
     )
 
 
-def _sources(chunks: Sequence[Chunk], citations: Sequence[Citation]) -> str:
-    """系统提示 = 约束 + 编号好的资料。
+def _sources(sources: Sequence[_Source]) -> str:
+    """系统提示 = 约束 + 编号好的切片。
 
-    资料与引用是两个序列但同样长、同次序，所以编号是数出来的而不是各写一遍
-    ——两边各数一次，早晚有一边会数错。
+    编号取自 `source.citation.index`，与随答案交回去的那批是同一个值——不是在这里
+    重新数一遍。
     """
     blocks = [
-        f"[{citation.index}] {citation.label}\n{passage_text(chunk)}"
-        for chunk, citation in zip(chunks, citations, strict=True)
+        f"[{source.citation.index}] {source.citation.label}\n{_prompt_text(source.chunk)}"
+        for source in sources
     ]
     return _INSTRUCTION + "\n\n".join(blocks)
 
@@ -197,9 +213,8 @@ def _warn_on_unknown_citations(text: str, given: int) -> None:
     不改成错误——模型偶尔会多写一个编号，答案本身通常还有用；但一定要留痕，
     否则「引用了一个不存在的来源」这件事在界面上与正常答案长得一模一样。
     """
-    unknown = sorted(
-        {int(found) for found in _MARKER.findall(text) if not 1 <= int(found) <= given}
-    )
+    cited = {int(found) for found in _MARKER.findall(text)}
+    unknown = sorted(number for number in cited if not 1 <= number <= given)
     if unknown:
         logger.warning(
             "答案里引用了没有给出的资料编号 %s（这次给的是 1-%d 号）",

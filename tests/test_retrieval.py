@@ -10,13 +10,14 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping, Sequence
 
 import pytest
 
 from ragamer.retrieval import (
     CANDIDATE_LIMIT,
-    MAX_PASSAGES,
+    MAX_CHUNKS,
     cliff_cut,
     retrieve,
 )
@@ -25,7 +26,7 @@ from ragamer.stores.memory import InMemoryChunkStore
 from ragamer.vectors.base import Embedding, ModelOutputError
 from ragamer.vectors.fake import FakeEmbedder
 
-from .conftest import make_chunk
+from .conftest import chunk_store, make_chunk
 
 GAME = "black_myth"
 
@@ -94,12 +95,6 @@ class RecordingChunkStore(InMemoryChunkStore):
         return super().search(game_id, dense=dense, sparse=sparse, where=where, limit=limit)
 
 
-def store_with(*chunks) -> InMemoryChunkStore:
-    store = InMemoryChunkStore()
-    store.upsert(GAME, list(chunks))
-    return store
-
-
 # --- 断崖截断 ---
 
 
@@ -134,11 +129,28 @@ def test_分数为负时不拿它算相对落差():
     assert scores_of(cliff_cut([hit(1, 0.0), hit(2, -0.4)])) == [0.0]
 
 
+def test_分数不在零点一到一的量纲里时留痕(caplog):
+    """断崖的 0.3 / 0.5 是按精排分的 [0, 1] 标定的（真实精排 sigmoid 之后）。
+
+    换上一个返回 logits 的精排，绝对落差几乎必然命中（下例 5.0 → 4.0 一上来就切）、
+    相对落差则被除以「前一条分数」那一步整个关掉，两条都不报错——截断位置于是悄悄换了
+    个依据。所以这里要留痕，断言的也正是这条痕。
+    """
+    with caplog.at_level(logging.WARNING):
+        cut = cliff_cut([hit(1, 5.0), hit(2, 4.0)])
+
+    warnings = [
+        record.getMessage() for record in caplog.records if record.levelno == logging.WARNING
+    ]
+    assert any("量纲" in message for message in warnings)
+    assert len(cut) == 1
+
+
 def test_上界是有上限的():
     """一条断崖都没有时由数量定，但绝不因为「候选多」就多给。"""
     cut = cliff_cut([hit(index, 0.9 - index * 0.01) for index in range(1, 16)])
 
-    assert len(cut) == MAX_PASSAGES
+    assert len(cut) == MAX_CHUNKS
 
 
 def test_上界不超过候选数():
@@ -178,12 +190,12 @@ def test_检索把稠密与稀疏两路一起交给存储():
 
 def test_候选池比截断上界大():
     """池子不大于上界，上界就会把每条候选都保下来，断崖等于没生效。"""
-    assert CANDIDATE_LIMIT > MAX_PASSAGES
+    assert CANDIDATE_LIMIT > MAX_CHUNKS
 
 
 def test_精排吃正文不吃附加文本():
     """`content_meta` 按设计不参与向量化，打分同理——表格的长文本列会把分数带偏。"""
-    store = store_with(make_chunk(1, content_meta="| 说明 | 一长串表格里的说明 |"))
+    store = chunk_store(GAME, make_chunk(1, content_meta="| 说明 | 一长串表格里的说明 |"))
     reranker = ScriptedReranker({"正文1": 0.9})
 
     retrieve("二郎神", game_id=GAME, chunks=store, embedder=FakeEmbedder(), reranker=reranker)
@@ -193,7 +205,7 @@ def test_精排吃正文不吃附加文本():
 
 def test_精排按分数排出顺序():
     """存储回来的顺序由它自己定，交出去的顺序由精排定。"""
-    store = store_with(make_chunk(1), make_chunk(2), make_chunk(3))
+    store = chunk_store(GAME, make_chunk(1), make_chunk(2), make_chunk(3))
 
     found = retrieve(
         "二郎神",
@@ -208,7 +220,7 @@ def test_精排按分数排出顺序():
 
 def test_同分时按切片序号定序():
     """同分的两条每次都要排出同一个顺序，否则截断位置会在它们之间随机挪。"""
-    store = store_with(make_chunk(7), make_chunk(3))
+    store = chunk_store(GAME, make_chunk(7), make_chunk(3))
 
     found = retrieve(
         "二郎神",
@@ -257,7 +269,7 @@ def test_没有候选时不调精排():
 
 def test_精排分数与候选条数对不上就报错():
     """按短的一边截齐会得到一个静默错位的排序——查不出、也不报错。"""
-    store = store_with(make_chunk(1), make_chunk(2))
+    store = chunk_store(GAME, make_chunk(1), make_chunk(2))
 
     with pytest.raises(ModelOutputError):
         retrieve(
@@ -270,7 +282,7 @@ def test_精排分数与候选条数对不上就报错():
 
 
 def test_向量化一条都没产出就报错():
-    store = store_with(make_chunk(1))
+    store = chunk_store(GAME, make_chunk(1))
 
     with pytest.raises(ModelOutputError):
         retrieve(

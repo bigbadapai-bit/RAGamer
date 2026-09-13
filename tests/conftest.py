@@ -121,3 +121,10 @@ def make_chunk(chunk_id: int, **overrides: object) -> Chunk:
         "sparse_vector": {chunk_id: 1.0},
     }
     return Chunk(chunk_id=chunk_id, **{**defaults, **overrides})
+
+
+def chunk_store(game_id: str, *chunks: Chunk) -> InMemoryChunkStore:
+    """一个已经装好这批切片的内存切片存储。"""
+    store = InMemoryChunkStore()
+    store.upsert(game_id, list(chunks))
+    return store

@@ -24,15 +24,18 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+from ragamer.logging import get_logger
 from ragamer.stores.base import ChunkFilter, ChunkHit, ChunkStore
 from ragamer.vectors.base import Embedder, ModelOutputError, Reranker
 
-#: 交出去的内容条数上界。**上界是「最多」，不是「取前 K 条」**——实际给几条由
+logger = get_logger(__name__)
+
+#: 交出去的切片条数上界。**上界是「最多」，不是「取前 K 条」**——实际给几条由
 #: 断崖说了算（§3.3、坑 #14 的 `min(10, 候选数)`）。
-MAX_PASSAGES = 10
+MAX_CHUNKS = 10
 
 #: 断崖的两个口径：绝对落差、相对落差（相邻分差 ÷ 前一条分数）。两者都是「大于」才
-#: 算断崖，取自原项目标定过的值（§3.3）。
+#: 算断崖，取自原项目标定过的值（§3.3），量纲是精排分的 [0, 1]。
 CLIFF_ABSOLUTE = 0.3
 CLIFF_RELATIVE = 0.5
 
@@ -43,8 +46,8 @@ CLIFF_RELATIVE = 0.5
 #: 乘出来的池子大小还要够存储一次取回，所以按上界的倍数给，不写死一个数。
 CANDIDATE_FACTOR = 3
 
-#: 一次检索取回多少条候选。数值由 `MAX_PASSAGES` 与 `CANDIDATE_FACTOR` 推出来。
-CANDIDATE_LIMIT = MAX_PASSAGES * CANDIDATE_FACTOR
+#: 一次检索取回多少条候选。数值由 `MAX_CHUNKS` 与 `CANDIDATE_FACTOR` 推出来。
+CANDIDATE_LIMIT = MAX_CHUNKS * CANDIDATE_FACTOR
 
 
 def retrieve(
@@ -55,16 +58,17 @@ def retrieve(
     embedder: Embedder,
     reranker: Reranker,
     where: ChunkFilter | None = None,
-    candidates: int = CANDIDATE_LIMIT,
 ) -> tuple[ChunkHit, ...]:
     """主检索路：一批候选进，截断后的一批进生成。
 
     返回的分数是**精排分**，顺序即交出去的顺序。一条都没检索到时返回空元组——
-    由调用方决定没有资料时怎么办，这一层不编造内容。
+    由调用方决定没有内容时怎么办，这一层不编造内容。
+
+    候选池固定取 :data:`CANDIDATE_LIMIT`，不做成入参：池子一旦可以被调小到上界以内，
+    上界就会把候选全保下来，断崖等于没生效，而两个参数看上去都还写在那里。
 
     :param query: 用来向量化与精排的文本。改写（`ragamer.query`）在外面做完再进来。
     :param where: 结构化过滤条件，版本那一条由 `ragamer.query.version_filter` 给出。
-    :param candidates: 精排前的候选池大小。
     :raises ModelOutputError: 向量化或精排的条数与候选对不上。宁可当场炸：
         按短的一边截齐会得到一个静默错位的排序，查不出、也不报错。
     """
@@ -76,7 +80,7 @@ def retrieve(
         dense=embedding.dense[0],
         sparse=embedding.sparse[0],
         where=where,
-        limit=candidates,
+        limit=CANDIDATE_LIMIT,
     )
     if not found:
         return ()  # 空候选上白调一次精排
@@ -114,11 +118,12 @@ def cliff_cut(hits: Sequence[ChunkHit]) -> tuple[ChunkHit, ...]:
     除法算成一个假的断崖），这时只按绝对落差判——真实精排的分数落在 [0, 1]，
     走到这一支说明分数已经贴底，本来也没什么可再切的。
 
-    上界是 `min(MAX_PASSAGES, 候选数)`：**候选本来就少时不凑数**。传进来的应当是
+    上界是 `min(MAX_CHUNKS, 候选数)`：**候选本来就少时不凑数**。传进来的应当是
     已经按分数降序排好的候选。
     """
+    _warn_on_scale(hits)
     selected: list[ChunkHit] = []
-    for hit in hits[:MAX_PASSAGES]:
+    for hit in hits[:MAX_CHUNKS]:
         if selected and _is_cliff(selected[-1].score, hit.score):
             break
         selected.append(hit)
@@ -130,3 +135,22 @@ def _is_cliff(previous: float, current: float) -> bool:
     if drop > CLIFF_ABSOLUTE:
         return True
     return previous > 0 and drop / previous > CLIFF_RELATIVE
+
+
+def _warn_on_scale(hits: Sequence[ChunkHit]) -> None:
+    """分数不在 [0, 1] 里时提醒一声：断崖的两个阈值是按这个量纲标定的。
+
+    真实精排是 sigmoid 之后的取值（`ragamer.vectors.bge`），假件也照同一量纲造。
+    换上一个返回 logits 的精排，0.3 与 0.5 就不再是原来那个意思——绝对落差几乎必然
+    命中、一上来就切，相对落差则被除以「前一条分数」那一步整个关掉。两条都不报错，
+    截断位置于是悄悄换了个依据，所以在这里留一条痕。
+    """
+    outside = next((hit.score for hit in hits if not 0.0 <= hit.score <= 1.0), None)
+    if outside is not None:
+        logger.warning(
+            "精排分不在 [0, 1] 里（如 %g）：断崖的 %g / %g 是按这个量纲标定的，"
+            "这次的截断位置不能按那两个口径读",
+            outside,
+            CLIFF_ABSOLUTE,
+            CLIFF_RELATIVE,
+        )
