@@ -68,6 +68,8 @@ def test_守则扫到了源码():
         "query.py",
         "retrieval.py",
         "answering.py",
+        "clarifying.py",
+        "knowledge.py",
         "api.py",
         "logging.py",
         "memory.py",
