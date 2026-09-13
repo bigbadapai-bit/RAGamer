@@ -1,4 +1,4 @@
-"""入库端点（主缝）：内存假件换掉八个外部依赖，整条链路跑一遍。
+"""入库端点（主缝）：内存假件换掉全部外部依赖，整条链路跑一遍。
 
 只断言外部可观察的行为：HTTP 响应本身，以及通过存储适配器的查询接口能观察到的
 入库结果。原项目审计出来的缺陷几乎全部出在串联层——接错了线，只有跑完真实串联
@@ -6,6 +6,8 @@
 """
 
 from __future__ import annotations
+
+import logging
 
 import pytest
 from fastapi.testclient import TestClient
@@ -203,6 +205,15 @@ def test_导入过程中上报了进度(client):
     assert all(event["file_number"] == 1 and event["file_total"] == 1 for event in progress)
 
 
+def test_导入在跑的时候就把进度落进日志(client, caplog):
+    """响应里的 `progress` 是跑完才拿得到的账单；一批几十份资料时，那之前靠日志。"""
+    with caplog.at_level(logging.INFO, logger="ragamer.api"):
+        import_articles(client, upload("二郎神.md"))
+
+    assert "导入 二郎神.md：[1/1] 归一化" in caplog.text
+    assert "导入 二郎神.md：[1/1] 入库" in caplog.text
+
+
 def test_返回结果含切片数_覆盖的标签_跳过的条数与错误(client):
     payload = import_articles(client, upload("二郎神.md"), upload("攻略.pdf"))
     ok, failed = payload["results"]
@@ -223,6 +234,18 @@ def test_一批的条数按文件算(client):
 
 
 # --- 库与游戏 ---
+
+
+def test_知识库配置读不了时报_422_而不是_500():
+    """库里配了个不认识的主体类型：是知识库的数据坏了，不是这份资料的错。"""
+    container = make_container()
+    container.docs.put(KB_COLLECTION, GAME, {"subject_types": ["这不是类目"]})
+    client = TestClient(create_app(container))
+
+    response = client.post(CHUNKS_URL, files=[upload("二郎神.md")])
+
+    assert response.status_code == 422
+    assert "这不是类目" in response.json()["detail"]
 
 
 def test_知识库不存在时_404_不静默按默认词表建内容():

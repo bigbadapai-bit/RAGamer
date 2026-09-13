@@ -18,9 +18,12 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 
 from ragamer.container import Container
 from ragamer.importing import STAGE_LABELS, Importer, ImportResult, ProgressEvent
+from ragamer.logging import get_logger
 from ragamer.sources import SourceDocument
 from ragamer.stores.base import UNVERSIONED, collection_name
 from ragamer.tagging import TagVocabulary
+
+logger = get_logger(__name__)
 
 #: 知识库元数据所在的集合，文档 id 就是游戏 id。
 KB_COLLECTION = "knowledge_bases"
@@ -29,7 +32,12 @@ KB_COLLECTION = "knowledge_bases"
 def create_app(container: Container) -> FastAPI:
     """把组合根里那套依赖接成 ASGI 应用。"""
     app = FastAPI(title="RAGamer", summary="游戏攻略 RAG 助手")
-    importer = Importer(chunks=container.chunks, embedder=container.embedder, llm=container.llm)
+    importer = Importer(
+        chunks=container.chunks,
+        embedder=container.embedder,
+        llm=container.llm,
+        on_progress=_log_progress,
+    )
 
     @app.post("/api/kb/{game_id}/import")
     async def import_sources(
@@ -58,6 +66,21 @@ def create_app(container: Container) -> FastAPI:
     return app
 
 
+def _log_progress(event: ProgressEvent) -> None:
+    """导入是同步的一整段，日志是它在跑的时候唯一看得见的进度窗口。
+
+    响应里的 `progress` 是跑完之后才拿得到的账单；一批几十份资料时，
+    那之前能看到的只有这几行。
+    """
+    logger.info(
+        "导入 %s：[%d/%d] %s",
+        event.filename,
+        event.file_number,
+        event.file_total,
+        STAGE_LABELS[event.stage],
+    )
+
+
 def _check_game_id(game_id: str) -> None:
     """游戏 id 同时是 collection 名，不合法就当场 400。
 
@@ -83,7 +106,14 @@ def _vocabulary(container: Container, game_id: str) -> TagVocabulary:
             status_code=404,
             detail=f"知识库 {game_id} 不存在。先在知识库管理里建一个，再导入资料",
         )
-    return TagVocabulary.from_mapping(payload)
+    try:
+        return TagVocabulary.from_mapping(payload)
+    except ValueError as exc:
+        # 库里配了个不认识的主体类型：是知识库自己的数据坏了，不是这份资料的错，
+        # 也不该长成一个 500——那样界面上只会看见「服务器错误」，查无可查
+        raise HTTPException(
+            status_code=422, detail=f"知识库 {game_id} 的配置读不了：{exc}"
+        ) from exc
 
 
 def _result_payload(result: ImportResult) -> dict[str, Any]:
