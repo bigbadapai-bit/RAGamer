@@ -18,7 +18,6 @@ import pytest
 
 from ragamer.config import MineruSettings
 from ragamer.mineru import (
-    MineruClient,
     MineruParser,
     MineruRejected,
     MineruTaskFailed,
@@ -181,8 +180,8 @@ class FakeMineru:
         return [item for item in self.requests if "/extract-results/batch/" in str(item.url)]
 
 
-def make_client(fake: FakeMineru, time: FakeTime, **overrides: Any) -> MineruClient:
-    return MineruClient(
+def make_parser(fake: FakeMineru, time: FakeTime, **overrides: Any) -> MineruParser:
+    return MineruParser(
         make_settings(**overrides),
         client=httpx.Client(transport=httpx.MockTransport(fake), trust_env=False),
         sleep=time.sleep,
@@ -197,18 +196,20 @@ def make_source(filename: str = "攻略.png", data: bytes = PNG) -> SourceDocume
 # --- 四步链路 ---
 
 
-def test_一份截图从申请链接一路走到结果包():
+def test_一份截图从申请链接一路走到归一化文档():
     fake = FakeMineru()
     time = FakeTime()
-    client = make_client(fake, time)
+    parser = make_parser(fake, time)
 
-    bundle = client.extract(make_source())
+    doc = parser.parse(make_source())
 
-    assert bundle.markdown == MARKDOWN
-    assert bundle.content_list == tuple(CONTENT_LIST)
-    assert [image.name for image in bundle.images] == ["images/a.jpg", "images/b.png"]
-    assert bundle.images[0].data == IMAGES["images/a.jpg"]
-    assert bundle.images[0].content_type == "image/jpeg"
+    assert doc.markdown == MARKDOWN
+    assert doc.content_list == tuple(CONTENT_LIST)
+    # 正文里 Markdown 与 HTML 两种引用都要认出来（表格内嵌的图是 HTML 那种）
+    assert doc.images == ("images/a.jpg", "images/b.png")
+    assert [asset.name for asset in doc.assets] == ["images/a.jpg", "images/b.png"]
+    assert doc.assets[0].data == IMAGES["images/a.jpg"]
+    assert doc.assets[0].content_type == "image/jpeg"
     assert fake.uploaded == PNG
     # 后端与 OCR 开关进请求体：默认 vlm，截图必须开 OCR
     assert fake.model_version == "vlm"
@@ -218,9 +219,9 @@ def test_一份截图从申请链接一路走到结果包():
 def test_上传给_MinerU_的文件名带扩展名与内容摘要():
     """MinerU 按扩展名认格式；同名不同内容的两份文件在服务端会互相覆盖。"""
     first = FakeMineru()
-    make_client(first, FakeTime()).extract(make_source("攻略.png", PNG))
+    make_parser(first, FakeTime()).parse(make_source("攻略.png", PNG))
     second = FakeMineru()
-    make_client(second, FakeTime()).extract(make_source("攻略.png", PDF))
+    make_parser(second, FakeTime()).parse(make_source("攻略.png", PDF))
 
     assert first.uploaded_name.startswith("攻略-")
     assert first.uploaded_name.endswith(".png")
@@ -230,20 +231,20 @@ def test_上传给_MinerU_的文件名带扩展名与内容摘要():
 def test_PDF_不开_OCR():
     """PDF 有自己的文字层，开 OCR 反而把它丢掉；截图反过来，不开就是一张白纸。"""
     fake = FakeMineru()
-    make_client(fake, FakeTime()).extract(make_source("手册.pdf", PDF))
+    make_parser(fake, FakeTime()).parse(make_source("手册.pdf", PDF))
 
     assert fake.is_ocr is False
 
 
 def test_结果包放在子目录里也能解出来():
     fake = FakeMineru(make_bundle(prefix="二郎神/vlm/"))
-    client = make_client(fake, FakeTime())
+    parser = make_parser(fake, FakeTime())
 
-    bundle = client.extract(make_source())
+    doc = parser.parse(make_source())
 
-    assert bundle.markdown == MARKDOWN
+    assert doc.markdown == MARKDOWN
     # 包内的相对路径要跟正文对齐，正文里引用的是 images/a.jpg
-    assert [image.name for image in bundle.images] == ["images/a.jpg", "images/b.png"]
+    assert [asset.name for asset in doc.assets] == ["images/a.jpg", "images/b.png"]
 
 
 # --- 凭据与代理 ---
@@ -252,7 +253,7 @@ def test_结果包放在子目录里也能解出来():
 def test_预签名地址不带_token():
     """上传与下载走的是各自的签名地址，把 Bearer 顺手发过去就是把凭据给了 CDN。"""
     fake = FakeMineru()
-    make_client(fake, FakeTime()).extract(make_source())
+    make_parser(fake, FakeTime()).parse(make_source())
 
     authorized = [item for item in fake.requests if item.headers.get("authorization")]
     assert [str(item.url) for item in authorized] == [
@@ -263,11 +264,23 @@ def test_预签名地址不带_token():
     assert fake.calls("GET")[-1].headers.get("authorization") is None
 
 
-def test_客户端不读环境里的代理():
-    """大文件上传走系统代理会超时（架构文档第六节坑 #6）。"""
-    client = MineruClient(make_settings())
+def test_出错信息里的地址抹掉签名():
+    """预签名地址的查询串里就是签名，原样进日志等于把凭据落盘。"""
+    fake = FakeMineru()
+    fake.download_status = [403] * 3
 
-    assert client._client.trust_env is False
+    with pytest.raises(MineruRejected) as excinfo:
+        make_parser(fake, FakeTime()).parse(make_source())
+
+    assert "cdn.test" in str(excinfo.value)
+    assert "sign=xyz" not in str(excinfo.value)
+
+
+def test_适配器不读环境里的代理():
+    """大文件上传走系统代理会超时（架构文档第六节坑 #6）。"""
+    parser = MineruParser(make_settings())
+
+    assert parser._client.trust_env is False
 
 
 # --- 轮询的两个上限 ---
@@ -277,9 +290,9 @@ def test_轮询按间隔等_出结果就停():
     fake = FakeMineru()
     fake.states = ["running", "running", "done"]
     time = FakeTime()
-    client = make_client(fake, time)
+    parser = make_parser(fake, time)
 
-    client.extract(make_source())
+    parser.parse(make_source())
 
     assert len(fake.polls()) == 3
     # 第一次立刻问，之后每问一次等一个间隔
@@ -292,7 +305,7 @@ def test_任务失败时当场抛错_不等满时长():
     time = FakeTime()
 
     with pytest.raises(MineruTaskFailed) as excinfo:
-        make_client(fake, time).extract(make_source("攻略.png"))
+        make_parser(fake, time).parse(make_source("攻略.png"))
 
     assert "文件损坏" in str(excinfo.value)
     assert "攻略.png" in str(excinfo.value)
@@ -304,10 +317,10 @@ def test_轮询到点还没完就报错_并带上最后看到的状态():
     fake = FakeMineru()
     fake.states = ["running"]
     time = FakeTime()
-    client = make_client(fake, time, poll_timeout_seconds=10.0, poll_interval_seconds=3.0)
+    parser = make_parser(fake, time, poll_timeout_seconds=10.0, poll_interval_seconds=3.0)
 
     with pytest.raises(MineruTimeout) as excinfo:
-        client.extract(make_source("攻略.png"))
+        parser.parse(make_source("攻略.png"))
 
     message = str(excinfo.value)
     assert "10 秒" in message
@@ -322,7 +335,7 @@ def test_一条结果都还没有时继续等而不是判失败():
     fake.entry = {}  # 服务端回了空结果
 
     with pytest.raises(MineruTimeout) as excinfo:
-        make_client(fake, FakeTime(), poll_timeout_seconds=6.0).extract(make_source())
+        make_parser(fake, FakeTime(), poll_timeout_seconds=6.0).parse(make_source())
 
     assert "未知" in str(excinfo.value)  # 一条状态都没看到，如实说
     assert len(fake.polls()) >= 2
@@ -336,9 +349,9 @@ def test_服务端_5xx_会重试():
     fake.batch_status = [503, 500]
     time = FakeTime()
 
-    bundle = make_client(fake, time).extract(make_source())
+    doc = make_parser(fake, time).parse(make_source())
 
-    assert bundle.markdown == MARKDOWN
+    assert doc.markdown == MARKDOWN
     assert len(fake.calls("POST")) == 3
     assert time.slept == [3.0, 3.0]
 
@@ -348,7 +361,7 @@ def test_下载结果包_5xx_也重试():
     fake.download_status = [502]
     time = FakeTime()
 
-    assert make_client(fake, time).extract(make_source()).markdown == MARKDOWN
+    assert make_parser(fake, time).parse(make_source()).markdown == MARKDOWN
     assert len(fake.calls("GET")) == 3  # 一次轮询 + 两次下载
 
 
@@ -357,7 +370,7 @@ def test_凭据被拒不重试():
     fake.batch_status = [401]
 
     with pytest.raises(MineruRejected) as excinfo:
-        make_client(fake, FakeTime()).extract(make_source("攻略.png"))
+        make_parser(fake, FakeTime()).parse(make_source("攻略.png"))
 
     assert "401" in str(excinfo.value)
     assert len(fake.calls("POST")) == 1
@@ -369,7 +382,7 @@ def test_业务码非_0_也算被拒():
     fake.msg = "文件大小超出限制"
 
     with pytest.raises(MineruRejected) as excinfo:
-        make_client(fake, FakeTime()).extract(make_source())
+        make_parser(fake, FakeTime()).parse(make_source())
 
     assert "-60005" in str(excinfo.value)
     assert "文件大小超出限制" in str(excinfo.value)
@@ -380,7 +393,7 @@ def test_结果包不是_zip_时报错并点名文件():
     fake = FakeMineru("这不是个 zip".encode())
 
     with pytest.raises(MineruUnavailable) as excinfo:
-        make_client(fake, FakeTime()).extract(make_source("攻略.png"))
+        make_parser(fake, FakeTime()).parse(make_source("攻略.png"))
 
     assert "攻略.png" in str(excinfo.value)
 
@@ -390,7 +403,7 @@ def test_结果包里没有正文时报错():
     fake = FakeMineru(_without_full_md(make_bundle()))
 
     with pytest.raises(MineruUnavailable) as excinfo:
-        make_client(fake, FakeTime()).extract(make_source())
+        make_parser(fake, FakeTime()).parse(make_source())
 
     assert "full.md" in str(excinfo.value)
 
@@ -408,52 +421,40 @@ def _without_full_md(payload: bytes) -> bytes:
 def test_越界的条目被跳过():
     """`..` 只可能来自坏掉或伪造的包。这里不落盘，也没有往外写的路径给它走。"""
     fake = FakeMineru(make_bundle(extra={"../evil.txt": b"nope", "/etc/passwd": b"nope"}))
-    client = make_client(fake, FakeTime())
+    parser = make_parser(fake, FakeTime())
 
-    bundle = client.extract(make_source())
+    doc = parser.parse(make_source())
 
-    assert [image.name for image in bundle.images] == ["images/a.jpg", "images/b.png"]
+    assert [asset.name for asset in doc.assets] == ["images/a.jpg", "images/b.png"]
 
 
 def test_结果包里没有条目级结构时留一条痕_不阻断(caplog):
     """正文与原图都还在，少的只是二次 OCR 的依据——所以要留痕，不能装着没这回事。"""
     fake = FakeMineru(make_bundle(content_list=None))
-    client = make_client(fake, FakeTime())
+    parser = make_parser(fake, FakeTime())
 
     with caplog.at_level("WARNING"):
-        bundle = client.extract(make_source("攻略.png"))
+        doc = parser.parse(make_source("攻略.png"))
 
-    assert bundle.content_list == ()
+    assert doc.content_list == ()
     assert "条目级结构" in caplog.text
 
 
 # --- 解析适配器 ---
 
 
-def test_解析器认_PDF_与图片():
-    parser = MineruParser(make_client(FakeMineru(), FakeTime()))
+def test_适配器认_PDF_与图片():
+    parser = MineruParser(make_settings())
 
     assert ".pdf" in parser.SUFFIXES
     assert ".png" in parser.SUFFIXES
     assert ".md" not in parser.SUFFIXES
 
 
-def test_解析器产出归一化文档_附件带类型():
-    parser = MineruParser(make_client(FakeMineru(), FakeTime()))
-
-    doc = parser.parse(make_source())
-
-    assert doc.markdown == MARKDOWN
-    assert doc.images == ("images/a.jpg", "images/b.png")
-    assert [asset.name for asset in doc.assets] == ["images/a.jpg", "images/b.png"]
-    assert doc.assets[0].content_type == "image/jpeg"
-    assert doc.content_list == tuple(CONTENT_LIST)
-
-
-def test_解析器把_MinerU_的失败原样报出来():
+def test_适配器把_MinerU_的失败原样报出来():
     fake = FakeMineru()
     fake.states = ["failed"]
-    parser = MineruParser(make_client(fake, FakeTime()))
+    parser = make_parser(fake, FakeTime())
 
     with pytest.raises(SourceError):  # 导入编排器按这个基类兜
         parser.parse(make_source())

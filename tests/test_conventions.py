@@ -31,9 +31,12 @@ _ADAPTERS = {
     "BgeM3Embedder",
     "BgeReranker",
     "OpenAiLlm",
-    "MineruClient",
     "MineruParser",
 }
+
+#: 只扫 `src/ragamer`：`tools/` 下是一次性运维脚本，不进包、没有测试缝可言，
+#: 它自己构造适配器是对的（实验要按后端各造一个，组合根给不了）。
+#: 「适配器只在组合根构造」这条规矩管的是应用代码。
 
 #: 供应商库只允许出现在各自的适配器模块里：其余模块只认 ragamer.stores 与
 #: ragamer.vectors 的协议，换后端、换模型都不动业务代码。

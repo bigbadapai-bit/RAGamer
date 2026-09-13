@@ -66,6 +66,8 @@ class NormalizedDoc:
     markdown: str
     #: 正文里引用到的图片地址，按出现顺序、去重前原样。
     #: 补图那一层按它取原图做二次 OCR 与摘要。`publish_assets` 之后这里是对象 key。
+    #: 认的是「正文怎么写」而不是「取不取得到」：md 来源里指向外网的 `<img src="http…">`
+    #: 也会进来，补图那一层按自己能取到的那种处理。
     images: tuple[str, ...] = ()
     #: 解析适配器附带的条目级结构（MinerU 的 `content_list.json` 就是它）。
     #: 切分用不到它——正文已经在 `markdown` 里了；补图的二次 OCR 回填要用，
@@ -120,13 +122,8 @@ class MarkdownParser:
     SUFFIXES = (".md", ".markdown", ".txt")
 
     def parse(self, source: SourceDocument) -> NormalizedDoc:
-        suffix = Path(source.filename).suffix.lower()
-        if suffix not in self.SUFFIXES:
-            supported = "、".join(self.SUFFIXES)
-            raise UnsupportedSourceError(
-                f"{source.filename}：这个格式还没有对应的解析适配器（现在只认 {supported}）。"
-                "PDF 与图片走 MinerU、网页走爬虫；后者还没接上"
-            )
+        if Path(source.filename).suffix.lower() not in self.SUFFIXES:
+            raise _unsupported(source, self.SUFFIXES)
         markdown = _decode(source)
         return NormalizedDoc(markdown=markdown, images=image_refs(markdown))
 
@@ -145,18 +142,33 @@ class ParserRouter:
     def __init__(self, parsers: Sequence[SourceParser]) -> None:
         if not parsers:
             raise ValueError("至少要有一个解析适配器，否则什么格式都读不了")
+        suffixes = [suffix for parser in parsers for suffix in parser.SUFFIXES]
+        # 重叠当场报出来：先命中的那个赢，另一条来源就成了摆设，而且不会有任何提示
+        repeated = sorted({suffix for suffix in suffixes if suffixes.count(suffix) > 1})
+        if repeated:
+            raise ValueError(
+                f"扩展名 {'、'.join(repeated)} 被两个解析适配器认领了：先命中的那个会把另一个盖掉"
+            )
         self._parsers = tuple(parsers)
-        self.SUFFIXES = tuple(suffix for parser in self._parsers for suffix in parser.SUFFIXES)
+        self.SUFFIXES = tuple(suffixes)
 
     def parse(self, source: SourceDocument) -> NormalizedDoc:
         suffix = Path(source.filename).suffix.lower()
         for parser in self._parsers:
             if suffix in parser.SUFFIXES:
                 return parser.parse(source)
-        raise UnsupportedSourceError(
-            f"{source.filename}：这个格式还没有对应的解析适配器"
-            f"（现在只认 {'、'.join(self.SUFFIXES)}）"
-        )
+        raise _unsupported(source, self.SUFFIXES)
+
+
+def _unsupported(source: SourceDocument, suffixes: Sequence[str]) -> UnsupportedSourceError:
+    """不认识这个格式。认得的扩展名由调用方给：单独用某个解析器时认的是它自己那几个，
+    经 `ParserRouter` 分发时认的是全部适配器的那几个。
+    """
+    return UnsupportedSourceError(
+        f"{source.filename}：这个格式还没有对应的解析适配器"
+        f"（现在只认 {'、'.join(suffixes)}）。"
+        "PDF 与图片走 MinerU、网页走爬虫；后者还没接上"
+    )
 
 
 def image_refs(markdown: str) -> tuple[str, ...]:

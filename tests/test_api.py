@@ -13,13 +13,12 @@ import pytest
 from fastapi.testclient import TestClient
 
 from ragamer.api import KB_COLLECTION, create_app
-from ragamer.mineru import MineruParser
 from ragamer.sources import MarkdownParser, ParserRouter
 from ragamer.stores.base import UNVERSIONED, image_prefix
 from ragamer.stores.memory import InMemoryObjectStore
 
 from .conftest import make_container
-from .test_mineru import FakeMineru, FakeTime, make_client
+from .test_mineru import FakeMineru, FakeTime, make_parser
 
 GAME = "black_myth"
 CHUNKS_URL = f"/api/kb/{GAME}/import"
@@ -251,7 +250,7 @@ def mineru_container() -> tuple[FakeMineru, object]:
     fake = FakeMineru()
     container = make_container(
         objects=InMemoryObjectStore(),
-        parser=ParserRouter((MarkdownParser(), MineruParser(make_client(fake, FakeTime())))),
+        parser=ParserRouter((MarkdownParser(), make_parser(fake, FakeTime()))),
     )
     container.docs.put(KB_COLLECTION, GAME, KB)
     return fake, container

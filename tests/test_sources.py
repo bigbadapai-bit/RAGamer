@@ -198,6 +198,15 @@ def test_一个适配器都没有的_router_当场报错():
         ParserRouter(())
 
 
+def test_两个适配器认领同一个扩展名时当场报错():
+    """先命中的那个赢，另一条来源就成了摆设——而且不会有任何提示。"""
+    with pytest.raises(ValueError) as excinfo:
+        ParserRouter((StubParser((".md", ".txt"), "甲"), StubParser((".txt",), "乙")))
+
+    assert ".txt" in str(excinfo.value)
+    assert ".md" not in str(excinfo.value)  # 只点重叠的那个
+
+
 def test_路由器本身也是解析器():
     assert isinstance(ParserRouter((MarkdownParser(),)), SourceParser)
 

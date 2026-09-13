@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from ragamer.config import Settings
 from ragamer.llm import LlmClient, OpenAiLlm
 from ragamer.logging import get_logger
-from ragamer.mineru import MineruClient, MineruParser
+from ragamer.mineru import MineruParser
 from ragamer.sources import MarkdownParser, ParserRouter, SourceParser
 from ragamer.stores.base import (
     ChunkStore,
@@ -98,7 +98,7 @@ def build_container(settings: Settings) -> Container:
             (
                 MarkdownParser(),
                 # PDF 与图片走云端解析；它拿到的原图由导入编排器送进对象存储
-                MineruParser(MineruClient(settings.mineru)),
+                MineruParser(settings.mineru),
             )
         ),
     )

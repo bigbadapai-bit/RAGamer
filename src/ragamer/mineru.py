@@ -1,7 +1,8 @@
 """MinerU 云端解析：PDF 与图片 → Markdown。
 
-一份资料走四步：申请上传链接 → PUT 上传 → 轮询结果 → 下载结果包。版面分析外包给
-MinerU（本地不跑 magic-pdf），本模块只负责把它接进归一化那条路（docs/ARCHITECTURE.md §1.1）。
+一份资料走四步：申请上传链接 → PUT 上传 → 轮询结果 → 下载结果包。结果包解开就是
+归一化文档（ADR-0006）——版面分析外包给 MinerU（本地不跑 magic-pdf），本模块只负责
+把它接进归一化那条路（docs/ARCHITECTURE.md §1.1）。
 
 四件事必须一次做对：
 
@@ -25,20 +26,18 @@ import posixpath
 import time
 import zipfile
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any
 from urllib.parse import quote
 
 import httpx
 
 from ragamer.config import MineruSettings
 from ragamer.logging import get_logger
+from ragamer.redaction import redact_address
 from ragamer.sources import NormalizedDoc, SourceAsset, SourceDocument, SourceError, image_refs
 
 logger = get_logger(__name__)
-
-T = TypeVar("T")
 
 #: 批量上传解析接口挂在 base_url 下面的这一层。
 API_PREFIX = "/api/v4"
@@ -80,34 +79,17 @@ class MineruTimeout(MineruError):
     """等过了总时长上限还没完。信息里带最后看到的状态。"""
 
 
-@dataclass(frozen=True)
-class MineruImage:
-    """结果包里的一张原图。
-
-    `name` 是包内的相对路径（`images/xxx.jpg`）——正文引用它时用的正是这个名字，
-    所以「哪一处引用对应哪张图」在这一层就定下来了。
-    """
-
-    name: str
-    data: bytes
-    content_type: str
-
-
-@dataclass(frozen=True)
-class MineruBundle:
-    """一次解析的产物：正文 + 条目级结构 + 原图。"""
-
-    markdown: str
-    content_list: tuple[Mapping[str, Any], ...]
-    images: tuple[MineruImage, ...]
-
-
-class MineruClient:
-    """MinerU 云端解析接口的客户端。
+class MineruParser:
+    """PDF 与图片 → MinerU → 归一化文档。
 
     端点、凭据、三个上限全部来自配置，这里不硬编码任何一项。传输层与时钟可注入：
     测试用 `httpx.MockTransport` 打真实代码路径（含轮询与解包），一次网络都不发。
+
+    原图**不在这里进对象存储**——对象 key 要用到游戏 id，那在导入编排器里
+    （`ragamer.sources.publish_assets`）。
     """
+
+    SUFFIXES = PDF_SUFFIXES + IMAGE_SUFFIXES
 
     def __init__(
         self,
@@ -132,8 +114,8 @@ class MineruClient:
         self._sleep = sleep
         self._clock = clock
 
-    def extract(self, source: SourceDocument) -> MineruBundle:
-        """一份资料 → 解析产物。
+    def parse(self, source: SourceDocument) -> NormalizedDoc:
+        """一份资料 → 归一化文档。原图作为附件留给导入编排器发布。
 
         :raises MineruError: 走不通。信息里已点名是哪个文件、卡在哪一步。
         """
@@ -141,7 +123,7 @@ class MineruClient:
         batch_id, upload_url = self._request_upload(source, name)
         self._upload(source, upload_url)
         zip_url = self._await_result(source, batch_id, name)
-        return _unpack(self._download(source, zip_url), source)
+        return _normalize(self._download(source, zip_url), source)
 
     def _request_upload(self, source: SourceDocument, name: str) -> tuple[str, str]:
         """申请上传链接。上传完不必再调提交接口——服务端扫到文件就自己排上。"""
@@ -152,7 +134,7 @@ class MineruClient:
             "files": [{"name": name, "is_ocr": _needs_ocr(source.filename)}],
         }
         url = f"{self._base}{API_PREFIX}/file-urls/batch"
-        response = self._attempt(self._send, "POST", url, source=source, json=payload)
+        response = self._fetch("POST", url, source=source, json=payload)
         data = _business(response, source)
         batch_id = data.get("batch_id")
         urls = data.get("file_urls")
@@ -164,9 +146,7 @@ class MineruClient:
 
     def _upload(self, source: SourceDocument, upload_url: str) -> None:
         # 预签名地址，裸字节上传：不带 Bearer，也不带 Content-Type
-        self._attempt(
-            self._send, "PUT", upload_url, source=source, content=source.data, authorized=False
-        )
+        self._fetch("PUT", upload_url, source=source, content=source.data, authorized=False)
 
     def _await_result(self, source: SourceDocument, batch_id: str, name: str) -> str:
         """轮询到解析完成，返回结果包的下载地址。
@@ -174,6 +154,10 @@ class MineruClient:
         两个上限一起兜住「不无限等」：间隔由配置给，总时长同样。单次失败（连不上、
         5xx）不判死刑——轮询本来就在反复问，死线是它的上限；但**任务 failed 当场抛错**，
         不等满时长。
+
+        死线只管轮询这一段。在它之上还有上传、下载与各最多 `_ATTEMPTS` 次重试，
+        每段都有自己的单请求超时，所以一份资料的最坏耗时是有限的，
+        但不是 `poll_timeout_seconds` 秒——要卡整份资料的预算得从调用方那层来。
         """
         url = f"{self._base}{API_PREFIX}/extract-results/batch/{quote(batch_id, safe='')}"
         timeout = self._config.poll_timeout_seconds
@@ -186,9 +170,9 @@ class MineruClient:
                     f"{source.filename}：等待 MinerU 解析超过 {timeout:g} 秒（最后状态：{state}）"
                 )
             try:
-                entry = _entry(
-                    _business(self._send("GET", url, source=source), source), source, name
-                )
+                # 单发不重试：这一层本来就在反复问，重试交给死线和间隔
+                response = self._request("GET", url, source=source)
+                entry = _entry(_business(response, source), source, name)
             except MineruUnavailable as exc:
                 logger.warning("%s；%g 秒后再问一次", exc, self._config.poll_interval_seconds)
             else:
@@ -211,10 +195,10 @@ class MineruClient:
 
     def _download(self, source: SourceDocument, zip_url: str) -> bytes:
         # 同样是预签名地址，同样不带 Bearer
-        response = self._attempt(self._send, "GET", zip_url, source=source, authorized=False)
+        response = self._fetch("GET", zip_url, source=source, authorized=False)
         return response.content
 
-    def _send(
+    def _fetch(
         self,
         method: str,
         url: str,
@@ -224,28 +208,18 @@ class MineruClient:
         content: bytes | None = None,
         authorized: bool = True,
     ) -> httpx.Response:
-        """发一次请求。传输层与状态码在这里翻成项目自己的异常，重试是 `_attempt` 的事。"""
-        try:
-            response = self._client.request(
-                method,
-                url,
-                json=json,
-                content=content,
-                headers=self._headers if authorized else None,
-            )
-        except httpx.HTTPError as exc:
-            raise MineruUnavailable(
-                f"{source.filename}：连不上 MinerU 的 {_address(url)}（{exc!r}）"
-            ) from exc
-        if response.status_code >= 400:
-            raise _status_error(source, url, response)
-        return response
-
-    def _attempt(self, operation: Callable[..., T], *args: Any, **kwargs: Any) -> T:
+        """发一次请求，可以再试的那种失败最多试 `_ATTEMPTS` 次。"""
         attempt = 1
         while True:
             try:
-                return operation(*args, **kwargs)
+                return self._request(
+                    method,
+                    url,
+                    source=source,
+                    json=json,
+                    content=content,
+                    authorized=authorized,
+                )
             except MineruUnavailable as exc:
                 if attempt >= _ATTEMPTS:
                     raise
@@ -259,33 +233,36 @@ class MineruClient:
                 self._sleep(self._config.poll_interval_seconds)
                 attempt += 1
 
-
-class MineruParser:
-    """PDF 与图片 → MinerU → 归一化文档。
-
-    只做「取产物」这一件事。原图**不在这里进对象存储**——对象 key 要用到游戏 id，
-    那在导入编排器里（`sources.publish_assets`）。
-    """
-
-    SUFFIXES = PDF_SUFFIXES + IMAGE_SUFFIXES
-
-    def __init__(self, client: MineruClient) -> None:
-        self._client = client
-
-    def parse(self, source: SourceDocument) -> NormalizedDoc:
-        bundle = self._client.extract(source)
-        return NormalizedDoc(
-            markdown=bundle.markdown,
-            images=image_refs(bundle.markdown),
-            content_list=bundle.content_list,
-            assets=tuple(
-                SourceAsset(image.name, image.data, image.content_type) for image in bundle.images
-            ),
-        )
+    def _request(
+        self,
+        method: str,
+        url: str,
+        *,
+        source: SourceDocument,
+        json: Mapping[str, Any] | None = None,
+        content: bytes | None = None,
+        authorized: bool = True,
+    ) -> httpx.Response:
+        """发一次请求。传输层与状态码在这里翻成项目自己的异常，重试是 `_fetch` 的事。"""
+        try:
+            response = self._client.request(
+                method,
+                url,
+                json=json,
+                content=content,
+                headers=self._headers if authorized else None,
+            )
+        except httpx.HTTPError as exc:
+            raise MineruUnavailable(
+                f"{source.filename}：连不上 MinerU 的 {redact_address(url)}（{exc!r}）"
+            ) from exc
+        if response.status_code >= 400:
+            raise _status_error(source, url, response)
+        return response
 
 
 def _status_error(source: SourceDocument, url: str, response: httpx.Response) -> MineruError:
-    where = _address(url)
+    where = redact_address(url)
     if response.status_code == 429:
         return MineruUnavailable(f"{source.filename}：{where} 限流（HTTP 429）")
     if response.status_code >= 500:
@@ -355,8 +332,8 @@ def _zip_url(entry: Mapping[str, Any], source: SourceDocument) -> str:
     return url
 
 
-def _unpack(payload: bytes, source: SourceDocument) -> MineruBundle:
-    """结果包 → 正文 + 条目级结构 + 原图。
+def _normalize(payload: bytes, source: SourceDocument) -> NormalizedDoc:
+    """结果包 → 归一化文档：正文 + 条目级结构 + 原图（附件）。
 
     只按名字读条目，**不落盘**：不写文件就没有目录穿越（zip slip）可谈。`..` 之类的
     越界条目直接跳过——它们只可能来自坏掉或伪造的包。
@@ -369,11 +346,13 @@ def _unpack(payload: bytes, source: SourceDocument) -> MineruBundle:
         names = [name for name in archive.namelist() if _readable(name)]
         markdown_name = _markdown_name(names, source)
         base = posixpath.dirname(markdown_name)
-        return MineruBundle(
-            markdown=_read_markdown(archive, markdown_name, source),
+        markdown = _read_markdown(archive, markdown_name, source)
+        return NormalizedDoc(
+            markdown=markdown,
+            images=image_refs(markdown),
             content_list=_read_content_list(archive, names, source),
-            images=tuple(
-                MineruImage(
+            assets=tuple(
+                SourceAsset(
                     name=_relative(name, base),
                     data=archive.read(name),
                     content_type=_content_type(name),
@@ -470,13 +449,6 @@ def _upload_name(filename: str, data: bytes) -> str:
     suffix = Path(filename).suffix
     stem = Path(filename).stem.replace('"', "").replace("\\", "").strip() or "source"
     return f"{stem}-{hashlib.sha256(data).hexdigest()[:8]}{suffix}"
-
-
-def _address(url: str) -> str:
-    """只留协议与主机。预签名地址的查询串里有签名，不该进错误信息与日志。"""
-    parsed = httpx.URL(url)
-    port = f":{parsed.port}" if parsed.port is not None else ""
-    return f"{parsed.scheme}://{parsed.host}{port}"
 
 
 def _names(names: Sequence[str]) -> str:

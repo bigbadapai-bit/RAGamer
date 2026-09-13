@@ -12,9 +12,11 @@ MinerU 不把图片区域里的文字 OCR 成正文（它的产品决策），�
 **判定口径**（一个图片条目算「有文字」的两种情形）：
 
 1. 条目自身带 `text` / `content` 字段——pipeline 后端若能直接抽到图内文字就是这种；
-2. 正文里这张图的引用之后紧跟一个 `<details>` 折叠块——vlm 后端走的是这种。
+2. 正文里这张图的引用之后紧跟一个标着 `text_image` 的 `<details>` 折叠块——
+   vlm 后端走的是这种（§1.2 那个例子的原样）。
 
 两种都没有，才算「有图但没提取出文字」，也就是必须靠二次 OCR 补的那种。
+第 2 条认的是标记而不只是 `<details>`：正文里别的折叠块（表格、公式）不算这张图的文字。
 
 凭据从 `.env` 读（`RAGAMER_MINERU_API_KEY`），不从命令行传：命令行参数会进 shell 历史。
 """
@@ -29,8 +31,8 @@ from pathlib import Path
 
 from ragamer.config import ConfigError, Settings, get_settings
 from ragamer.logging import get_logger, setup_logging
-from ragamer.mineru import IMAGE_SUFFIXES, MineruBundle, MineruClient, MineruError
-from ragamer.sources import SourceDocument
+from ragamer.mineru import IMAGE_SUFFIXES, MineruError, MineruParser
+from ragamer.sources import NormalizedDoc, SourceDocument
 
 logger = get_logger(__name__)
 
@@ -40,6 +42,10 @@ BACKENDS = ("pipeline", "vlm")
 #: 判定「这张图后面跟了提取出来的文字」的窗口（字符）。
 #: 折叠块紧跟图片引用（§1.2 那个例子），取这么长够到它，又不会把后面正文里的算进来。
 DETAILS_WINDOW = 500
+
+#: 图内文字那个折叠块的标记。认它而不只是认 `<details>`：正文里别的折叠块
+#: （表格、公式）不是这张图的文字，算进来会把比例压低。
+DETAILS_MARK = "<summary>text_image</summary>"
 
 
 @dataclass(frozen=True)
@@ -63,14 +69,14 @@ class FileStat:
         return self.error is None
 
 
-def measure(name: str, backend: str, bundle: MineruBundle) -> FileStat:
+def measure(name: str, backend: str, doc: NormalizedDoc) -> FileStat:
     """一份解析产物里，图片条目各有多少带上了文字。"""
-    entries = [entry for entry in bundle.content_list if entry.get("type") == "image"]
+    entries = [entry for entry in doc.content_list if entry.get("type") == "image"]
     entry_text = details = 0
     for entry in entries:
         if str(entry.get("text") or entry.get("content") or "").strip():
             entry_text += 1
-        elif _details_after(bundle.markdown, str(entry.get("img_path") or "")):
+        elif _details_after(doc.markdown, str(entry.get("img_path") or "")):
             details += 1
     return FileStat(
         name=name,
@@ -82,13 +88,17 @@ def measure(name: str, backend: str, bundle: MineruBundle) -> FileStat:
 
 
 def _details_after(markdown: str, ref: str) -> bool:
-    """这张图的引用后面跟了折叠块吗。"""
+    """这张图的引用后面跟了标着 `text_image` 的折叠块吗。
+
+    只在引用之后的那一段窗口里找，而且认标记：窗口里碰巧有个表格折叠块，
+    不能算成这张图提取到了文字——那正是把这个比例算歪的方式。
+    """
     if not ref:
         return False
     start = markdown.find(ref)
     if start < 0:
         return False
-    return "<details" in markdown[start : start + len(ref) + DETAILS_WINDOW]
+    return DETAILS_MARK in markdown[start : start + len(ref) + DETAILS_WINDOW]
 
 
 def run(
@@ -104,9 +114,9 @@ def run(
     )
     stats: list[FileStat] = []
     for backend in backends:
-        client = MineruClient(settings.mineru.model_copy(update={"model_version": backend}))
+        parser = MineruParser(settings.mineru.model_copy(update={"model_version": backend}))
         for path in files:
-            stats.append(_one(client, path, backend))
+            stats.append(_one(parser, path, backend))
     return stats
 
 
@@ -117,10 +127,10 @@ def images_in(directory: Path) -> list[Path]:
     return sorted(path for path in directory.iterdir() if path.suffix.lower() in IMAGE_SUFFIXES)
 
 
-def _one(client: MineruClient, path: Path, backend: str) -> FileStat:
+def _one(parser: MineruParser, path: Path, backend: str) -> FileStat:
     source = SourceDocument(filename=path.name, data=path.read_bytes())
     try:
-        stat = measure(path.name, backend, client.extract(source))
+        stat = measure(path.name, backend, parser.parse(source))
     except MineruError as exc:
         logger.error("%s · %s：%s", path.name, backend, exc)
         return FileStat(name=path.name, backend=backend, error=str(exc))

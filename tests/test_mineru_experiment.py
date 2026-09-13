@@ -11,20 +11,23 @@ from pathlib import Path
 import pytest
 from mineru_ocr_experiment import FileStat, images_in, measure, report
 
-from ragamer.mineru import MineruBundle
+from ragamer.sources import NormalizedDoc
 
 TEXT_ENTRY = {"type": "text", "text": "二郎神是隐藏 BOSS"}
 IMAGE_ENTRY = {"type": "image", "img_path": "images/a.jpg", "image_caption": []}
 
+#: 图内文字那个折叠块，与 §1.2 给的例子同形。
+DETAILS = "<details>\n<summary>text_image</summary>\n血量 12000\n</details>\n"
 
-def bundle(markdown: str, entries: list[dict]) -> MineruBundle:
-    return MineruBundle(markdown=markdown, content_list=tuple(entries), images=())
+
+def parsed(markdown: str, entries: list[dict]) -> NormalizedDoc:
+    return NormalizedDoc(markdown=markdown, content_list=tuple(entries))
 
 
 def test_条目自带文字就算有文字():
     """pipeline 后端若能直接抽到图内文字，走的是这一路。"""
     stat = measure(
-        "a.jpg", "pipeline", bundle("![](images/a.jpg)", [{**IMAGE_ENTRY, "text": "血量 12000"}])
+        "a.jpg", "pipeline", parsed("![](images/a.jpg)", [{**IMAGE_ENTRY, "text": "血量 12000"}])
     )
 
     assert (stat.image_entries, stat.with_entry_text, stat.missing) == (1, 1, 0)
@@ -32,38 +35,43 @@ def test_条目自带文字就算有文字():
 
 def test_正文里的折叠块也算有文字():
     """vlm 后端走的是这一路：图内文字落在紧跟图片引用的 `<details>` 里。"""
-    markdown = (
-        "![](images/a.jpg)\n<details>\n<summary>text_image</summary>\n血量 12000\n</details>\n"
-    )
-    stat = measure("a.jpg", "vlm", bundle(markdown, [IMAGE_ENTRY]))
+    stat = measure("a.jpg", "vlm", parsed(f"![](images/a.jpg)\n{DETAILS}", [IMAGE_ENTRY]))
 
     assert (stat.with_details, stat.missing) == (1, 0)
 
 
 def test_两处都没有才算有图无字():
-    stat = measure("a.jpg", "vlm", bundle("![](images/a.jpg)\n\n后面是正文。", [IMAGE_ENTRY]))
+    stat = measure("a.jpg", "vlm", parsed("![](images/a.jpg)\n\n后面是正文。", [IMAGE_ENTRY]))
 
     assert (stat.image_entries, stat.missing) == (1, 1)
 
 
+def test_别的折叠块不算这张图的文字():
+    """正文里挨着图片的表格／公式折叠块不是图内文字，算进来就把比例压低了。"""
+    other = "![](images/a.jpg)\n<details>\n<summary>table</summary>\n| 血量 | 12000 |\n</details>\n"
+    stat = measure("a.jpg", "vlm", parsed(other, [IMAGE_ENTRY]))
+
+    assert stat.missing == 1
+
+
 def test_正文里根本没有这张图的引用也算有图无字():
     """条目说有这张图，正文里却找不到它——信息一样是取不到的。"""
-    stat = measure("a.jpg", "vlm", bundle("只有正文，一张图都没有。", [IMAGE_ENTRY]))
+    stat = measure("a.jpg", "vlm", parsed("只有正文，一张图都没有。", [IMAGE_ENTRY]))
 
     assert stat.missing == 1
 
 
 def test_窗口之外的折叠块不算在这张图头上():
     """下一节的折叠块离得太远，算进来就会把比例压低，正是最坏的那种错。"""
-    far = "![](images/a.jpg)\n" + "正文。" * 300 + "\n<details>\n<summary>text_image</summary>\n"
-    stat = measure("a.jpg", "vlm", bundle(far, [IMAGE_ENTRY]))
+    far = "![](images/a.jpg)\n" + "正文。" * 300 + "\n" + DETAILS
+    stat = measure("a.jpg", "vlm", parsed(far, [IMAGE_ENTRY]))
 
     assert stat.missing == 1
 
 
 def test_只数图片条目():
     stat = measure(
-        "a.jpg", "vlm", bundle("![](images/a.jpg)", [TEXT_ENTRY, IMAGE_ENTRY, {"type": "table"}])
+        "a.jpg", "vlm", parsed("![](images/a.jpg)", [TEXT_ENTRY, IMAGE_ENTRY, {"type": "table"}])
     )
 
     assert stat.image_entries == 1

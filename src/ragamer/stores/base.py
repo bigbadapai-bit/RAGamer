@@ -338,5 +338,9 @@ def image_key(game_id: str, digest: str, name: str) -> str:
     `digest` 取自来源文件的字节：同一份文件重导算出的 key 完全一致，图片原地覆盖，
     与切片主键由导入侧分配（`ragamer.importing.chunk_id`）是同一套幂等思路；
     不同文件即使同名也各有各的一层，不会互相覆盖。
+
+    **代价**：同一份资料改了内容再导，算出的 digest 变了，上一版的图片会留在旧的
+    那一层——它按游戏一级清理时一并收走（`image_prefix(game_id)`）。比按文件名分层强：
+    那样两份同名不同内容的截图会互相覆盖，答案是配错图，而且不报错。
     """
     return f"{image_prefix(game_id, digest)}/{name}"
