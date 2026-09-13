@@ -84,12 +84,26 @@ uv run pytest -m integration     # 跑真模型的集成测试（首次会下载
 - 打标用的词表来自知识库元数据（MongoDB 的 `knowledge_bases` 集合，id 即游戏 id）。
   库不存在时 404，不静默按默认词表建内容。
 
+## 提问理解
+
+读取侧的第一道处理在 `ragamer.query`：**一次模型调用**同时判定问的是哪款游戏、哪个版本，
+以及改写后的规范问法（`docs/ARCHITECTURE.md` §3.1 的联合输出节点）。读取侧目前只到这一步，
+检索与生成在后面两张票里接。
+
+- **候选只能是库里真有的**：游戏与版本的候选由调用方从库里读出来传进去，模型给的取值
+  对不上候选就丢掉、留空——编出来的游戏名照它检索只会查空，而且不报错。
+- **版本过滤恒为「所选版本或未标注版本」**（ADR-0004）：问题里没点名版本，就用知识库标着的
+  当前生效版本；两处都判不出来时**不做版本过滤**——过滤成「只留未标注版本」会把标了版本的
+  资料整批静默漏掉。
+- **改写结果稳定可复现**：温度钉死 0，归一化只压平空白，改写后的问题因此能直接当缓存 key。
+- **这一步失败不阻断提问**：模型挂了就按原问法继续，游戏与版本留空交回给会话里已选定的那两个。
+
 ## 目录
 
 ```
 src/ragamer/          应用代码（config 配置装载、logging 日志、llm 语言模型适配器、sources 归一化、
-                      chunking 切分器、tagging 打标、importing 导入编排器、api HTTP 端点、
-                      container 组合根、__main__ 启动自检）
+                      chunking 切分器、tagging 打标、importing 导入编排器、query 提问理解、
+                      api HTTP 端点、container 组合根、__main__ 启动自检）
 src/ragamer/stores/   存储适配器：base 协议与共享类型、chunks Milvus、documents Mongo、objects MinIO、memory 内存假件
 src/ragamer/vectors/  向量化与精排：base 协议与共享类型、bge 真实模型、fake 确定性假件
 tests/                测试：行为测试 + 结构约束 + 集成测试
