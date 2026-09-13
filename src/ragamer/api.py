@@ -1,12 +1,12 @@
 """HTTP 端点：写入侧与读取侧对外的唯一入口。
 
-四个端点分两侧：
+五个端点分两侧：
 
 - **写入侧** `POST /api/kb/{game_id}/import`。批量提交、**逐文件独立**：某个文件失败时
   其余照常入库，失败的那个在结果里带文件名与失败阶段。
-- **读取侧** `POST /api/chat/sessions`、`GET /api/chat/sessions/{session_id}`、
-  `GET /api/chat/sessions/{session_id}/ask`。开会话、把历史读回来、逐字问一句（SSE）。
-  对话页那一层在后面的票里接。
+- **读取侧** `POST /api/chat/sessions`、`GET /api/chat/sessions`（按库列会话）、
+  `GET /api/chat/sessions/{session_id}`、`GET /api/chat/sessions/{session_id}/ask`。
+  开会话、列会话、把历史读回来、逐字问一句（SSE）。对话页那一层在后面的票里接。
 
 对话那几个只做 HTTP 这一层的事：会话不存在翻成 404、问题为空翻成 400、一轮问答翻成
 SSE 事件。**「这一轮算不算问完」「要不要写进历史」在 `ragamer.conversations` 里**，
@@ -22,7 +22,7 @@ SSE 事件。**「这一轮算不算问完」「要不要写进历史」在 `rag
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import asdict
 from typing import Annotated, Any
 
@@ -36,6 +36,7 @@ from ragamer.conversations import (
     Chat,
     Conversation,
     ConversationNotFound,
+    ConversationSummary,
     Game,
     Reply,
     Sources,
@@ -129,10 +130,7 @@ def create_app(container: Container) -> FastAPI:
         知识库本身不存在则是 404，与建会话同一个口径：那是游戏选错了。
         """
         _kb_document(container, game_id)
-        return {
-            "game_id": game_id,
-            "sessions": [asdict(summary) for summary in chat.list_for_game(game_id)],
-        }
+        return _sessions_payload(game_id, chat.list_for_game(game_id))
 
     @app.get("/api/chat/sessions/{session_id}")
     def read_session(session_id: str) -> dict[str, Any]:
@@ -331,6 +329,15 @@ def _conversation(chat: Chat, session_id: str) -> Conversation:
         return chat.open(session_id)
     except ConversationNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+def _sessions_payload(game_id: str, summaries: Sequence[ConversationSummary]) -> dict[str, Any]:
+    """会话列表对外的样子。
+
+    `ConversationSummary` 天生装不下正文，所以这里不必再挑一遍字段——列表就三样：
+    会话 id、标题、最后活跃时刻。正文在单条会话那一条端点上取。
+    """
+    return {"game_id": game_id, "sessions": [asdict(summary) for summary in summaries]}
 
 
 def _conversation_payload(conversation: Conversation) -> dict[str, Any]:

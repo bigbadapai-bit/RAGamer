@@ -109,6 +109,16 @@ def matches(chunk: Chunk, where: ChunkFilter | None) -> bool:
     )
 
 
+def matches_where(document: Mapping[str, Any], where: Mapping[str, Any] | None) -> bool:
+    """`DocStore.find` 的等值匹配语义。
+
+    内存假件照它实现；Mongo 适配器把同一组语义翻成 filter 交给服务端。两处的判断必须
+    一致，否则缝里跑过的行为与云端跑的行为对不上——与 :func:`matches` 同一个理由，
+    只是这里只有等值这一条，所以短得多。
+    """
+    return all(document.get(key) == value for key, value in (where or {}).items())
+
+
 def require_vectors(chunk: Chunk) -> None:
     """入库前必须已经向量化。
 
@@ -297,13 +307,15 @@ class DocStore(Store, Protocol):
         「某个游戏下的最近若干条，且不要正文」——先 `list_ids` 再逐条 `get` 会把每份文档
         都读出来，几十条会话就是几十次往返，而其中有用的只有标题和时间那两个字段。
 
-        - `where`：**等值**匹配，`None` 即不过滤。刻意只做到等值——比较、数组包含那些
-          是 `ChunkFilter` 的事，那边有 `matches()` 兜住两套实现的口径；这一层再长出一套
-          过滤语义，两个后端就会有对不上的地方。
+        - `where`：**等值**匹配，`None` 即不过滤，语义见 :func:`matches_where`。刻意只做到
+          等值——比较、数组包含那些是 `ChunkFilter` 的事，那边有 `matches()` 兜住两套实现
+          的口径；这一层再长出一套过滤语义，两个后端就会有对不上的地方。
         - `fields`：空即整份返回；非空只返回这几项。**列表这类场景必须给**，否则把一堆
           用不上的正文拖回来，正是这个方法要避免的事。
         - `order_by` / `descending`：按哪个字段排、正序还是倒序。不给 `order_by` 时
-          顺序由存储自己定（Mongo 不保证），**不要依赖它**。
+          顺序由存储自己定（Mongo 不保证），**不要依赖它**。给的字段要在每份文档里都存在：
+          **缺这个字段的文档怎么排，两个后端不保证一致**（Mongo 把缺的当 null，内存假件
+          当空串），别拿一个可能缺的字段来排。
         - `limit`：条数上限。
 
         **返回的每一条都带 `_id`**。它是文档 id，批量取的时候调用方就是靠它认人的。

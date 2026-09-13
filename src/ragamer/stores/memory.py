@@ -20,6 +20,7 @@ from ragamer.stores.base import (
     StoreError,
     collection_name,
     matches,
+    matches_where,
     normalize_prefix,
     require_vectors,
 )
@@ -136,15 +137,15 @@ class InMemoryDocStore:
     ) -> list[dict[str, Any]]:
         """等值匹配 + 排序 + 截断，与真实那边同一套语义。
 
-        排序前先按 id 定序，所以**同分的排法在这里是确定的**——真实那边不保证，
-        测试依赖的是这里这份确定性。缺 `order_by` 那个字段的按空串算：本项目要排序的
-        字段（时间）都是必有的，真出现缺的，两边排法会不一样，这一点不追平。
+        匹配走 `base.matches_where`，与真实适配器同一份规则（见模块说明）。排序前先按
+        id 定序，所以**同分的排法在这里是确定的**——真实那边不保证，测试依赖的是这里
+        这份确定性。缺 `order_by` 那个字段的按空串算，与真实那边的排法不一致，
+        `find` 的契约里写了这一条。
         """
-        wanted = dict(where or {})
         found = [
             {"_id": doc_id, **document}
             for doc_id, document in sorted(self._collections.get(collection, {}).items())
-            if all(document.get(key) == value for key, value in wanted.items())
+            if matches_where(document, where)
         ]
         if order_by is not None:
             found.sort(key=lambda document: document.get(order_by, ""), reverse=descending)

@@ -128,7 +128,12 @@ def test_两次会话互不串扰():
 
 
 def test_列出这个库的会话_按最后活跃倒序():
-    """左栏那一份：**最后说过话的排最前**，先建的那个也一样能翻上来。"""
+    """左栏那一份：**最后说过话的排最前**，先建的那个也一样能翻上来。
+
+    这一层注入不了假时钟（`Chat` 在 `create_app` 里造），靠的是真实时钟。够用：
+    Python 在 Windows 上取的是 100 纳秒精度，而两次请求之间隔着毫秒级的活儿——
+    撞上同一刻要差四个数量级。排序本身另有 `test_conversations` 用假时钟钉住。
+    """
     client = client_with(FakeLlm(said(QUESTION), REPLY), DOC)
     first = start(client)
     second = start(client)
