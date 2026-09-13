@@ -30,7 +30,7 @@ from ragamer.conversations import (
 )
 from ragamer.llm import FakeLlm, LlmTimeout
 from ragamer.routing import RouteTable
-from ragamer.tagging import ContentNature
+from ragamer.tagging import ContentNature, SubjectType
 from ragamer.vectors.fake import FakeReranker
 
 from .conftest import (
@@ -153,7 +153,7 @@ def test_没有候选时回落会话选定的知识库():
 # --- 选路 ---
 
 
-def test_问题类型决定走哪几路():
+def test_查询类型决定走哪几路():
     """判成事实型就走主检索 + 元数据过滤：第二条是单路稠密检索，还带着内容性质过滤。
 
     选路的失效是静默的（照样出答案，只是依据偏了），所以这里断的是「检索收到了什么」。
@@ -185,6 +185,32 @@ def test_知识库的路由表覆盖默认选路():
     )
 
     assert len(chunks.searches) == 1
+
+
+def test_路由表里配的主体类型与内容性质真的到了过滤条件里():
+    """配置 → 选路 → 检索这一条要通到底：只断「表里写着」的话，中间断了一环也看不出来。
+
+    内容性质由查询类型推出来，主体类型只能靠配置给——所以这一条用配置那一维来证。
+    """
+    llm = FakeLlm(said("二郎神血量多少", route="事实型"), "血量是 8000[1]。")
+    chat, chunks = recording_chat(llm)
+    conversation = chat.start(game_id=GAME)
+    routes = RouteTable.from_mapping(
+        {
+            "route_table": {
+                "factual": {
+                    "paths": ["main", "metadata"],
+                    "subject_types": ["character"],
+                    "content_natures": ["stats"],
+                }
+            }
+        }
+    )
+
+    asked(chat, conversation, "二郎神血量多少", routes=routes)
+
+    assert chunks.searches[1]["where"].subject_types == (SubjectType.CHARACTER,)
+    assert chunks.searches[1]["where"].content_natures == (ContentNature.STATS,)
 
 
 def test_判不出类型时照默认组合继续作答():

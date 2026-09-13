@@ -101,7 +101,7 @@ def retrieve(
     :param query: 用来向量化与精排的文本。改写（`ragamer.query`）在外面做完再进来。
     :param where: 结构化过滤条件，版本那一条由 `ragamer.query.version_filter` 给出。
         多路共用同一份——各路各自过滤，融合之后就分不清哪条候选是按哪套条件取的了。
-    :param route: 这次走哪几路，由 `ragamer.routing` 按问题类型给出。**不给就只走
+    :param route: 这次走哪几路，由 `ragamer.routing` 按查询类型给出。**不给就只走
         主检索路**：这一层不替调用方选路。选中了还没接上的路会跳过并留痕。
     :raises ModelOutputError: 向量化或精排的条数与候选对不上。宁可当场炸：
         按短的一边截齐会得到一个静默错位的排序，查不出、也不报错。
@@ -112,7 +112,7 @@ def retrieve(
     found = rrf(
         [
             _recall(path, embedding, game_id=game_id, chunks=chunks, where=where, route=route)
-            for path in _paths(route)
+            for path in _paths_to_run(route)
         ]
     )
     if not found:
@@ -120,7 +120,7 @@ def retrieve(
     return cliff_cut(_reranked(query, found, reranker))
 
 
-def _paths(route: Route | None) -> tuple[RecallPath, ...]:
+def _paths_to_run(route: Route | None) -> tuple[RecallPath, ...]:
     """这次真正要跑的路。**没接上的跳过，一条都不剩时退回主检索路。**
 
     不给 `route` 就是只走主检索——选路是 `ragamer.routing` 的事，这一层不替调用方决定。
@@ -152,7 +152,7 @@ def _recall(
 ) -> list[ChunkHit]:
     """跑一路召回。**向量化在调用方做过一次，这里只取用**——各路检索的必须是同一个问题。
 
-    只有两条路会走到这里（`_paths` 已经把没接上的滤掉了）。
+    只有两条路会走到这里（`_paths_to_run` 已经把没接上的滤掉了）。
     """
     metadata = path is RecallPath.METADATA
     return chunks.search(

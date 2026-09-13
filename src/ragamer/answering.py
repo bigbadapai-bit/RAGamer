@@ -211,7 +211,7 @@ class Answerer:
         :param version: 这次按哪个版本检索。空串表示没点名（回落 `current_version`）。
         :param current_version: 知识库标着的现行版本。两个都是空串时不做版本过滤，
             并留一条 warning——见 `ragamer.query.version_filter`。
-        :param route: 这次走哪几路召回。**不给就只走主检索路**——选路要的是问题类型，
+        :param route: 这次走哪几路召回。**不给就只走主检索路**——选路要的是查询类型，
             而那是 `ragamer.query.understand` 的产物，这一层拿不到也不该假装拿得到
             （`ragamer.conversations` 那边判出来再传进来）。
         :raises ValueError: 问题为空。空问题会让检索查出任意一批切片。

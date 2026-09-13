@@ -79,7 +79,7 @@ def test_路由标签不在词表里时判不出并留痕(caplog):
     assert result.query_type is None
     assert result.game == "黑神话·悟空"
     assert result.rewritten_query == "二郎神怎么打"
-    assert any("问题类型不在词表里" in record.getMessage() for record in caplog.records)
+    assert any("查询类型不在词表里" in record.getMessage() for record in caplog.records)
 
 
 def test_按提示留空串是判不出而不是认出个没见过的取值(caplog):
@@ -91,7 +91,23 @@ def test_按提示留空串是判不出而不是认出个没见过的取值(capl
         result = understand("那个很难的 BOSS 怎么过", llm=llm, games=GAMES)
 
     assert result.query_type is None
-    assert not [record for record in caplog.records if "问题类型" in record.getMessage()]
+    assert not [record for record in caplog.records if "查询类型" in record.getMessage()]
+
+
+def test_模型整个漏掉查询类型时另外三个字段照用(caplog):
+    """字段**缺席**与「按提示留了空串」要分得开，而两者的走法一样（都回落默认组合）。
+
+    缺席只赔上它自己：`route` 有默认值，另外三个字段照常带走。把它们一起赔进去，
+    等于为一个本来就定义了回落的字段牺牲三个没得回落的——重试一次还好，重试用尽
+    就整套降级了。
+    """
+    llm = FakeLlm({key: value for key, value in JOINT_OUTPUT.items() if key != "route"})
+
+    with caplog.at_level(logging.WARNING, logger="ragamer.query"):
+        result = understand("二郎神怎么打", llm=llm, games=GAMES, versions=VERSIONS)
+
+    assert result == Understanding("黑神话·悟空", "2.0", "二郎神怎么打")
+    assert any("整个缺席" in record.getMessage() for record in caplog.records)
 
 
 def test_提示词里写全了六类问题():

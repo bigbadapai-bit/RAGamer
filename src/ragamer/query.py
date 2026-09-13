@@ -97,8 +97,11 @@ def understand(
     kind = parse_query_type(guess.route)
     if kind is None and guess.route.strip():
         # 词表以外的标签与「按提示留了空串」不是一回事：后者是判不出，前者是提示词
-        # 与 schema 没对上或者模型跑偏了。判不出不报，跑偏要留痕。
-        logger.warning("模型判出的问题类型不在词表里，本次按默认组合走：%r", guess.route)
+        # 与 schema 没对上或者模型跑偏了。判不出不报，跑偏要留痕——留痕的判据见
+        # `_JointOutput.route`：这个字段只在这一层失手时回落，不该连累另外三个。
+        logger.warning("模型判出的查询类型不在词表里，本次按默认组合走：%r", guess.route)
+    elif kind is None and "route" not in guess.model_fields_set:
+        logger.warning("模型没给查询类型（这个字段整个缺席），本次按默认组合走")
     return Understanding(
         game=_pick(guess.game, games, what="游戏"),
         version=_pick(guess.version, versions, what="版本"),
@@ -184,12 +187,12 @@ def _instruction(games: Sequence[str], versions: Sequence[str]) -> str:
 
 
 def _query_type_options() -> str:
-    """问题类型的可选值。叫法与典型问法都写上——只给名字，模型会在「事实型」与
+    """查询类型的可选值。叫法与典型问法都写上——只给名字，模型会在「事实型」与
     「表格型」之间猜，而这两类问的都是数值。"""
     options = "；".join(
         f"{QUERY_TYPE_LABELS[kind]}（{QUERY_TYPE_HINTS[kind]}）" for kind in QueryType
     )
-    return f"问题类型只能从这些里原样取一个：{options}；都不符就留空串。"
+    return f"查询类型只能从这些里原样取一个：{options}；都不符就留空串。"
 
 
 def _candidates(what: str, values: Sequence[str]) -> str:
@@ -201,9 +204,13 @@ def _candidates(what: str, values: Sequence[str]) -> str:
 class _JointOutput(BaseModel):
     """一次联合输出的四个字段。字段描述会随 schema 一起进提示词。
 
-    `route` 是路由标签（`ragamer.routing.QueryType` 的一个）。它是**必填**的：
-    留成可选会请模型在拿不准时省略，而省略掉的每一次都要按默认组合多跑一路。
-    判不出来时请它给空串——那是词表里的一个明确答案，不是缺字段。
+    `route` 是路由标签（`ragamer.routing.QueryType` 的一个）。它**有默认值，但缺席要
+    留痕**：整个返不回来时，联合输出那一步会以 `LlmInvalidOutput` 重试一次（错误带回去，
+    见 `ragamer.llm`），重试用尽就整套降级——为一个**本来就定义了回落**的字段赔上
+    游戏、版本、改写问法这三个没得回落的，不划算。
+
+    所以缺字段只有这一个字段自己吃亏，代价是「缺席」与「按提示留了空串」在 schema
+    层面分不开，得靠 `model_fields_set` 认——判据在 `understand` 里。
     """
 
     game: str = Field(
@@ -215,4 +222,7 @@ class _JointOutput(BaseModel):
     rewritten_query: str = Field(
         description="改写后的规范问法：补齐指代的主体名，语义与原问题一致，不回答问题"
     )
-    route: str = Field(description="问题属于哪一类，只能从系统提示列出的几类里原样取一个")
+    route: str = Field(
+        default="",
+        description="问题属于哪一类，只能从系统提示列出的几类里原样取一个；判断不出就留空串",
+    )

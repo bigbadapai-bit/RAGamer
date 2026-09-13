@@ -64,7 +64,7 @@ def test_默认表照_3_1_摆():
 
 
 def test_多出来的那几条路是逐类加在事实型那一组上的():
-    """模糊型与时滞型在原文里只写了「+ 某一路」——那就是事实型那一组再加一条。
+    """模糊型与时效型在原文里只写了「+ 某一路」——那就是事实型那一组再加一条。
 
     这样读的另一个好处：拿掉加的那一条，剩下的正好是事实型那一组。
     """
@@ -150,15 +150,15 @@ def test_对象形式里没写的过滤字段仍走默认():
     assert route.content_natures == NATURES_FOR_TYPE[QueryType.GUIDE]
 
 
-def test_配置里不认识的问题类型当场报错():
+def test_配置里不认识的查询类型当场报错():
     """留到检索那一步才炸的话，离配置的出处已经很远了，而那时报出来的是一条
     「知识库里没有找到资料」。"""
-    with pytest.raises(ValueError, match="不认识的问题类型"):
+    with pytest.raises(ValueError, match="不认识的查询类型"):
         RouteTable.from_mapping({"route_table": {"玄学": ["main"]}})
 
 
 def test_配置里不认识的路当场报错():
-    with pytest.raises(ValueError, match="不认识的路"):
+    with pytest.raises(ValueError, match="不认识的取值"):
         RouteTable.from_mapping({"route_table": {"factual": ["main", "算命"]}})
 
 

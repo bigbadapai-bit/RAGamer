@@ -1,4 +1,4 @@
-"""查询路由：按问题类型决定这次走哪几路召回，不做无差别全跑。
+"""查询路由：按查询类型决定这次走哪几路召回，不做无差别全跑。
 
 **判定本身不新增任何模型调用**：路由标签是联合输出节点（`ragamer.query`）多吐出来的
 一个字段，那一步本来就要问模型一次（`docs/ARCHITECTURE.md` §3.1）。
@@ -91,7 +91,7 @@ class RecallPath(StrEnum):
 #: 已经接上的路。其余四条在后面的票里补——选中了没接上的那条会跳过并留痕。
 WIRED_PATHS: frozenset[RecallPath] = frozenset({RecallPath.MAIN, RecallPath.METADATA})
 
-#: 默认路由表（§3.1 的那张表）：问题类型 → 走哪几路。
+#: 默认路由表（§3.1 的那张表）：查询类型 → 走哪几路。
 #:
 #: 三处与原文的出入，都是有意的：
 #:
@@ -109,7 +109,7 @@ DEFAULT_ROUTES: Mapping[QueryType, tuple[RecallPath, ...]] = {
     QueryType.TABULAR: (RecallPath.TABLE, RecallPath.MAIN),
 }
 
-#: 问题类型 → 元数据过滤路收窄到哪一类内容性质。
+#: 查询类型 → 元数据过滤路收窄到哪一类内容性质。
 #:
 #: 内容性质说的是「一个切片回答的是哪一类问题」，与「问题属于哪一类」是同一根轴的两面，
 #: 所以这是一张固定推导，**不进可覆盖的那张表**——界面改的是走哪几路。
@@ -136,7 +136,7 @@ class Route:
 
     #: 按顺序走的路。顺序不影响结果（候选取回后交给 RRF 融合），只影响日志。
     paths: tuple[RecallPath, ...]
-    #: 元数据过滤路按这些内容性质取候选。空 = 不按性质收窄。由问题类型推出来。
+    #: 元数据过滤路按这些内容性质取候选。空 = 不按性质收窄。由查询类型推出来。
     content_natures: tuple[ContentNature, ...] = ()
     #: 元数据过滤路按这些主体类型取候选。空 = 不限。
     #:
@@ -148,7 +148,7 @@ class Route:
 
 @dataclass(frozen=True)
 class RouteTable:
-    """问题类型 → 这一类的召回组合。默认值见 :data:`DEFAULT_ROUTES`。
+    """查询类型 → 这一类的召回组合。默认值见 :data:`DEFAULT_ROUTES`。
 
     表里**六类齐全**：缺一类的表在 :meth:`route_for` 上会以 KeyError 炸在检索那一步，
     那时已经离配置的出处很远了。配置读进来的表是补齐过的，构造时就拦下。
@@ -183,7 +183,7 @@ class RouteTable:
         """
         raw = payload.get("route_table") or {}
         if not isinstance(raw, Mapping):
-            raise ValueError("route_table 应当是一个对象：问题类型 → 这一类走哪几路")
+            raise ValueError("route_table 应当是一个对象：查询类型 → 这一类走哪几路")
         routes = dict(DEFAULT_TABLE.routes)
         for key, row in raw.items():
             kind = _query_type(key)
@@ -239,56 +239,62 @@ def parse_query_type(value: str) -> QueryType | None:
 
 
 def _query_type(key: Any) -> QueryType:
-    """配置里的键 → 问题类型。不认识的当场报出来，别留到检索那一步才炸。"""
+    """配置里的键 → 查询类型。不认识的当场报出来，别留到检索那一步才炸。"""
     kind = parse_query_type(str(key))
     if kind is None:
         known = "、".join(sorted(item.value for item in QueryType))
-        raise ValueError(f"路由表里有个不认识的问题类型 {key!r}，只认这六个：{known}")
+        raise ValueError(f"路由表里有个不认识的查询类型 {key!r}，只认这六个：{known}")
     return kind
 
 
 def _route(kind: QueryType, row: Any) -> Route:
-    """配置里的一行 → :class:`Route`。数组只给路，对象可以连过滤条件一起给。"""
-    if isinstance(row, Mapping):
-        paths = _paths(row.get("paths"), kind)
-        natures = _natures(row.get("content_natures"), kind)
-        subjects = _subjects(row.get("subject_types"))
-    else:
-        paths, natures, subjects = _paths(row, kind), NATURES_FOR_TYPE[kind], ()
+    """配置里的一行 → :class:`Route`。数组只给路，对象可以连过滤条件一起给。
+
+    两种写法先归一成一种：数组包成只写了 `paths` 的对象，往下就只有一条代码路径。
+    三个取值各自「没写就取默认」的规则因此只写在各自的取值函数里，不在这里分叉。
+    """
+    fields = row if isinstance(row, Mapping) else {"paths": row}
+    paths = _row_paths(fields.get("paths"), kind)
     if not paths:
         # 一条路都不走 = 这一类问题一条候选都取不到，而它不会报错，只会永远答「没找到」
         raise ValueError(f"{QUERY_TYPE_LABELS[kind]}这一行一条路都没给")
-    return Route(paths, natures, subjects)
+    return Route(
+        paths,
+        _natures(fields.get("content_natures"), kind),
+        _subjects(fields.get("subject_types")),
+    )
 
 
-def _paths(raw: Any, kind: QueryType) -> tuple[RecallPath, ...]:
-    if not isinstance(raw, Sequence) or isinstance(raw, str):
-        raise ValueError(f"{QUERY_TYPE_LABELS[kind]}这一行的 paths 应当是一个路名的数组")
-    known = {path.value: path for path in RecallPath}
-    unknown = [item for item in raw if str(item) not in known]
-    if unknown:
-        names = "、".join(sorted(known))
-        raise ValueError(f"路由表里有不认识的路 {unknown}，只认这六个：{names}")
-    return tuple(known[str(item)] for item in raw)
+def _row_paths(raw: Any, kind: QueryType) -> tuple[RecallPath, ...]:
+    return _enums(raw, RecallPath, what=f"{QUERY_TYPE_LABELS[kind]}这一行走的路")
 
 
 def _natures(raw: Any, kind: QueryType) -> tuple[ContentNature, ...]:
     if raw is None:
+        # 没写就是按查询类型那一栏推出来的默认，不是「不限」
         return NATURES_FOR_TYPE[kind]
     return _enums(raw, ContentNature, what=f"{QUERY_TYPE_LABELS[kind]}这一行的内容性质")
 
 
 def _subjects(raw: Any) -> tuple[SubjectType, ...]:
     if raw is None:
+        # 没写是「不限」：默认表里这一维一律留空，理由见 :class:`Route`
         return ()
     return _enums(raw, SubjectType, what="路由表里的主体类型")
 
 
-def _enums(raw: Any, kind: type[StrEnum], *, what: str) -> tuple[Any, ...]:
-    """配置里的一串标签 → 枚举成员。认不出就报出来——留空是「不限」，与写错不是一回事。"""
+def _enums[EnumT: StrEnum](raw: Any, vocabulary: type[EnumT], *, what: str) -> tuple[EnumT, ...]:
+    """配置里的一串标签 → 枚举成员。
+
+    认不出就报出来：**留空是「不限」，与写错不是一回事**（默认表里主体类型就一律留空），
+    静默当成不限会让「配置没生效」看起来和「配置本来就没配」一样。
+
+    `what` 是出错信息里那个主语，由调用方给——三处取值的叫法不同，报错时要说得出
+    是哪一行哪一栏。
+    """
     if not isinstance(raw, Sequence) or isinstance(raw, str):
         raise ValueError(f"{what}应当是一个数组")
-    known = {item.value: item for item in kind}
+    known = {item.value: item for item in vocabulary}
     unknown = [item for item in raw if str(item) not in known]
     if unknown:
         names = "、".join(sorted(known))

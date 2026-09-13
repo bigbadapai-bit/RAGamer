@@ -302,7 +302,8 @@ def _vocabulary(container: Container, game_id: str) -> TagVocabulary:
 
 
 def _route_table(knowledge: Mapping[str, Any], *, game_id: str) -> RouteTable:
-    """这个知识库的查询路由表。
+    """这个知识库的查询路由表。**元数据已经在手里**，所以收的是那份文档而不是再读一次
+    （`ask` 那一步为了现行版本本来就要读它，见 `_kb_document`）。
 
     配置里没写的类型一律走默认值（`ragamer.routing`）——与打标词表同一个姿势：
     库里只写改过的那几行，默认值以后才改得动。而**读不了就是 422**：路由表决定这次
