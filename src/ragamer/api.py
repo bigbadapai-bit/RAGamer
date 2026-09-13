@@ -17,6 +17,7 @@ from typing import Annotated, Any
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 
 from ragamer.container import Container
+from ragamer.enriching import ImageEnricher
 from ragamer.importing import STAGE_LABELS, Importer, ImportResult, ProgressEvent
 from ragamer.logging import get_logger
 from ragamer.sources import SourceDocument
@@ -38,6 +39,13 @@ def create_app(container: Container) -> FastAPI:
         llm=container.llm,
         parser=container.parser,
         objects=container.objects,
+        # 补图在这一层装好再交进去：它要的三样（对象存储、OCR 引擎、视觉模型）
+        # 都是组合根造的，编排器只该看见一个 `ImageEnricher`
+        enricher=ImageEnricher(
+            objects=container.objects,
+            ocr=container.ocr,
+            vision=container.vision,
+        ),
         on_progress=_log_progress,
     )
 

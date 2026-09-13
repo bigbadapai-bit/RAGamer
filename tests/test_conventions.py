@@ -32,6 +32,7 @@ _ADAPTERS = {
     "BgeReranker",
     "OpenAiLlm",
     "MineruParser",
+    "RapidOcrEngine",
 }
 
 #: 只扫 `src/ragamer`：`tools/` 下是一次性运维脚本，不进包、没有测试缝可言，
@@ -48,6 +49,8 @@ _VENDOR_MODULES = {
     "urllib3": _PACKAGE / "stores" / "objects.py",
     # 真实模型是可选的 models 组，bge 里对它是懒导入（没装也能 import 本模块）
     "FlagEmbedding": _PACKAGE / "vectors" / "bge.py",
+    # 二次 OCR 是可选的 ocr 组，ocr 里同样是懒导入
+    "rapidocr": _PACKAGE / "ocr.py",
 }
 
 
@@ -71,6 +74,9 @@ def test_守则扫到了源码():
         "sources.py",
         "mineru.py",
         "importing.py",
+        "enriching.py",
+        "ocr.py",
+        "lazy.py",
         "api.py",
         "logging.py",
         "memory.py",

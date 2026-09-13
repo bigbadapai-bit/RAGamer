@@ -17,7 +17,7 @@ from ragamer.sources import MarkdownParser, ParserRouter
 from ragamer.stores.base import UNVERSIONED, image_prefix
 from ragamer.stores.memory import InMemoryObjectStore
 
-from .conftest import make_container
+from .conftest import FakeOcr, make_container
 from .test_mineru import FakeMineru, FakeTime, make_parser
 
 GAME = "black_myth"
@@ -202,12 +202,13 @@ def test_导入过程中上报了进度(client):
 
     assert [event["stage"] for event in progress] == [
         "normalize",
+        "enrich",
         "chunk",
         "tag",
         "embed",
         "store",
     ]
-    assert [event["stage_label"] for event in progress][0] == "归一化"
+    assert [event["stage_label"] for event in progress][:2] == ["归一化", "补图"]
     assert all(event["file_number"] == 1 and event["file_total"] == 1 for event in progress)
 
 
@@ -246,11 +247,15 @@ def mineru_container() -> tuple[FakeMineru, object]:
     """一个把 MinerU 接上的容器：假服务 + 内存对象存储，一次网络都不发。
 
     解析器这一组照组合根那份配：md／txt 走 MarkdownParser，PDF 与图片走 MinerU。
+    OCR 也照组合根那样接上——**接上 MinerU 就意味着图片区域里的文字要靠二次 OCR
+    取回来**，这里不给它，截图那份资料会卡在补图那一步（那正是它该有的行为，
+    只是这一条测的是「接线接对了」，不是「缺件时报什么错」）。
     """
     fake = FakeMineru()
     container = make_container(
         objects=InMemoryObjectStore(),
         parser=ParserRouter((MarkdownParser(), make_parser(fake, FakeTime()))),
+        ocr=FakeOcr("图内文字一", "图内文字二"),
     )
     container.docs.put(KB_COLLECTION, GAME, KB)
     return fake, container

@@ -19,6 +19,9 @@ from .conftest import COMPLETE_ENV
 
 REQUIRED_ENV = required_env_keys()
 
+#: 视觉模型那一组的全部键。它整组可选，但要么都给、要么都不给。
+_VISION_KEYS = tuple(key for key in env_keys(Settings) if key.startswith("RAGAMER_VISION_"))
+
 
 def _write_env_file(directory: Path, body: str) -> Path:
     path = directory / ".env"
@@ -174,6 +177,41 @@ def test_mineru_轮询上限非法时报错(settings_env, monkeypatch, value):
         load_settings(env_file=None)
 
     assert "RAGAMER_MINERU_POLL_TIMEOUT_SECONDS" in str(excinfo.value)
+
+
+def test_视觉模型整组不配时是关闭而不是报错(settings_env, monkeypatch):
+    """没配视觉模型是一种合法状态：补图只做二次 OCR，图里没有文字的那几张
+    会少掉可检索的文本，其余一切照旧——它不该让应用起不来。
+    """
+    for key in _VISION_KEYS:
+        monkeypatch.delenv(key)
+
+    settings = load_settings(env_file=None)
+
+    assert settings.vision.enabled is False
+    # 其余取值照 `LlmSettings` 的默认值走，与语言模型一致
+    assert settings.vision.timeout == 60.0
+    assert settings.vision.max_attempts == 3
+
+
+def test_视觉模型配了一半时启动阶段就报出来(settings_env, monkeypatch):
+    """配了一半是最坏的一种：看起来像配好了，实际到用的时候才炸。"""
+    monkeypatch.delenv("RAGAMER_VISION_API_KEY")
+    monkeypatch.delenv("RAGAMER_VISION_MODEL")
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_settings(env_file=None)
+
+    message = str(excinfo.value)
+    assert "RAGAMER_VISION_API_KEY" in message
+    assert "RAGAMER_VISION_MODEL" in message
+
+
+def test_视觉模型配齐时可用(settings_env):
+    settings = load_settings(env_file=None)
+
+    assert settings.vision.enabled is True
+    assert settings.vision.model == "test-vision-model"
 
 
 def test_milvus_的库名不能叫_default(settings_env, monkeypatch):
