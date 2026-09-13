@@ -280,9 +280,9 @@ def _events(replies: Iterator[Reply]) -> Iterator[str]:
 def _clarification_payload(clarification: Clarification) -> dict[str, Any]:
     """一次反问对外的样子。
 
-    候选连 `value` 一起给：`label` 是摆给人看的字面（游戏是显示名），`value` 是库里的
-    取值（游戏 id）。页面上按钮显示前者、回传后者——回传 label 的话，两个库重名时
-    会被认到另一个库上去。
+    `label` 是摆给人看的字面（游戏是显示名），`value` 是库里的取值（游戏 id）。
+    **从暂停点继续认的是 `label`**（`ragamer.clarifying._choice_of` 照它认），
+    `value` 一并给出来只是把库里那侧交代清楚——客户端要跳到那个库的页面时不必自己反推。
     """
     return {
         "pending_id": clarification.pending_id,
