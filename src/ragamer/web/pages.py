@@ -1,18 +1,21 @@
 """界面：服务端渲染的页面。
 
 模板 + htmx 局部刷新，**没有 JavaScript 构建步骤**（ADR-0005）。每条写入路径都先是一张
-普通的 HTML 表单：浏览器禁用 JavaScript 时页面照常能用，只是每次提交整页刷新一次；
-htmx 在的时候把结果那一块换掉，人不用跳走。表单同时带 `action`／`method` 与 `hx-post`，
-服务端按 `HX-Request` 决定回整页还是回片段——两条路走的是同一段处理逻辑。
+普通的 HTML 表单：浏览器禁用 JavaScript 时页面照常能用，只是每次提交整页刷新一次。
+
+htmx 只用在**有一块明显可以就地换掉的结果区**的地方——导入那条路就是：表单同时带
+`action`／`method` 与 `hx-post`，服务端按 `HX-Request` 决定回整页还是回片段，两条路走的是
+同一段处理逻辑。改配置与删库那几条不挂 htmx：它们的结果是「这个库现在是什么样」，
+整页重渲染本来就是对的，硬做成片段反而要把半张页面拆开拼。
 
 这一层不构造任何适配器，数据全来自组合根注入的容器。写入只做三件事——建库、改库、跑导入，
 三者都直接用写入侧已有的实现（`ragamer.knowledge` 与 `ragamer.importing`），页面自己不重做
-其中的判断。**删库同理**：页面只负责把「将要清掉什么」摆出来让人确认，清理本身走
-`purge_knowledge_base`，那条路上的四处数据不经过界面。切分预览页是把库里存下来的东西读回来
-渲染，**没有任何编辑入口**。
+其中的判断：术语映射的增删也是调 `set_term`／`remove_term`，不在页面里拼那份映射。
+**删库同理**：页面只负责把「将要清掉什么」摆出来让人确认，清理本身走 `purge_knowledge_base`，
+那条路上的三处存储不经过界面。切分预览页是把库里存下来的东西读回来渲染，**没有任何编辑入口**。
 
-术语映射与删库这类会改数据的动作一律走「提交 → 重定向 → 重新渲染」，不直接回 200：
-刷新一下就把上一次的删除或改动再提交一遍，是这类页面上最容易踩的一个坑。
+改配置与删库这类动作一律走「提交 → 重定向 → 重新渲染」，不直接回 200：刷新一下就把上一次
+的删除或改动再提交一遍，是这类页面上最容易踩的一个坑。
 
 对话与评测两个页面在这里只到占位为止，完整形态是后面几张票的事。
 """
@@ -32,7 +35,6 @@ from fastapi.templating import Jinja2Templates
 from ragamer.container import Container
 from ragamer.importing import STAGE_LABELS, Importer, ImportResult
 from ragamer.knowledge import (
-    BrokenKnowledgeBase,
     KnowledgeBase,
     KnowledgeBaseError,
     PurgeError,
@@ -41,11 +43,13 @@ from ragamer.knowledge import (
     list_knowledge_bases,
     purge_inventory,
     purge_knowledge_base,
+    remove_term,
+    set_term,
     update_knowledge_base,
     vocabulary_of,
 )
 from ragamer.sources import SourceDocument
-from ragamer.stores.base import UNVERSIONED, Chunk, collection_name, image_prefix
+from ragamer.stores.base import UNVERSIONED, Chunk, collection_name, image_folder
 from ragamer.tagging import (
     CONTENT_NATURE_NAMES,
     SUBJECT_TYPE_NAMES,
@@ -86,13 +90,16 @@ def create_router(container: Container) -> APIRouter:
         return RedirectResponse("/kb")
 
     @router.get("/kb")
-    def knowledge_bases(request: Request, deleted: str = "") -> Response:
+    def knowledge_bases(
+        request: Request, deleted: str = "", chunks: int = 0, images: int = 0
+    ) -> Response:
         """知识库列表与新建表单。每个库点进去配术语映射与版本，或者删掉它。"""
         return _knowledge_bases_page(
             request,
             container,
             message=(
-                f"已删除知识库 {deleted}：它在向量库、对象存储与 MongoDB 里的数据都清掉了。"
+                f"已删除知识库 {deleted}：清掉 {chunks} 条切片、{images} 个原图，"
+                "向量库、对象存储与 MongoDB 里的数据都清干净了。"
                 if deleted
                 else ""
             ),
@@ -124,12 +131,12 @@ def create_router(container: Container) -> APIRouter:
 
     @router.get("/kb/{game_id}")
     def knowledge_base_page(request: Request, game_id: str, saved: bool = False) -> Response:
-        """单个库的配置页：名称、启用的类目、术语映射、当前生效版本，以及删库入口。"""
+        """单个库的配置页：名称、启用的类目、术语映射、现行版本，以及删库入口。"""
         return _knowledge_base_page(
             request,
             container,
             game_id,
-            message="已保存。下一次打标与检索读的就是这一份。" if saved else "",
+            message="已保存。下一次导入打标与切分预览读的就是这一份。" if saved else "",
         )
 
     @router.post("/kb/{game_id}")
@@ -167,14 +174,7 @@ def create_router(container: Container) -> APIRouter:
                 ),
             )
         except (ValueError, KnowledgeBaseError) as exc:
-            return _knowledge_base_page(
-                request,
-                container,
-                game_id,
-                error=str(exc),
-                draft=draft,
-                status_code=_status_of(exc),
-            )
+            return _config_error(request, container, game_id, exc, draft=draft)
         return RedirectResponse(f"/kb/{game_id}?saved=1", status_code=303)
 
     @router.post("/kb/{game_id}/terms")
@@ -184,49 +184,28 @@ def create_router(container: Container) -> APIRouter:
         term: Annotated[str, Form()] = "",
         kind: Annotated[str, Form()] = "",
     ) -> Response:
-        """给术语映射加一条。叫法已经在表里时改掉它的归类，不报错——那是同一条映射。"""
+        """给术语映射加一条。叫法与表里已有的完全一样时改掉它的归类，不报错——那是同一条映射。
+
+        只差大小写或首尾空白的那种会被拦下：归一之后它们本来就是同一条，静默顶掉一条不好查。
+        """
         term = term.strip()
         if not term:
             return _knowledge_base_page(
                 request, container, game_id, error="先填一个这个游戏里的叫法", status_code=400
             )
         try:
-            existing = _readable_knowledge_base(container, game_id)
-            mapping = {**existing.vocabulary.term_mapping, term: _subject_type(kind)}
-            update_knowledge_base(
-                container.docs,
-                replace(
-                    existing,
-                    vocabulary=TagVocabulary(existing.vocabulary.subject_types, mapping),
-                ),
-            )
+            set_term(container.docs, game_id, term, _subject_type(kind))
         except (ValueError, KnowledgeBaseError) as exc:
-            return _knowledge_base_page(
-                request, container, game_id, error=str(exc), status_code=_status_of(exc)
-            )
+            return _config_error(request, container, game_id, exc)
         return RedirectResponse(f"/kb/{game_id}", status_code=303)
 
     @router.post("/kb/{game_id}/terms/delete")
     def delete_term(request: Request, game_id: str, term: Annotated[str, Form()] = "") -> Response:
         """从术语映射里去掉一条。去掉之后语料里的这个叫法就只剩模型兜底那条路了。"""
         try:
-            existing = _readable_knowledge_base(container, game_id)
-            remaining = {
-                name: kind
-                for name, kind in existing.vocabulary.term_mapping.items()
-                if name != term
-            }
-            update_knowledge_base(
-                container.docs,
-                replace(
-                    existing,
-                    vocabulary=TagVocabulary(existing.vocabulary.subject_types, remaining),
-                ),
-            )
+            remove_term(container.docs, game_id, term)
         except (ValueError, KnowledgeBaseError) as exc:
-            return _knowledge_base_page(
-                request, container, game_id, error=str(exc), status_code=_status_of(exc)
-            )
+            return _config_error(request, container, game_id, exc)
         return RedirectResponse(f"/kb/{game_id}", status_code=303)
 
     @router.get("/kb/{game_id}/delete")
@@ -236,9 +215,9 @@ def create_router(container: Container) -> APIRouter:
 
     @router.post("/kb/{game_id}/delete")
     def delete_kb(request: Request, game_id: str, confirm: Annotated[str, Form()] = "") -> Response:
-        """真删。四处数据一并清，知识库配置排在最后（见 `purge_knowledge_base`）。"""
+        """真删。三处存储一并清，知识库配置排在最后（见 `purge_knowledge_base`）。"""
         try:
-            knowledge_base = knowledge_base_of(container.docs, game_id)
+            knowledge_base_of(container.docs, game_id)
         except (ValueError, KnowledgeBaseError) as exc:
             return _knowledge_bases_page(
                 request, container, error=str(exc), status_code=_status_of(exc)
@@ -249,12 +228,21 @@ def create_router(container: Container) -> APIRouter:
                 request, container, game_id, error="先把那句确认勾上，再点删除", status_code=400
             )
         try:
-            purge_knowledge_base(container.chunks, container.docs, container.objects, game_id)
+            inventory = purge_knowledge_base(
+                container.chunks, container.docs, container.objects, game_id
+            )
         except PurgeError as exc:
             return _delete_page(request, container, game_id, error=str(exc), status_code=exc.status)
-        return RedirectResponse(
-            f"/kb?{urlencode({'deleted': knowledge_base.game_id})}", status_code=303
+        # 回话里带上真清掉的条数：确认页写的是「将要」，这里写的是「已经」，
+        # 两个数对得上才说明两处数的真是同一批东西
+        query = urlencode(
+            {
+                "deleted": game_id,
+                "chunks": inventory.chunk_count,
+                "images": inventory.image_count,
+            }
         )
+        return RedirectResponse(f"/kb?{query}", status_code=303)
 
     @router.get("/import")
     def import_page(request: Request, game_id: str = "") -> Response:
@@ -328,13 +316,18 @@ def create_router(container: Container) -> APIRouter:
 
     @router.get("/kb/{game_id}/preview")
     def preview(
-        request: Request, game_id: str, doc_title: str = "", version: str = UNVERSIONED
+        request: Request, game_id: str, doc_title: str = "", version: str | None = None
     ) -> Response:
         """切分预览（**只读**）：把入库的结果原样渲染出来。
 
         取切片走的是检索那条路（`fetch_document`），所以显示的就是检索时会看见的：
         该版本的内容与未标注版本的内容一并列出（ADR-0004），后者挂个徽章说明来历。
+
+        不带 `version` 参数时按这个库的**现行版本**取——设了现行版本却看不到它在哪儿生效，
+        那个设置就只是一行字。带空串则是明确地按「未标注版本」看。
         """
+        if version is None:
+            version = _current_version(container, game_id)
         try:
             collection_name(game_id)
         except ValueError as exc:
@@ -468,20 +461,34 @@ def _knowledge_base_page(
     )
 
 
-def _readable_knowledge_base(container: Container, game_id: str) -> KnowledgeBase:
-    """读一个库，并且要求它的配置是读得出来的。
+def _config_error(
+    request: Request,
+    container: Container,
+    game_id: str,
+    exc: Exception,
+    *,
+    draft: Mapping[str, Any] | None = None,
+) -> Response:
+    """改配置出错时**回这个库的配置页**，把原因写在上面。
 
-    配置坏掉的库**不让改术语映射**：那份映射本来就没读出来，照着内存里的默认值写回去
-    等于把它悄悄清空，还顺手把启用的类目改成全开——两件事都不会出声。
-    先把基本配置存好，配置就从坏变好了。
-
-    :raises UnknownKnowledgeBase: 没有这个库。
-    :raises BrokenKnowledgeBase: 库在，但配置读不了。
+    库不存在或 id 不合法时，`_knowledge_base_page` 自己会退到列表页——那儿正好能建一个。
+    状态码跟着异常走，与 JSON 端点那边翻出来的是同一个。
     """
-    knowledge_base = knowledge_base_of(container.docs, game_id)
-    if knowledge_base.problem:
-        raise BrokenKnowledgeBase(game_id, knowledge_base.problem)
-    return knowledge_base
+    return _knowledge_base_page(
+        request, container, game_id, error=str(exc), draft=draft, status_code=_status_of(exc)
+    )
+
+
+def _current_version(container: Container, game_id: str) -> str:
+    """这个库的现行版本。
+
+    读不出来（库不在、配置坏了、id 不合法）就按未标注版本走：这一处只影响预览默认取哪个
+    版本的切片，为它把整个预览页拦下来不值得。
+    """
+    try:
+        return knowledge_base_of(container.docs, game_id).version
+    except (ValueError, KnowledgeBaseError):
+        return UNVERSIONED
 
 
 def _delete_page(
@@ -519,7 +526,9 @@ def _delete_page(
         game_id=game_id,
         name=knowledge_base.name,
         inventory=inventory,
-        prefix=image_prefix(game_id),
+        # 带尾随斜杠，与实际清理用的是同一个前缀（见 `image_folder`）——页面上写着
+        # `images/black_myth`，删的时候按它去匹配，就会连 `black_myth_2` 的图一起收走
+        prefix=image_folder(game_id),
         error=error,
         status_code=status_code,
     )

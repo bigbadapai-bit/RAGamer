@@ -23,6 +23,8 @@ from ragamer.knowledge import (
     list_knowledge_bases,
     purge_inventory,
     purge_knowledge_base,
+    remove_term,
+    set_term,
     update_knowledge_base,
     vocabulary_of,
 )
@@ -141,10 +143,10 @@ def test_列表按游戏_id_排列(docs):
     ]
 
 
-# --- 当前生效版本 ---
+# --- 现行版本 ---
 
 
-def test_当前生效版本存得进去也读得回来(docs):
+def test_现行版本存得进去也读得回来(docs):
     create_knowledge_base(docs, replace(KnowledgeBase.new(GAME), version="2.0"))
 
     stored = docs.get(KB_COLLECTION, GAME)
@@ -162,7 +164,7 @@ def test_没配版本的库读回来是未标注版本(docs):
 
 
 def test_改库之后读回来是新的(docs):
-    """名称、启用的类目、术语映射、当前生效版本一起换掉，**保存后立即生效**。"""
+    """名称、启用的类目、术语映射、现行版本一起换掉，**保存后立即生效**。"""
     create_knowledge_base(docs, KnowledgeBase.new(GAME, "旧名", (SubjectType.CHARACTER,)))
 
     update_knowledge_base(
@@ -265,3 +267,71 @@ def test_不是存储错误的那种失败也保住配置(container):
         purge_knowledge_base(container.chunks, container.docs, ExplodingObjectStore(), GAME)
 
     assert container.docs.get(KB_COLLECTION, GAME) is not None
+
+
+def test_清前缀时不碰_id_是它前缀的另一个库(container):
+    """`delete_prefix` 比的是字符串前缀，不是目录：按 `images/black_myth` 去删，
+    `black_myth_2` 这个库的原图会被一并收走，而且不报错。"""
+    sibling = f"{GAME}_2"
+    _stocked(container)
+    container.objects.put(image_key(sibling, "a1b2", "它的立绘.png"), b"PNG")
+    container.chunks.upsert(sibling, [make_chunk(9, game_id=sibling)])
+
+    inventory = purge_inventory(container.chunks, container.objects, GAME)
+    purge_knowledge_base(container.chunks, container.docs, container.objects, GAME)
+
+    assert inventory.image_count == 1  # 只数自己那一张
+    assert container.objects.list_keys(image_prefix(sibling)) == [
+        image_key(sibling, "a1b2", "它的立绘.png")
+    ]
+    assert container.chunks.count(sibling) == 1
+
+
+# --- 术语映射的增删 ---
+
+
+def test_加一条映射之后读词表就有它了(docs):
+    create_knowledge_base(docs, KnowledgeBase.new(GAME, "", (SubjectType.CHARACTER,)))
+
+    set_term(docs, GAME, "妖王", SubjectType.CHARACTER)
+
+    assert vocabulary_of(docs, GAME).resolve("妖王") is SubjectType.CHARACTER
+    # 启用的类目原样带着，没被这次改动冲掉
+    assert vocabulary_of(docs, GAME).subject_types == (SubjectType.CHARACTER,)
+
+
+def test_同一个叫法再加一次是改归类不是加两条(docs):
+    create_knowledge_base(
+        docs, KnowledgeBase.new(GAME, "", (SubjectType.CHARACTER, SubjectType.ITEM))
+    )
+
+    set_term(docs, GAME, "妖王", SubjectType.CHARACTER)
+    set_term(docs, GAME, "妖王", SubjectType.ITEM)
+
+    assert vocabulary_of(docs, GAME).term_mapping == {"妖王": SubjectType.ITEM}
+
+
+def test_去掉一条映射之后这个词就只剩模型兜底了(docs):
+    create_knowledge_base(
+        docs,
+        KnowledgeBase(
+            GAME, "", TagVocabulary((SubjectType.CHARACTER,), {"妖王": SubjectType.CHARACTER})
+        ),
+    )
+
+    remove_term(docs, GAME, "妖王")
+
+    assert vocabulary_of(docs, GAME).term_mapping == {}
+    # 删一个表里没有的叫法不出错
+    remove_term(docs, GAME, "没配过的叫法")
+
+
+def test_配置读不了的库不让改映射(docs):
+    """那份映射本来就没读出来，照着默认值写回去等于把它悄悄清空。"""
+    broken = {"subject_types": ["这不是类目"], "term_mapping": {"妖王": "character"}}
+    docs.put(KB_COLLECTION, GAME, broken)
+
+    with pytest.raises(BrokenKnowledgeBase, match="配置读不了"):
+        set_term(docs, GAME, "心法", SubjectType.SKILL)
+
+    assert docs.get(KB_COLLECTION, GAME) == broken

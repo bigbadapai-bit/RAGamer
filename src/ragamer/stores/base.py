@@ -335,9 +335,21 @@ def image_prefix(game_id: str, digest: str = "") -> str:
     原项目那处坑是 list 与 put 各拼一遍前缀、两处对不上，于是清旧图静默失效；
     这里只要两处都调它，前缀就没有对不上的余地。
 
-    删库时按 `image_prefix(game_id)` 清一次就够，不必知道当初导过哪些文件。
+    清点与清理按 :func:`image_folder` 走，不必知道当初导过哪些文件。
     """
     return "/".join(part for part in (IMAGE_PREFIX, game_id, digest) if part)
+
+
+def image_folder(game_id: str) -> str:
+    """这个游戏的原图那一层，**带尾随斜杠**。按前缀清点与清理走它。
+
+    尾随的斜杠不是装饰：`delete_prefix` / `list_keys` 比的是**字符串前缀**，不是目录。
+    拿 `image_prefix(game_id)`（`images/black_myth`）去删，id 为 `black_myth_2` 的那个库
+    的原图会被一并收走——而且不报错，人只会在很久以后发现另一个库的图没了。
+    一游戏一 collection 要保证的正是互相隔离（ADR-0002），边界就在这里补上，
+    不指望每个调用点都记得自己加。
+    """
+    return f"{image_prefix(game_id)}/"
 
 
 def image_key(game_id: str, digest: str, name: str) -> str:
@@ -348,7 +360,7 @@ def image_key(game_id: str, digest: str, name: str) -> str:
     不同文件即使同名也各有各的一层，不会互相覆盖。
 
     **代价**：同一份资料改了内容再导，算出的 digest 变了，上一版的图片会留在旧的
-    那一层——它按游戏一级清理时一并收走（`image_prefix(game_id)`）。比按文件名分层强：
+    那一层——它按游戏一级清理时一并收走（`image_folder(game_id)`）。比按文件名分层强：
     那样两份同名不同内容的截图会互相覆盖，答案是配错图，而且不报错。
     """
     return f"{image_prefix(game_id, digest)}/{name}"

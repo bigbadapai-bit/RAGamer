@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import re
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 from fastapi.testclient import TestClient
@@ -384,12 +385,34 @@ def test_能改显示名与启用的类目(client, container):
     assert stored["term_mapping"] == KB["term_mapping"]
 
 
-def test_能设置这个库的当前生效版本(client, container):
+def test_能设置这个库的现行版本(client, container):
     response = save(client, version="2.0")
 
     assert response.status_code == 303
     assert container.docs.get(KB_COLLECTION, GAME)["version"] == "2.0"
     assert "2.0" in kb_page(client).text
+
+
+def test_预览页不带版本时按现行版本取切片(client, container):
+    """设了现行版本却看不见它在哪儿生效，那个设置就只是一行字。"""
+    save(client, version="2.0")
+    do_import(client)  # 未标注版本
+    do_import(client, version="2.0")
+
+    page = client.get(f"/kb/{GAME}/preview", params={"doc_title": DOC_TITLE}).text
+
+    assert "2.0" in page  # 取的是 2.0 那一批
+    assert "未标注版本，不随版本变化" in page  # 未标注的那批一并带上（ADR-0004）
+
+
+def test_预览页带空版本时按未标注版本看(client, container):
+    """空串是明确地要看「未标注版本」，不能当成「没说」而回落到现行版本。"""
+    save(client, version="2.0")
+    do_import(client, version="2.0")
+
+    page = preview(client, version="").text
+
+    assert "没有切片" in page
 
 
 def test_一个类目都没勾时页面留住填过的值(client):
@@ -534,13 +557,17 @@ def test_没勾确认不会删(client, container):
     assert stored(container)
 
 
-def test_删库把四处数据一并清掉_不留孤儿(client, container):
-    stocked(client, container)
+def test_删库把各处数据一并清掉_不留孤儿(client, container):
+    count = stocked(client, container)
 
     response = client.post(DELETE_URL, data={"confirm": "yes"}, follow_redirects=False)
 
     assert response.status_code == 303
-    assert response.headers["location"] == f"/kb?deleted={GAME}"
+    assert parse_qs(urlparse(response.headers["location"]).query) == {
+        "deleted": [GAME],
+        "chunks": [str(count)],
+        "images": ["2"],
+    }
     # 三处存储里都问不到这个库的东西了
     assert container.chunks.count(GAME) == 0
     assert container.objects.list_keys(image_prefix(GAME)) == []
@@ -549,13 +576,32 @@ def test_删库把四处数据一并清掉_不留孤儿(client, container):
     assert GAME not in client.get("/kb").text
 
 
-def test_删完回列表页并说一句(client, container):
-    stocked(client, container)
+def test_删完回列表页并说清清掉了多少(client, container):
+    """确认页写的是「将要」，这一句写的是「已经」——两个数对得上，那份确认才算数过。"""
+    count = stocked(client, container)
 
     response = client.post(DELETE_URL, data={"confirm": "yes"}, follow_redirects=True)
 
     assert f"已删除知识库 {GAME}" in response.text
+    assert f"清掉 {count} 条切片、2 个原图" in response.text
     assert "还没有知识库" in response.text
+
+
+def test_清库不碰_id_是它前缀的另一个库():
+    """`delete_prefix` 比的是字符串前缀：按 `images/black_myth` 去删，`black_myth_2`
+    的原图会被一并收走，而且不报错。"""
+    sibling = f"{GAME}_2"
+    chunks, container, client = broken_store_client()
+    chunks.recover()
+    do_import(client)
+    container.objects.put(image_key(GAME, "a1b2", "立绘.png"), b"PNG")
+    container.objects.put(image_key(sibling, "a1b2", "它的立绘.png"), b"PNG")
+
+    client.post(DELETE_URL, data={"confirm": "yes"})
+
+    assert container.objects.list_keys(image_prefix(GAME)) == [
+        image_key(sibling, "a1b2", "它的立绘.png")
+    ]
 
 
 def test_配置读不了的库照样删得掉(client, container):

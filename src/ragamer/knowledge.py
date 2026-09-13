@@ -6,7 +6,7 @@
 
 元数据存 MongoDB 的 `knowledge_bases` 集合，**文档 id 就是游戏 id**：它同时是 Milvus 的
 collection 名（ADR-0002），所以合法性校验直接复用 `collection_name`，不另立一套规则。
-文档里还存着**当前生效版本**——检索与聚合父块都从这一处取，不各自维护一份。
+文档里还存着**现行版本**——检索与聚合父块都从这一处取，不各自维护一份。
 
 「配置读不了」与「库不存在」是两件事，这里分成两个异常：前者的数据坏了，后者是游戏选错了。
 `ragamer.api` 把它们映射成 422 与 404，界面把它们渲染成两句话——判断只在这一处做。
@@ -19,7 +19,7 @@ collection 名（ADR-0002），所以合法性校验直接复用 `collection_nam
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from ragamer.logging import get_logger
@@ -29,7 +29,7 @@ from ragamer.stores.base import (
     DocStore,
     ObjectStore,
     collection_name,
-    image_prefix,
+    image_folder,
 )
 from ragamer.tagging import SubjectType, TagVocabulary
 
@@ -89,7 +89,7 @@ class KnowledgeBase:
     game_id: str
     name: str
     vocabulary: TagVocabulary
-    #: 当前生效版本。检索默认按它过滤（架构文档 §2.4），空串即未标注版本。
+    #: 现行版本。检索默认按它过滤（架构文档 §2.4），空串即未标注版本。
     version: str = UNVERSIONED
     #: 配置读不出来时的原因；正常时是空串。
     problem: str = ""
@@ -155,7 +155,7 @@ class KnowledgeBase:
 
 
 def _version(payload: Mapping[str, Any]) -> str:
-    """配置里的当前生效版本。老库里没有这个键——回落到未标注版本，不是随手挑一个。"""
+    """配置里的现行版本。老库里没有这个键——回落到未标注版本，不是随手挑一个。"""
     return str(payload.get("version") or UNVERSIONED)
 
 
@@ -190,7 +190,7 @@ def create_knowledge_base(docs: DocStore, knowledge_base: KnowledgeBase) -> None
 
 
 def update_knowledge_base(docs: DocStore, knowledge_base: KnowledgeBase) -> None:
-    """改一个已有的库：名称、启用的主体类型、术语映射、当前生效版本一起换掉。
+    """改一个已有的库：名称、启用的主体类型、术语映射、现行版本一起换掉。
 
     **库不存在时报错，不静默新建**：界面上点的是「保存」，凭空冒出一个库不是它要的结果，
     而且新库的 id 多半是打错的那个。
@@ -248,7 +248,8 @@ def purge_inventory(chunks: ChunkStore, objects: ObjectStore, game_id: str) -> P
     """
     return PurgeInventory(
         chunk_count=chunks.count(game_id),
-        image_count=len(objects.list_keys(image_prefix(game_id))),
+        # 前缀带尾随斜杠：少了它会把 id 是它前缀的另一个库的原图也数进来（见 `image_folder`）
+        image_count=len(objects.list_keys(image_folder(game_id))),
     )
 
 
@@ -266,6 +267,9 @@ def purge_knowledge_base(
     这条保证就漏了一大半。
 
     :raises PurgeError: 有哪一处没清干净；此时知识库配置原样留着。
+
+    ⚠️ 这里多清一处，`knowledge_base_delete.html` 里那张「将要清理的数据」清单就要跟着加一条：
+    确认页上少一行，人按下确认时看到的就不是全部。
     """
     chunk_count = 0
     image_count = 0
@@ -280,7 +284,7 @@ def purge_knowledge_base(
 
     try:
         # `delete_prefix` 把删掉的个数报回来，不必先列一遍再数一遍
-        image_count = objects.delete_prefix(image_prefix(game_id))
+        image_count = objects.delete_prefix(image_folder(game_id))
     except Exception as exc:
         failures.append(f"对象存储：{exc}")
 
@@ -312,6 +316,23 @@ def knowledge_base_of(docs: DocStore, game_id: str) -> KnowledgeBase:
     return KnowledgeBase.from_payload(game_id, payload)
 
 
+def readable_knowledge_base(docs: DocStore, game_id: str) -> KnowledgeBase:
+    """读一个库，并要求它的配置是读得出来的。
+
+    配置读不出来的库只能被显示、被修、被删，**不能被拿来干活**：那份词表本来就没读出来，
+    照着内存里的默认值用下去，标签会按「七类全开、映射为空」落——看起来一切正常，
+    错的全在标签里。
+
+    :raises ValueError: 游戏 id 不合法。
+    :raises UnknownKnowledgeBase: 没有这个库。
+    :raises BrokenKnowledgeBase: 库在，但配置读不了。
+    """
+    knowledge_base = knowledge_base_of(docs, game_id)
+    if knowledge_base.problem:
+        raise BrokenKnowledgeBase(game_id, knowledge_base.problem)
+    return knowledge_base
+
+
 def vocabulary_of(docs: DocStore, game_id: str) -> TagVocabulary:
     """这个知识库的打标词表。
 
@@ -321,7 +342,44 @@ def vocabulary_of(docs: DocStore, game_id: str) -> TagVocabulary:
     :raises UnknownKnowledgeBase: 没有这个库。
     :raises BrokenKnowledgeBase: 库在，但配置里的类目认不出来。
     """
-    knowledge_base = knowledge_base_of(docs, game_id)
-    if knowledge_base.problem:
-        raise BrokenKnowledgeBase(game_id, knowledge_base.problem)
-    return knowledge_base.vocabulary
+    return readable_knowledge_base(docs, game_id).vocabulary
+
+
+def set_term(docs: DocStore, game_id: str, term: str, kind: SubjectType) -> None:
+    """给这个库的术语映射加一条；叫法与表里已有的完全一样时改掉它的归类。
+
+    「读出来 → 改映射 → 原样写回去」整段放在这里，不放到页面上：那边要自己拼
+    `term_mapping`、还要记得把启用的主体类型一并带回去，抄一遍就是两处各错一半的机会。
+
+    :raises ValueError: 叫法归一之后与表里另一条撞上了（见 `TagVocabulary`）。
+    :raises BrokenKnowledgeBase: 库的配置读不了——先修好它再来配映射。
+    """
+    knowledge_base = readable_knowledge_base(docs, game_id)
+    update_knowledge_base(
+        docs,
+        replace(
+            knowledge_base,
+            vocabulary=TagVocabulary(
+                knowledge_base.vocabulary.subject_types,
+                {**knowledge_base.vocabulary.term_mapping, term: kind},
+            ),
+        ),
+    )
+
+
+def remove_term(docs: DocStore, game_id: str, term: str) -> None:
+    """从术语映射里去掉一条。表里没有这个叫法就什么都不做。
+
+    去掉之后语料里的这个叫法就只剩模型兜底那条路了——标签稀疏，但不会漏。
+    """
+    knowledge_base = readable_knowledge_base(docs, game_id)
+    remaining = {
+        name: kind for name, kind in knowledge_base.vocabulary.term_mapping.items() if name != term
+    }
+    update_knowledge_base(
+        docs,
+        replace(
+            knowledge_base,
+            vocabulary=TagVocabulary(knowledge_base.vocabulary.subject_types, remaining),
+        ),
+    )
