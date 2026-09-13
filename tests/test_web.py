@@ -349,8 +349,10 @@ def test_失败的是文件时重试表单说清要重新选中(client, containe
 
     assert "攻略.pdf" in retry
     assert "重新选中" in retry
+    assert "没选中的不会被提交" in retry  # 空着交回去不会静默少导一条
     assert PAGE_URL not in retry  # 成功的那条不重来
     assert 'name="files"' in retry
+    assert f'accept="{",".join((".md", ".markdown", ".txt"))}"' in retry
     # 文件名不该被当成网址带进重试（那会去抓一个不存在的站）
     assert 'name="urls"' not in retry
     # 重试走的是同一个端点：这张表单照原样交回去，选中的文件进的就是同一条链路
@@ -381,6 +383,22 @@ def test_一批里两份同标题的文件不互相覆盖(client, container):
     assert "甲.md" in failed  # 说清是跟谁撞了
     assert "二郎神" in failed
     assert len(stored(container)) > 1  # 先来的那份还在，没有被后一份替掉
+
+
+def test_撞了标题的那条不进重试表单(client, container):
+    """它失败不是因为跑挂了，是这一次提交里另有两条落成同一个标题。
+
+    单独重试它，它就成了这一批里唯一的一条，写下去会把它撞赢的那份整份替掉——
+    重试按钮不该是把人送进这个坑的那只手。
+    """
+    response = do_import(client, upload("甲.md"), upload("乙.md", SHORT))
+
+    # 这一批里没有「可以重试」的失败项，整张重试表单就不该出现
+    assert 'id="import-retry"' not in response.text
+    assert "这些不是重试能解决的" in response.text
+    assert "重试其中一个会把另一个替掉" in response.text
+    blocked = row(response.text, "乙.md")
+    assert "不能靠重试解决" in blocked
 
 
 def test_能选版本_不选记为未标注版本(client, container):

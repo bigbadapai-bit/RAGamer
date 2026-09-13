@@ -33,7 +33,7 @@ from fastapi.responses import RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 
 from ragamer.container import Container, build_importer
-from ragamer.importing import STAGE_LABELS, ImportResult
+from ragamer.importing import STAGE_LABELS, ImportResult, SourceKind
 from ragamer.knowledge import (
     KnowledgeBase,
     KnowledgeBaseError,
@@ -299,7 +299,7 @@ def create_router(container: Container) -> APIRouter:
             # 空的文件框也会送上来一个 filename 为空的部件，那不是一份资料
             if file.filename
         ]
-        links = _urls(urls)
+        links = _url_lines(urls)
         if not sources and not links:
             return reply("先选一份资料或填一个网址再提交")
         try:
@@ -318,7 +318,14 @@ def create_router(container: Container) -> APIRouter:
             version=version or UNVERSIONED,
             vocabulary=vocabulary,
         )
-        return reply(result=_import_result(results, game_id=game_id, version=version))
+        return reply(
+            result=_import_result(
+                results,
+                game_id=game_id,
+                version=version,
+                accept=",".join(container.parser.SUFFIXES),
+            )
+        )
 
     @router.get("/kb/{game_id}/preview")
     def preview(
@@ -653,7 +660,7 @@ def _status_of(exc: Exception) -> int:
 
 
 def _import_result(
-    results: Sequence[ImportResult], *, game_id: str, version: str
+    results: Sequence[ImportResult], *, game_id: str, version: str, accept: str = ""
 ) -> dict[str, Any]:
     """一次导入的逐条结果。**失败也是结果**，和成功的一起列出来。"""
     rows = [_import_row(result, game_id=game_id, version=version) for result in results]
@@ -662,13 +669,14 @@ def _import_result(
     return {
         "rows": rows,
         "game_id": game_id,
+        "accept": accept,
         "total": len(rows),
         "imported": len(ok),
         "failed": len(failed),
         # 这一批实际落下的东西：进了多少切片、覆盖到哪些标签（验收要的那两句）
         "chunks": sum(result.chunk_count for result in ok),
         "skipped": sum(result.skipped for result in ok),
-        "labels": _covered_labels(ok),
+        "labels_text": _labels_text(ok),
         # 空串就是未标注版本。界面上直接显示空串的话，那一行读起来像没渲染出来
         "version": version,
         "version_label": version or "未标注版本",
@@ -677,7 +685,7 @@ def _import_result(
 
 
 def _import_row(result: ImportResult, *, game_id: str, version: str) -> dict[str, Any]:
-    """一条来源的结果。**走过了哪些阶段就是它在界面上的进度**——
+    """一条资料的结果。**走过了哪些阶段就是它在界面上的进度**——
 
     导入是同步的一整段，请求回来的时候它已经跑完，能说的只有「走到哪为止」。
     """
@@ -689,6 +697,8 @@ def _import_row(result: ImportResult, *, game_id: str, version: str) -> dict[str
         "steps": [STAGE_LABELS[event.stage] for event in result.progress],
         "stage_label": EMPTY if result.stage is None else STAGE_LABELS[result.stage],
         "error": result.error or "",
+        # 撞了标题的那条重试不得：单独重试它，写下去就是把它撞的那一份删掉
+        "collides_with": result.collides_with,
         "chunk_count": result.chunk_count,
         "skipped": result.skipped,
         "subject_name": result.tags.subject_name,
@@ -698,16 +708,21 @@ def _import_row(result: ImportResult, *, game_id: str, version: str) -> dict[str
     }
 
 
-def _covered_labels(results: Sequence[ImportResult]) -> dict[str, list[str]]:
-    """这一批成功的那几条合起来覆盖到哪些标签，按字段各取并集。
+def _labels_text(results: Sequence[ImportResult]) -> str:
+    """这一批成功的那几条合起来覆盖到哪些标签（验收要的那一句）。
 
     一份资料一个切片都可能是空的（比如整篇都没读出结构），所以是并集而不是「第一条的」。
+    一条标签都没有时明说，不留一句「覆盖到的标签：」在那儿吊着。
     """
-    return {
-        "subject_types": _union(SUBJECT_TYPE_NAMES, [r.tags.subject_type for r in results]),
-        "content_natures": _union(CONTENT_NATURE_NAMES, [r.tags.content_nature for r in results]),
-        "game_terms": sorted({term for result in results for term in result.tags.game_terms}),
-    }
+    groups = (
+        ("主体类型", _union(SUBJECT_TYPE_NAMES, [r.tags.subject_type for r in results])),
+        ("内容性质", _union(CONTENT_NATURE_NAMES, [r.tags.content_nature for r in results])),
+        ("游戏术语", sorted({term for result in results for term in result.tags.game_terms})),
+    )
+    covered = [f"{name} {'、'.join(values)}" for name, values in groups if values]
+    if not covered:
+        return "这一批一条标签都没打上——语料本身没有可读的结构，模型那条路也没给出结论。"
+    return "覆盖到的标签：" + "；".join(covered) + "。"
 
 
 def _union(labels: Mapping[Any, str], groups: Iterable[Sequence[str]]) -> list[str]:
@@ -721,22 +736,27 @@ def _union(labels: Mapping[Any, str], groups: Iterable[Sequence[str]]) -> list[s
 def _retry_payload(failed: Sequence[ImportResult], *, version: str) -> dict[str, Any]:
     """「只重试失败的那些」要带上的东西。
 
-    网址能原样带上（它本身就是那条来源的凭据）；**文件带不了**——字节在浏览器那边，
-    提交完就不在页面上了，只能请人重新选中，所以这里只说清是哪些。
+    网址能原样带上（它本身就是那条资料的凭据）；**文件带不了**——字节在浏览器那边，
+    提交完就不在页面上了，只能请人重新选中。
+
+    **撞了标题的那条不进重试**：它失败是因为同一次提交里另有两条落成了同一个文档标题，
+    单独重试它，它就成了那一批里唯一的一条，写下去会把它撞赢的那份整份替掉——
+    重试按钮不该是把人送进这个坑的那只手。
     """
+    retryable = [result for result in failed if not result.collides_with]
     return {
-        # 只带地址那几条：把文件名塞进网址框，重试会去抓一个不存在的站
-        "urls": "\n".join(result.source for result in failed if _is_url(result.source)),
-        "files": [result.source for result in failed if not _is_url(result.source)],
+        "urls": [result.source for result in retryable if result.kind is SourceKind.URL],
+        "files": [result.source for result in retryable if result.kind is SourceKind.FILE],
+        "blocked": [
+            {"source": result.source, "other": result.collides_with}
+            for result in failed
+            if result.collides_with
+        ],
         "version": version,
     }
 
 
-def _is_url(source: str) -> bool:
-    return source.startswith(("http://", "https://"))
-
-
-def _urls(raw: str) -> list[str]:
+def _url_lines(raw: str) -> list[str]:
     """网址输入框里的地址：一行一条，空行与前后空白丢掉。
 
     重复的地址不去重——两条一样的地址就是同一份资料，导入侧按幂等处理（主键稳定，

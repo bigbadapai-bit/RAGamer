@@ -39,8 +39,7 @@
       <input type="file" name="files" multiple accept="{{ accept }}"
              class="block w-full text-sm">
       <span class="mt-1 block text-xs text-slate-500">
-        可多选。按扩展名挑处理方式：md／txt 直接读，PDF 与图片走 MinerU，图片里的文字另做二次 OCR
-        （{{ accept }}）。一批里某一条失败不牵连其余。
+        可多选。按扩展名挑处理方式，认得的是 {{ accept }}；一批里某一条失败不牵连其余。
       </span>
     </label>
 
@@ -58,7 +57,7 @@
       <button type="submit" class="rounded bg-slate-900 px-4 py-2 text-sm font-medium text-white">
         开始导入
       </button>
-      <span id="import-busy" class="htmx-indicator text-sm text-slate-500">正在导入……</span>
+      <span id="import-busy" class="htmx-indicator text-sm text-slate-500">正在导入……一批跑完才出逐条结果，跑的过程看服务端日志</span>
     </div>
   </form>
 </section>

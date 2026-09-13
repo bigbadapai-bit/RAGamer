@@ -13,7 +13,7 @@
   <p class="mb-1 text-sm text-slate-500">共 {{ result.total }} 条，成功 {{ result.imported }} 条{% if result.failed %}，失败 {{ result.failed }} 条{% endif %}。标注版本：{{ result.version_label }}。</p>
   {# 这一批实际落下了什么：进了多少切片、覆盖到哪些标签（验收要的那两句） #}
   {% if result.imported %}
-  <p class="mb-4 text-sm text-slate-500">这批入库 {{ result.chunks }} 条切片{% if result.skipped %}，跳过 {{ result.skipped }} 条{% endif %}。覆盖到的标签：{% if result.labels.subject_types %}主体类型 {{ result.labels.subject_types | join("、") }}；{% endif %}{% if result.labels.content_natures %}内容性质 {{ result.labels.content_natures | join("、") }}；{% endif %}{% if result.labels.game_terms %}游戏术语 {{ result.labels.game_terms | join("、") }}。{% endif %}</p>
+  <p class="mb-4 text-sm text-slate-500">这批入库 {{ result.chunks }} 条切片{% if result.skipped %}，跳过 {{ result.skipped }} 条{% endif %}。{{ result.labels_text }}</p>
   {% else %}
   <div class="mb-4"></div>
   {% endif %}
@@ -49,35 +49,41 @@
       </p>
       {% else %}
       <p class="mt-1 text-sm text-red-700">卡在「{{ row.stage_label }}」：{{ row.error }}</p>
+      {% if row.collides_with %}
+      <p class="mt-1 text-xs text-slate-500">
+        这一条不能靠重试解决：单独重试它，它就成了这一批里唯一的一条，写下去会把它撞赢的那份整份替掉。
+      </p>
+      {% endif %}
       {% endif %}
     </li>
     {% endfor %}
   </ul>
 
-  {% if result.failed %}
+  {% if result.retry.urls or result.retry.files %}
   {#
     只重试失败的那些。网址能原样带上（地址就是它的凭据）；文件带不了——字节在浏览器那边，
-    提交完就不在页面上了，只能请人重新选中。这张表单与上面那张提交到同一个端点，
-    所以重试走的还是同一条链路。
+    提交完就不在页面上了，只能请人重新选中，**没重新选中的不会被提交**，所以这里把
+    「这一提交会带上什么」说清楚。这张表单与上面那张提交到同一个端点，走的还是同一条链路。
   #}
   <form id="import-retry" method="post" action="/import" enctype="multipart/form-data"
         hx-post="/import" hx-encoding="multipart/form-data"
         hx-target="#import-result" hx-swap="innerHTML" hx-indicator="#import-busy"
         class="mt-6 space-y-4 border-t border-slate-200 pt-4">
-    <h3 class="text-sm font-medium">重试失败的那 {{ result.failed }} 条</h3>
+    <h3 class="text-sm font-medium">重试这些</h3>
     <input type="hidden" name="game_id" value="{{ result.game_id }}">
     <input type="hidden" name="version" value="{{ result.retry.version }}">
     {% if result.retry.urls %}
-    <p class="text-xs text-slate-500">这些地址已经填好了：</p>
-    <textarea name="urls" rows="{{ result.retry.urls.split('\n') | length }}"
-              class="w-full rounded border border-slate-300 px-3 py-2 text-xs">{{ result.retry.urls }}</textarea>
+    <p class="text-xs text-slate-500">本次会重试这 {{ result.retry.urls | length }} 个网址：</p>
+    <textarea name="urls" rows="{{ [result.retry.urls | length, 6] | min }}"
+              class="w-full rounded border border-slate-300 px-3 py-2 text-xs">{{ result.retry.urls | join("\n") }}</textarea>
     {% endif %}
     {% if result.retry.files %}
     <p class="text-xs text-slate-500">
-      失败的文件：{{ result.retry.files | join("、") }}。浏览器不会把文件留给我们，
-      <strong>重新选中</strong>它们再提交。
+      另有 {{ result.retry.files | length }} 个文件要重试：{{ result.retry.files | join("、") }}。
+      浏览器不会把文件留给我们，<strong>重新选中</strong>它们再提交，没选中的不会被提交。
     </p>
-    <input type="file" name="files" multiple class="block w-full text-sm">
+    <input type="file" name="files" multiple accept="{{ result.accept }}"
+           class="block w-full text-sm">
     {% endif %}
     <div class="flex items-center gap-4">
       <button type="submit" class="rounded bg-slate-900 px-4 py-2 text-sm font-medium text-white">
@@ -86,6 +92,17 @@
       <span class="htmx-indicator text-sm text-slate-500">正在导入……</span>
     </div>
   </form>
+  {% endif %}
+
+  {% if result.retry.blocked %}
+  <div class="mt-6 border-t border-slate-200 pt-4">
+    <h3 class="text-sm font-medium">这些不是重试能解决的</h3>
+    <ul class="mt-2 space-y-1 text-xs text-slate-500">
+      {% for item in result.retry.blocked %}
+      <li>{{ item.source }} 与 {{ item.other }} 落成了同一个文档标题，重试其中一个会把另一个替掉。</li>
+      {% endfor %}
+    </ul>
+  </div>
   {% endif %}
 </section>
 {% endif %}

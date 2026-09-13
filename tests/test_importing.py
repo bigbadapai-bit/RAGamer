@@ -13,12 +13,13 @@ from ragamer.chunking import Chunk, ChunkRules
 from ragamer.importing import (
     Importer,
     ImportStage,
+    SourceKind,
     chunk_id,
     content_hash,
     document_title,
 )
 from ragamer.sources import NormalizedDoc, SourceAsset, SourceDocument
-from ragamer.stores.base import UNVERSIONED, image_prefix
+from ragamer.stores.base import UNVERSIONED, StoreUnavailableError, image_prefix
 from ragamer.stores.memory import InMemoryChunkStore, InMemoryObjectStore
 from ragamer.tagging import ContentNature, SubjectType, TagVocabulary
 from ragamer.vectors.base import ModelUnavailableError
@@ -279,6 +280,9 @@ def test_同一批里两份同标题的文件不互相覆盖():
     assert results[1].stage is ImportStage.STORE
     assert "甲.md" in results[1].error and "二郎神" in results[1].error
     assert results[1].chunk_count == 0
+    # 撞车结构化地带出来：界面据此把这一条挡在「重试」之外（单独重试会删掉甲）
+    assert results[1].collides_with == "甲.md"
+    assert results[0].collides_with == ""
     # 乙是同一篇的短版本：真写下去的话甲那一批切片会被它替掉
     assert [chunk.content for chunk in stored(chunks)] == [
         chunk.content for chunk in stored(reference)
@@ -299,6 +303,38 @@ def test_同一批里同一份资料提交两次不算撞车():
 
     assert [result.ok for result in results] == [True, True]
     assert len(stored(chunks)) == results[0].chunk_count
+
+
+def test_写失败的那条不占文档标识():
+    """认领发生在真的写进库之后。
+
+    前一条写挂了、后一条同名，后一条该报自己的写错误，而不是被误报成「跟前面那条撞了」
+    ——后者会把人打发去改标题，白改一场。
+    """
+
+    class FailingStore(InMemoryChunkStore):
+        def upsert(self, game_id: str, chunks) -> None:
+            raise StoreUnavailableError("Milvus", "milvus.test:19530", 2.5, "连接被拒绝")
+
+    results = make_importer(FailingStore()).batch(
+        [markdown("甲.md"), markdown("乙.md", text=SHORT_ARTICLE)],
+        game_id=GAME,
+        vocabulary=BLACK_MYTH,
+    )
+
+    assert [result.ok for result in results] == [False, False]
+    assert [result.collides_with for result in results] == ["", ""]
+    assert all(result.stage is ImportStage.STORE for result in results)
+
+
+def test_结果里带着来源的种类():
+    """界面靠它决定失败的那条回填到网址框还是文件框，不靠字符串长得像不像地址。"""
+    importer = make_importer(InMemoryChunkStore(), crawler=FakeCrawler(**{PAGE_URL: WIKI_ARTICLE}))
+
+    results = importer.batch([markdown()], urls=[MISSING_URL], game_id=GAME, vocabulary=BLACK_MYTH)
+
+    assert [result.kind for result in results] == [SourceKind.FILE, SourceKind.URL]
+    assert not results[1].ok  # 抓取失败那条也带得出种类，重试才知道往哪儿回填
 
 
 def test_两个不同网址切成同一个标题时后一条失败():

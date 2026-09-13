@@ -1,23 +1,27 @@
 """导入编排器：写入侧的唯一入口。
 
-**两个入口，一条链路**：`import_one` 收本地文件（或界面上传的字节），`import_url` 收网址，
-两条在归一化那一步合流（`import_url` 只是换了个取正文的方式），此后切分、打标、
-向量化、入库完全不区分来源——验收要求的「抓取结果与本地文件走完全相同的后续链路」，
-与其靠两处代码长得一样来保证，不如让它们本来就是同一处。
+**两类来源，一条链路**：`batch` 收本地资料（或界面上传的字节）与网址，两条在归一化那一步
+合流（网址只是换了个取正文的方式），此后补图、切分、打标、向量化、入库完全不区分来源——
+验收要求的「抓取结果与本地文件走完全相同的后续链路」，与其靠两处代码长得一样来保证，
+不如让它们本来就是同一处。单条也有入口（`import_one`／`import_url`），那是给不带批次的
+调用方用的，走的是同一段 `_run`。
 
 一份资料从归一化一路送到库里，中间串起补图、切分、打标、向量化。链路上每一段都自己
 有模块，这里不重做其中任何一件，只负责把线接对——而接错的代价恰恰最大，
-所以编排层自己扛三件事：
+所以编排层自己扛四件事：
 
 - **进度可上报**：每进入一个阶段回调一次，界面上的「还要等多久、卡在哪一步」来自它。
-- **一批里某个文件失败不牵连其余**：异常在逐个文件那一层兜住，记下文件名与失败阶段。
-  兜住不等于吞掉——每一次失败都落日志（带调用栈），也落进那个文件的结果里。
+- **一批里某一条失败不牵连其余**：异常在逐条那一层兜住，记下它从哪来、失败在哪一步。
+  兜住不等于吞掉——每一次失败都落日志（带调用栈），也落进那一条的结果里。
 - **同一份资料重复导入不产生重复切片**，靠两个机制：
   一是**切片主键由导入侧分配**，取「游戏 + 文档标题 + 版本 + 切片序号」的哈希，
   重导算出的 id 与上次完全一致，覆盖写入天然幂等（服务端自增做不到这一点）；
   二是**入库时按文档整体替换**，先删掉这份文档在这个版本下的旧切片再写。
   少了第二条，新一次切出来的片数变少时，只靠覆盖会留下一截旧切片——
   查得出来、还会进聚合父块，而且不报错。
+- **一次提交里两条不会互相覆盖**：文档标识（标题 + 版本）是替换的范围，两条落成同一个
+  标识时后一条带着 :class:`DocumentCollision` 失败。跨提交的重导不在此列——那是「同名即
+  同一份文档」，是有意的。
 """
 
 from __future__ import annotations
@@ -63,6 +67,17 @@ class ImportStage(StrEnum):
     STORE = "store"
 
 
+class SourceKind(StrEnum):
+    """一条资料是从哪来的。差异只到取正文那一步（`_Entry.normalize`），但界面要留一份——
+
+    「重试失败的那些」得知道失败的那条该回填到网址框还是文件框里，
+    靠 `source` 长得像不像地址来猜，迟早会把一个叫得怪的文件名派去抓。
+    """
+
+    FILE = "file"
+    URL = "url"
+
+
 #: 阶段的中文叫法。日志与界面上的「失败在哪一步」都用它。
 STAGE_LABELS: dict[ImportStage, str] = {
     ImportStage.NORMALIZE: "归一化",
@@ -97,18 +112,27 @@ class _Entry:
 
     #: 这一条是从哪来的：文件名，或网址。进度与结果里指认它用的就是它。
     source: str
+    kind: SourceKind
     #: 取正文那一步。本地资料读字节再解析，网址去抓——差异只到这一层为止。
     normalize: Callable[[], NormalizedDoc]
-    #: 同一份来源的凭据。同一次提交里两条身份相同即同一份资料，不是撞车。
+    #: 同一份资料的凭据。同一次提交里两条身份相同即同一份，不是撞车。
     identity: str
 
 
-@dataclass(frozen=True)
-class _Claim:
-    """一批里先占下某个文档标识的那条来源。撞车时要说清是跟谁撞的。"""
+class DocumentCollision(ValueError):
+    """这一条与同一次提交里的另一条落成同一个文档标识。
 
-    identity: str
-    source: str
+    写下去会把那一份整份替掉，所以当场失败。**带上撞的是谁**：界面要据此把这一条
+    挡在「重试」之外——单独重试它就等于把它撞的那一份删掉。
+    """
+
+    def __init__(self, other: str, doc_title: str) -> None:
+        super().__init__(
+            f"这一批里的 {other} 也叫「{doc_title}」。文档标题是重导替换的范围，"
+            "两份落成同一个标题会互相覆盖，只会留下最后写的那一份。"
+            "改掉其中一份的标题，或者分两次导入。"
+        )
+        self.other = other
 
 
 def log_progress(event: ProgressEvent) -> None:
@@ -143,7 +167,7 @@ class CoveredTags:
 
 @dataclass(frozen=True)
 class ImportResult:
-    """一个文件的导入结果。**失败也是结果**——一批里它失败了，其余照跑。"""
+    """一条资料的导入结果。**失败也是结果**——一批里它失败了，其余照跑。"""
 
     #: 这一条是从哪来的：文件名，或网址。
     source: str
@@ -156,11 +180,16 @@ class ImportResult:
     #: 不是留一片空白。所以这个数今天是 0，留着是因为它是界面要说清的一个口径。
     skipped: int
     tags: CoveredTags
+    #: 本地文件还是网址。界面据此决定重试时回填到哪个框里。
+    kind: SourceKind = SourceKind.FILE
     #: 失败发生在哪一步；成功时是 `None`。
     stage: ImportStage | None = None
     #: 失败原因；成功时是 `None`。
     error: str | None = None
-    #: 这个文件走过的阶段，按先后。走到哪就报到哪。
+    #: 撞车时撞的是谁（同一次提交里的另一条）。**这条失败不能靠重试解决**：
+    #: 单独重试它，它就成了那一批里唯一的一条，写下去会把它撞赢的那份整份替掉。
+    collides_with: str = ""
+    #: 这条资料走过的阶段，按先后。走到哪就报到哪。
     progress: tuple[ProgressEvent, ...] = ()
 
     @property
@@ -253,7 +282,7 @@ class Importer:
         同一次提交里一个文件与一个网址撞上才不会互相覆盖。
         """
         total = len(sources) + len(urls)
-        claimed: dict[tuple[str, str], _Claim] = {}
+        claimed: dict[tuple[str, str], _Entry] = {}
         entries = [self._file_entry(source, game_id) for source in sources]
         entries += [self._url_entry(url) for url in urls]
         return tuple(
@@ -333,6 +362,7 @@ class Importer:
         """一份本地资料 → 这一次要跑的那条。原图在这里进对象存储。"""
         return _Entry(
             source=source.filename,
+            kind=SourceKind.FILE,
             # 抓回来的网页没有附件，附件这一步只在文件这条路上
             normalize=lambda: self._publish(self.parser.parse(source), source, game_id),
             # 同一批里再提交一次同一份文件是幂等的，靠它认出来
@@ -344,7 +374,9 @@ class Importer:
         crawler = self.crawler
         if crawler is None:
             raise ValueError("这个导入器没有接上抓取器，导入不了网址（组合根里接）")
-        return _Entry(source=url, normalize=lambda: crawler.crawl(url), identity=url)
+        return _Entry(
+            source=url, kind=SourceKind.URL, normalize=lambda: crawler.crawl(url), identity=url
+        )
 
     def _run(
         self,
@@ -355,7 +387,7 @@ class Importer:
         vocabulary: TagVocabulary | None,
         file_number: int,
         file_total: int,
-        claimed: dict[tuple[str, str], _Claim] | None = None,
+        claimed: dict[tuple[str, str], _Entry] | None = None,
     ) -> ImportResult:
         """六个阶段走一遍。`entry.normalize` 是这里唯一的变量：本地资料读字节、网址去抓。
 
@@ -397,8 +429,11 @@ class Importer:
                 source_url=doc.source_url,
             )
             enter(ImportStage.STORE)
-            _claim(claimed, doc_title, version, entry)
+            # 先看这个标识是不是已经被这一批里的别条占了——占了就不写，写下去就是覆盖
+            _check_claim(claimed, doc_title, version, entry)
             self._store(game_id, doc_title, version, rows)
+            # 真写进去了才算占下：写失败的那条不该让后面的同名条报成「撞车」
+            _reserve(claimed, doc_title, version, entry)
         # 兜住全部异常是「一个文件失败不牵连其余」要求的：读文件、抓网页、调模型、写库
         # 都可能以各自的异常类型挂掉，而这一批的其余文件不该跟着陪葬。兜住不等于吞掉
         # ——错误原文进结果、带调用栈进日志，两处都留痕。
@@ -416,8 +451,11 @@ class Importer:
                 chunk_count=0,
                 skipped=0,
                 tags=CoveredTags(),
+                kind=entry.kind,
                 stage=current,
                 error=str(exc),
+                # 撞车单独标出来：这条失败重试不得，界面要拦住
+                collides_with=exc.other if isinstance(exc, DocumentCollision) else "",
                 progress=tuple(reported),
             )
         return ImportResult(
@@ -426,6 +464,7 @@ class Importer:
             chunk_count=len(rows),
             skipped=skipped,
             tags=_covered(tagged),
+            kind=entry.kind,
             progress=tuple(reported),
         )
 
@@ -534,28 +573,28 @@ def _unique(values: Iterable[str]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(values))
 
 
-def _claim(
-    claimed: dict[tuple[str, str], _Claim] | None,
+def _check_claim(
+    claimed: dict[tuple[str, str], _Entry] | None,
     doc_title: str,
     version: str,
     entry: _Entry,
 ) -> None:
-    """在一批里认下「标题 + 版本」这个文档标识。**撞上了就当场失败，不写下去。**
+    """这一批里「标题 + 版本」这个文档标识被别条占了吗？占了就当场失败，不写下去。
 
-    文档标识同时是重导替换的范围：两条来源落成同一个标识时，后写的那条会把前一条整批
-    删掉，而两条结果都报成功——库里只剩一条，界面上却看着两份都进来了。宁可少一份、
+    文档标识同时是重导替换的范围：两条落成同一个标识时，后写的那条会把前一条整批删掉，
+    而两条结果都报成功——库里只剩一条，界面上却看着两份都进来了。宁可少一份、
     并且说清为什么。同一份资料重复提交是例外：标识一样、内容也一样，写下去等于没写。
     """
     if claimed is None:
         return
-    key = (doc_title, version)
-    first = claimed.get(key)
-    if first is None:
-        claimed[key] = _Claim(identity=entry.identity, source=entry.source)
-        return
-    if first.identity != entry.identity:
-        raise ValueError(
-            f"这一批里的 {first.source} 也叫「{doc_title}」。文档标题是重导替换的范围，"
-            "两份落成同一个标题会互相覆盖，只会留下最后写的那一份。"
-            "改掉其中一份的标题，或者分两次导入。"
-        )
+    first = claimed.get((doc_title, version))
+    if first is not None and first.identity != entry.identity:
+        raise DocumentCollision(first.source, doc_title)
+
+
+def _reserve(
+    claimed: dict[tuple[str, str], _Entry] | None, doc_title: str, version: str, entry: _Entry
+) -> None:
+    """写进库了才算占下这个标识。写失败的那条不占——后面同名的那条该去写它自己的。"""
+    if claimed is not None:
+        claimed.setdefault((doc_title, version), entry)
