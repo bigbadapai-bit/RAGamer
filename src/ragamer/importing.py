@@ -128,9 +128,9 @@ class DocumentCollision(ValueError):
 
     def __init__(self, other: str, doc_title: str) -> None:
         super().__init__(
-            f"这一批里的 {other} 也叫「{doc_title}」。文档标题是重导替换的范围，"
-            "两份落成同一个标题会互相覆盖，只会留下最后写的那一份。"
-            "改掉其中一份的标题，或者分两次导入。"
+            f"这一批里的 {other} 也叫「{doc_title}」。文档标题同时是重导替换的范围："
+            "两条落成同一个标题只会留下一份。改掉其中一份的标题再导——"
+            "分两次导入也留不下两份，后一次会替掉前一次。"
         )
         self.other = other
 

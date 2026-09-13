@@ -279,6 +279,8 @@ def test_同一批里两份同标题的文件不互相覆盖():
     assert [result.ok for result in results] == [True, False]
     assert results[1].stage is ImportStage.STORE
     assert "甲.md" in results[1].error and "二郎神" in results[1].error
+    # 「分两次导入」不是出路：后一次会把前一次整份替掉，两份留不下。文案不能把人往那儿引
+    assert "分两次导入也留不下两份" in results[1].error
     assert results[1].chunk_count == 0
     # 撞车结构化地带出来：界面据此把这一条挡在「重试」之外（单独重试会删掉甲）
     assert results[1].collides_with == "甲.md"
