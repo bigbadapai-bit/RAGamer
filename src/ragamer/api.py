@@ -1,8 +1,11 @@
-"""HTTP 端点：写入侧对外的唯一入口。
+"""HTTP 端点：写入侧与读取侧对外的唯一入口。
 
-一个端点——`POST /api/kb/{game_id}/import`。批量提交、**逐文件独立**：某个文件失败时
-其余照常入库，失败的那个在结果里带文件名与失败阶段。读取侧（提问）与几个页面在后面的
-票里接。
+三个端点：
+
+- `POST /api/kb/{game_id}/import`——批量提交、**逐文件独立**：某个文件失败时其余照常入库，
+  失败的那个在结果里带文件名与失败阶段。
+- `POST /api/ask`——提一个问题，拿回一段带引用的答案，**或者一次反问**（`kind` 区分两者）。
+- `POST /api/ask/{pending_id}`——用户点完反问里的候选，从那个暂停点继续，拿回答案。
 
 知识库元数据从 MongoDB 读（`knowledge_bases` 集合，id 就是游戏 id）：打标要用的词表
 ——启用了哪些主体类型、这个游戏的术语映射——就在它里面（docs/ARCHITECTURE.md §2.3）。
@@ -11,22 +14,29 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import asdict
 from typing import Annotated, Any
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 
+from ragamer.answering import Answer, Answerer
+from ragamer.clarifying import (
+    Clarification,
+    Clarifier,
+    NoKnowledgeBase,
+    NotACandidate,
+    UnknownPending,
+)
 from ragamer.container import Container
 from ragamer.importing import STAGE_LABELS, Importer, ImportResult, ProgressEvent
+from ragamer.knowledge import KB_COLLECTION
 from ragamer.logging import get_logger
 from ragamer.sources import SourceDocument
 from ragamer.stores.base import UNVERSIONED, collection_name
 from ragamer.tagging import TagVocabulary
 
 logger = get_logger(__name__)
-
-#: 知识库元数据所在的集合，文档 id 就是游戏 id。
-KB_COLLECTION = "knowledge_bases"
 
 
 def create_app(container: Container) -> FastAPI:
@@ -38,6 +48,42 @@ def create_app(container: Container) -> FastAPI:
         llm=container.llm,
         on_progress=_log_progress,
     )
+    clarifier = Clarifier(
+        chunks=container.chunks,
+        docs=container.docs,
+        llm=container.llm,
+        answerer=Answerer(
+            chunks=container.chunks,
+            embedder=container.embedder,
+            reranker=container.reranker,
+            llm=container.llm,
+        ),
+    )
+
+    @app.post("/api/ask")
+    async def ask_question(
+        question: Annotated[str, Form(description="用户的问题")],
+        game_id: Annotated[
+            str, Form(description="这次提问所在的游戏知识库，留空即没有上下文可依")
+        ] = "",
+        version: Annotated[
+            str, Form(description="会话里选定的版本，留空即按知识库的现行版本")
+        ] = "",
+    ) -> dict[str, Any]:
+        """提一个问题。
+
+        判得出问的是哪款游戏、哪个版本就直接作答；判不准就停下来反问，
+        响应里的 `kind` 是 `answer` 还是 `clarification`。
+        """
+        return _turn(lambda: clarifier.start(question, game_id=game_id, version=version))
+
+    @app.post("/api/ask/{pending_id}")
+    async def resolve_clarification(
+        pending_id: str,
+        label: Annotated[str, Form(description="用户点的那个候选，原样回传")],
+    ) -> dict[str, Any]:
+        """从反问的暂停点继续。选完就作答，不会再反问一次。"""
+        return _turn(lambda: clarifier.resume(pending_id, label))
 
     @app.post("/api/kb/{game_id}/import")
     async def import_sources(
@@ -64,6 +110,54 @@ def create_app(container: Container) -> FastAPI:
         }
 
     return app
+
+
+def _turn(call: Callable[[], Answer | Clarification]) -> dict[str, Any]:
+    """跑一次提问，并把它翻成响应。
+
+    领域里的几种「说不通」各自对应一个状态码，**在这里翻一次**：让它们漏到 500，
+    界面上只会看见「服务器错误」，而这几种各自都有下一步该做什么
+    （换个问法、重新提一次、先去建个库）。
+    """
+    try:
+        result = call()
+    except NotACandidate as exc:
+        # 选的东西不在候选里：请求本身是合法的，带的值不对
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except (UnknownPending, NoKnowledgeBase) as exc:
+        # 没有这个暂停点 / 一个库都没有：这两件都是「找不到」，不是请求写错了
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        # 空问题会让检索查出任意一批切片，答案也就是编的
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _turn_payload(result)
+
+
+def _turn_payload(result: Answer | Clarification) -> dict[str, Any]:
+    """一次提问的响应。`kind` 说清这是答案还是一次反问，两者字段不重叠。"""
+    if isinstance(result, Clarification):
+        return {
+            "kind": "clarification",
+            "pending_id": result.pending_id,
+            "dimension": result.dimension,
+            "prompt": result.prompt,
+            "choices": [
+                {"label": choice.label, "value": choice.value} for choice in result.choices
+            ],
+        }
+    return {
+        "kind": "answer",
+        "text": result.text,
+        "citations": [
+            {
+                "index": citation.index,
+                "label": citation.label,
+                "doc_title": citation.doc_title,
+                "ancestor_path": citation.ancestor_path,
+            }
+            for citation in result.citations
+        ],
+    }
 
 
 def _log_progress(event: ProgressEvent) -> None:

@@ -12,7 +12,8 @@ import logging
 import pytest
 from fastapi.testclient import TestClient
 
-from ragamer.api import KB_COLLECTION, create_app
+from ragamer.api import create_app
+from ragamer.knowledge import KB_COLLECTION
 from ragamer.stores.base import UNVERSIONED
 
 from .conftest import make_container
