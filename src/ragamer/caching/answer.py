@@ -35,6 +35,7 @@ from ragamer.caching.base import (
 )
 from ragamer.logging import get_logger
 from ragamer.query import effective_version, normalize_query
+from ragamer.routing import Route
 
 logger = get_logger(__name__)
 
@@ -75,6 +76,7 @@ class CachedAnswerer:
         version: str = "",
         current_version: str = "",
         rewritten_query: str = "",
+        route: Route | None = None,
     ) -> Answer:
         """命中缓存就拼出上次那份答案，未命中就走主检索路并把结果写回。
 
@@ -83,6 +85,8 @@ class CachedAnswerer:
         :param current_version: 知识库标着的现行版本。
         :param rewritten_query: 改写后的问法（`ragamer.query.understand`）。空串表示那一步
             降级了，这时按原问题算键——**绝不落到空串上**，那会让所有降级提问共用一个键。
+        :param route: 这次走哪几路召回，原样交给下层。**不进缓存键**：它是改写后的问题与
+            知识库路由表的函数，两个键相同的提问必然走同一条路。
         :raises ValueError: 问题为空。这时不查也不写缓存，直接交给下层当场报错。
         :raises ragamer.llm.LlmError: 生成失败。缓存只在生成成功之后才写。
         """
@@ -97,7 +101,11 @@ class CachedAnswerer:
         if cached is not None:
             return Answer(cached.text, cached.citations, cached.images)
         answer = self.answers.answer(
-            question, game_id=game_id, version=version, current_version=current_version
+            question,
+            game_id=game_id,
+            version=version,
+            current_version=current_version,
+            route=route,
         )
         if key is not None:
             self._write(key, CachedAnswer.of(answer), question)
@@ -111,12 +119,14 @@ class CachedAnswerer:
         version: str = "",
         current_version: str = "",
         rewritten_query: str = "",
+        route: Route | None = None,
     ) -> AnswerStream:
         """:meth:`answer` 的流式形态：命中就重放缓存，未命中边走边吐。
 
         两条路吐出来的东西一样多——**命中时逐字流式不是可选项**，它是「体验与未命中
         一致」的全部内容。
 
+        :param route: 这次走哪几路召回，原样交给下层。不进缓存键，理由同 :meth:`answer`。
         :raises ValueError: 问题为空。
         :raises ragamer.llm.LlmError: 生成失败。流到一半失败也照抛。
         """
@@ -131,7 +141,11 @@ class CachedAnswerer:
         if cached is not None:
             return AnswerStream(cached.citations, cached.images, replay(cached.text))
         streamed = self.answers.stream(
-            question, game_id=game_id, version=version, current_version=current_version
+            question,
+            game_id=game_id,
+            version=version,
+            current_version=current_version,
+            route=route,
         )
         return AnswerStream(
             streamed.citations, streamed.images, self._written_back(key, streamed, question)

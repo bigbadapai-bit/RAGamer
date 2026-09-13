@@ -20,8 +20,16 @@ from ragamer.clarifying import CONFIDENT
 from ragamer.conversations import SESSION_PAGE_SIZE
 from ragamer.knowledge import KB_COLLECTION
 from ragamer.llm import FakeLlm
+from ragamer.websearch import FakeWebSearch, WebResult
 
-from .conftest import HalfwayLlm, chunk_store, joint_reply, make_chunk, make_container
+from .conftest import (
+    HalfwayLlm,
+    RecordingChunkStore,
+    chunk_store,
+    joint_reply,
+    make_chunk,
+    make_container,
+)
 
 GAME = "black_myth"
 #: 这个库的元数据。`name` 是显示名——它同时是给模型的游戏候选。
@@ -35,17 +43,19 @@ QUESTION = "二郎神掉什么"
 REPLY = "掉的是三尖两刃刀[1]。"
 
 
-def said(rewritten: str, game: str = "") -> dict[str, object]:
+def said(rewritten: str, game: str = "", route: str = "") -> dict[str, object]:
     """提问理解那一步的脚本：一次联合输出。
 
     **判出来就算确定**：这几个用例关心的是流与落库，分级在 `tests/test_clarifying.py`
     里单测。少了确定度那两个字段，联合输出节点会当场判成「读不出来」，整条理解静默
     降级回原问法。
+    路由标签默认留空（判不出）：这些用例要证的不是选路，留空让它们走默认组合即可。
     """
     return joint_reply(
         game=game,
         game_confidence=CONFIDENT if game else 0.0,
         rewritten_query=rewritten,
+        route=route,
     )
 
 
@@ -54,6 +64,15 @@ def client_with(llm, *chunks) -> TestClient:
     container = make_container(llm=llm, chunks=chunk_store(GAME, *chunks))
     container.docs.put(KB_COLLECTION, GAME, KB)
     return TestClient(create_app(container))
+
+
+def recording_client(llm, kb: dict, *chunks) -> tuple[TestClient, RecordingChunkStore]:
+    """同上，但切片存储记下每次检索收到的参数——用来看这一轮走了哪几路。"""
+    store = RecordingChunkStore()
+    store.upsert(GAME, list(chunks))
+    container = make_container(llm=llm, chunks=store)
+    container.docs.put(KB_COLLECTION, GAME, kb)
+    return TestClient(create_app(container)), store
 
 
 def start(client: TestClient) -> str:
@@ -285,6 +304,73 @@ def test_生成中途失败时发错误事件且不写进历史():
     assert events[-1] == "error"
     assert "done" not in events
     assert client.get(f"/api/chat/sessions/{session_id}").json()["turns"] == []
+
+
+# --- 选路 ---
+
+
+def test_知识库里的路由表覆盖默认选路():
+    """组合住在知识库元数据里（与打标词表同一个姿势）：界面改的是「走哪几路」。
+
+    默认表里事实型走两路，这份配置把它改成只走主检索——检索次数就是这件事在外面
+    唯一看得见的证据。
+    """
+    kb = {**KB, "route_table": {"factual": ["main"]}}
+    client, store = recording_client(FakeLlm(said(QUESTION, route="事实型"), REPLY), kb, DOC)
+    session_id = start(client)
+
+    ask(client, session_id, QUESTION)
+
+    assert len(store.searches) == 1
+
+
+def test_没配路由表时走默认组合():
+    """没写 `route_table` 是最常见的一种——它不是错误，是走默认。"""
+    client, store = recording_client(FakeLlm(said(QUESTION, route="事实型"), REPLY), KB, DOC)
+    session_id = start(client)
+
+    ask(client, session_id, QUESTION)
+
+    assert len(store.searches) == 2
+
+
+def test_时效型问题走联网兜底并在引用里标出来():
+    """一条链路的验收：知识库里没有的东西去外部搜回来，并且**标明这是搜来的**。
+
+    本地库是空的——这一路的意义就在这里，别按「没找到」处理。
+    """
+    result = WebResult(
+        "1.1 版本更新公告", "https://example.com/patch", "金箍棒改了。", "2026-01-02"
+    )
+    container = make_container(
+        llm=FakeLlm(said("这版本改了什么", route="时效型"), "金箍棒的基础伤害下调了[1]。"),
+        search=FakeWebSearch([result]),
+    )
+    container.docs.put(KB_COLLECTION, GAME, KB)
+    client = TestClient(create_app(container))
+    session_id = start(client)
+
+    parsed = parse_sse(ask(client, session_id, "这版本改了什么"))
+
+    events = [name for name, _ in parsed]
+    citations = parsed[events.index("citations")][1]["citations"]
+    assert [(item["index"], item["origin"]) for item in citations] == [(1, "web")]
+    assert citations[0]["url"] == result.url
+    assert events[-1] == "done"
+
+
+def test_路由表配坏了当场422():
+    """配置写坏时静默按默认值跑，会让人以为「改配置没用」，查无可查。"""
+    client, _ = recording_client(
+        FakeLlm(said(QUESTION, route="事实型"), REPLY),
+        {**KB, "route_table": {"factual": ["算命"]}},
+        DOC,
+    )
+    session_id = start(client)
+
+    response = client.get(f"/api/chat/sessions/{session_id}/ask", params={"question": QUESTION})
+
+    assert response.status_code == 422
 
 
 # --- 边界 ---

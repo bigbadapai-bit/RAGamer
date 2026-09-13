@@ -70,6 +70,9 @@ COMPLETE_ENV: dict[str, str] = {
     "RAGAMER_CRAWL_TIMEOUT": "7.5",
     "RAGAMER_CRAWL_MIN_INTERVAL": "0.25",
     "RAGAMER_CRAWL_MAX_BYTES": "1048576",
+    "RAGAMER_SEARCH_BASE_URL": "https://search.test/v1/web-search",
+    "RAGAMER_SEARCH_API_KEY": "test-search-api-key",
+    "RAGAMER_SEARCH_TIMEOUT": "7.5",
 }
 
 
@@ -118,6 +121,7 @@ def make_container(
     ocr=None,
     crawler=None,
     cache=None,
+    search=None,
 ) -> Container:
     """造一个容器：八个依赖默认都是假件，测试只覆盖自己关心的那几个。
 
@@ -125,6 +129,7 @@ def make_container(
     默认的语言模型一条脚本都没排：真被调用到就会当场炸，而不是静默返回空串。
     默认的解析器也只有 md／txt 那条路——真正接上 MinerU 的是组合根，
     这里换掉就等于把那份资料交给假件。
+    `search` 默认是 `None`——与「没配检索服务」同一个状态，联网那一类用例自己传假件。
     """
     return Container(
         chunks=chunks if chunks is not None else InMemoryChunkStore(),
@@ -140,6 +145,7 @@ def make_container(
         parser=parser if parser is not None else ParserRouter((MarkdownParser(),)),
         crawler=crawler if crawler is not None else FakeCrawler(),
         cache=cache if cache is not None else InMemoryAnswerCache(),
+        search=search,
     )
 
 
@@ -195,6 +201,7 @@ def make_chat(container: Container) -> Chat:
         embedder=container.embedder,
         reranker=container.reranker,
         llm=container.llm,
+        search=container.search,
     )
     return Chat(
         docs=container.docs,
@@ -262,6 +269,9 @@ def joint_reply(**overrides: object) -> dict[str, object]:
         "version": "1.0",
         "version_confidence": 0.9,
         "rewritten_query": "二郎神怎么打",
+        # 空串是「判不出」这一类的明确答案。**不能省**：整个字段缺席是另一回事，
+        # 那一支要留一条 warning（见 `ragamer.query.understand`），默认回复不该触发它
+        "route": "",
     }
     return {**reply, **overrides}
 

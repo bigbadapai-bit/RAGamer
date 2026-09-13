@@ -120,6 +120,11 @@ def test_确定时直接作答并带上引用(client):
             "label": "二郎神",
             "doc_title": "二郎神",
             "ancestor_path": "",
+            # 知识与网络两条来源共用这一个形状，`url` 与 `published_at` 空着即语料来的；
+            # `origin` 是给界面判「这条是不是网上搜的」用的，不许它自己去猜 url 空不空
+            "url": "",
+            "published_at": "",
+            "origin": "local",
         }
     ]
     assert citations["version"] == "1.0"

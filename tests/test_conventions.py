@@ -35,6 +35,7 @@ _ADAPTERS = {
     "RedisAnswerCache",
     "RapidOcrEngine",
     "HttpCrawler",
+    "BochaWebSearch",
 }
 
 #: 只扫 `src/ragamer`：`tools/` 下是一次性运维脚本，不进包、没有测试缝可言，
@@ -82,7 +83,10 @@ def test_守则扫到了源码():
         "wikitext.py",
         "importing.py",
         "query.py",
+        "expanding.py",
+        "routing.py",
         "retrieval.py",
+        "websearch.py",
         "answering.py",
         "conversations.py",
         "clarifying.py",

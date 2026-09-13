@@ -33,6 +33,8 @@ from ragamer.conversations import (
 )
 from ragamer.knowledge import KB_COLLECTION
 from ragamer.llm import FakeLlm, LlmTimeout
+from ragamer.routing import RouteTable
+from ragamer.tagging import ContentNature, SubjectType
 from ragamer.vectors.fake import FakeReranker
 
 from .conftest import (
@@ -55,12 +57,13 @@ DOC = make_chunk(
 )
 
 
-def said(rewritten: str, game: str = "", version: str = "") -> dict[str, object]:
+def said(rewritten: str, game: str = "", version: str = "", route: str = "") -> dict[str, object]:
     """提问理解那一步的脚本：一次联合输出。
 
     **判出来就算确定**：这几个用例关心的是改写与游戏候选，分级本身在
     `tests/test_clarifying.py` 里单测。少了确定度那两个字段的话，联合输出节点会当场
     判成「读不出来」，整条理解静默降级回原问法——用例于是测了个寂寞。
+    路由标签默认留空（判不出）：这些用例要证的不是选路，留空让它们走默认组合即可。
     """
     return joint_reply(
         game=game,
@@ -68,6 +71,7 @@ def said(rewritten: str, game: str = "", version: str = "") -> dict[str, object]
         version=version,
         version_confidence=CONFIDENT if version else 0.0,
         rewritten_query=rewritten,
+        route=route,
     )
 
 
@@ -157,6 +161,84 @@ def test_没有候选时回落会话选定的知识库():
     asked(chat, conversation, "那它掉什么")
 
     assert chunks.searches[0]["game_id"] == GAME
+
+
+# --- 选路 ---
+
+
+def test_查询类型决定走哪几路():
+    """判成事实型就走主检索 + 元数据过滤：第二条是单路稠密检索，还带着内容性质过滤。
+
+    选路的失效是静默的（照样出答案，只是依据偏了），所以这里断的是「检索收到了什么」。
+    """
+    llm = FakeLlm(said("二郎神掉什么", route="事实型"), "掉的是三尖两刃刀[1]。")
+    chat, chunks = recording_chat(llm)
+    conversation = chat.start(game_id=GAME)
+
+    asked(chat, conversation, "二郎神掉什么")
+
+    assert len(chunks.searches) == 2
+    main, metadata = chunks.searches
+    assert main["sparse"] is not None
+    assert metadata["sparse"] is None
+    assert metadata["where"].content_natures == (ContentNature.STATS,)
+
+
+def test_知识库的路由表覆盖默认选路():
+    """路由表是每个库一份的配置：把事实型改成只走主检索，这一轮就只检索一次。"""
+    llm = FakeLlm(said("二郎神掉什么", route="事实型"), "掉的是三尖两刃刀[1]。")
+    chat, chunks = recording_chat(llm)
+    conversation = chat.start(game_id=GAME)
+
+    asked(
+        chat,
+        conversation,
+        "二郎神掉什么",
+        routes=RouteTable.from_mapping({"route_table": {"factual": ["main"]}}),
+    )
+
+    assert len(chunks.searches) == 1
+
+
+def test_路由表里配的主体类型与内容性质真的到了过滤条件里():
+    """配置 → 选路 → 检索这一条要通到底：只断「表里写着」的话，中间断了一环也看不出来。
+
+    内容性质由查询类型推出来，主体类型只能靠配置给——所以这一条用配置那一维来证。
+    """
+    llm = FakeLlm(said("二郎神血量多少", route="事实型"), "血量是 8000[1]。")
+    chat, chunks = recording_chat(llm)
+    conversation = chat.start(game_id=GAME)
+    routes = RouteTable.from_mapping(
+        {
+            "route_table": {
+                "factual": {
+                    "paths": ["main", "metadata"],
+                    "subject_types": ["character"],
+                    "content_natures": ["stats"],
+                }
+            }
+        }
+    )
+
+    asked(chat, conversation, "二郎神血量多少", routes=routes)
+
+    assert chunks.searches[1]["where"].subject_types == (SubjectType.CHARACTER,)
+    assert chunks.searches[1]["where"].content_natures == (ContentNature.STATS,)
+
+
+def test_判不出类型时照默认组合继续作答():
+    """路由判定失败不该让整个提问失败：按事实型那一行走，答案照出。"""
+    llm = FakeLlm(said("二郎神掉什么"), "掉的是三尖两刃刀[1]。")
+    chat, chunks = recording_chat(llm)
+    conversation = chat.start(game_id=GAME)
+
+    asked(chat, conversation, "二郎神掉什么")
+
+    assert len(chunks.searches) == 2
+    assert [turn.content for turn in chat.open(conversation.session_id).turns] == [
+        "二郎神掉什么",
+        "掉的是三尖两刃刀[1]。",
+    ]
 
 
 # --- 刷新之后 ---

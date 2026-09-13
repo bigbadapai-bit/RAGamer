@@ -29,8 +29,10 @@ SSE 事件、暂停点选错了翻成 422。**「这一轮算不算问完」「�
 
 知识库元数据从 MongoDB 读（`knowledge_bases` 集合，id 就是游戏 id）：打标要用的词表
 ——启用了哪些主体类型、这个游戏的术语映射——就在它里面（docs/ARCHITECTURE.md §2.3），
-检索回落哪个版本也从它取（§2.4）。形状与判断在 `ragamer.knowledge`，界面那条写入路径
-用的是同一份。
+检索回落哪个版本也从它取（§2.4），**这次走哪几路召回**同样由它覆盖（§3.1 的默认路由表
+是出厂值，库里配了 `route_table` 就用配的）。形状与判断在 `ragamer.knowledge`，界面那条
+写入路径用的是同一份。知识库列表同时是**游戏候选**：给模型的是显示名，拿回来再换回 id，
+理由见 `_games`。
 本层**一个适配器都不构造**，全部来自组合根（`ragamer.container`），缝因此立得住。
 
 这是**只有 JSON 端点**的应用；给人看的页面由 `ragamer.web` 挂上去，两者在
@@ -56,6 +58,7 @@ from ragamer.conversations import (
     Chat,
     Conversation,
     ConversationNotFound,
+    Game,
     Reply,
     SessionPage,
     Sources,
@@ -64,9 +67,15 @@ from ragamer.conversations import (
     parse_session_cursor,
 )
 from ragamer.importing import STAGE_LABELS, ImportResult, ProgressEvent
-from ragamer.knowledge import KnowledgeBase, KnowledgeBaseError, readable_knowledge_base
+from ragamer.knowledge import (
+    KB_COLLECTION,
+    KnowledgeBase,
+    KnowledgeBaseError,
+    readable_knowledge_base,
+)
 from ragamer.llm import LlmError
 from ragamer.logging import get_logger
+from ragamer.routing import RouteTable
 from ragamer.sources import SourceDocument
 from ragamer.stores.base import UNVERSIONED, StoreError, collection_name
 from ragamer.tagging import TagVocabulary
@@ -225,12 +234,15 @@ def create_app(container: Container, chat: Chat | None = None) -> FastAPI:
         # 先读一次会话：不存在当场 404，顺带拿到它绑的知识库（现行版本要从那里取）。
         # `chat.ask` 自己还会再读一次，那是它的事——会话是上一次请求写下的，
         # 这一层手里这一份只用来决定「去哪个库问」。
-        knowledge = _knowledge_base(container, _conversation(chat, session_id).game_id)
+        conversation = _conversation(chat, session_id)
+        knowledge = _kb_document(container, conversation.game_id)
         replies = chat.ask(
             session_id,
             question,
             version=version,
-            current_version=knowledge.version,
+            current_version=str(knowledge.get("version", "")),
+            games=_games(container),
+            routes=_route_table(knowledge, game_id=conversation.game_id),
             pending_id=pending_id,
             label=label,
         )
@@ -396,6 +408,55 @@ def _vocabulary(container: Container, game_id: str) -> TagVocabulary:
     return _knowledge_base(container, game_id).vocabulary
 
 
+def _kb_document(container: Container, game_id: str) -> dict[str, Any]:
+    """这个知识库的元数据，**原始那一份**。
+
+    提问那条路读它而不是读 `_knowledge_base`：路由表要从文档本身建
+    （`RouteTable.from_mapping`），而 `KnowledgeBase` 是 `ragamer.knowledge` 归一过的
+    形状，不带原样字段。读一次就够——现行版本也从这一份里取。
+
+    库不存在是游戏选错了，当场 404，不静默按默认值把内容查一遍。
+    """
+    payload = container.docs.get(KB_COLLECTION, game_id)
+    if payload is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"知识库 {game_id} 不存在。先在知识库管理里建一个",
+        )
+    return payload
+
+
+def _route_table(knowledge: Mapping[str, Any], *, game_id: str) -> RouteTable:
+    """这个知识库的查询路由表。**元数据已经在手里**，所以收的是那份文档而不是再读一次
+    （`ask` 那一步为了现行版本本来就要读它，见 `_kb_document`）。
+
+    配置里没写的类型一律走默认值（`ragamer.routing`）——与打标词表同一个姿势：
+    库里只写改过的那几行，默认值以后才改得动。而**读不了就是 422**：路由表决定这次
+    检索走哪几路，配置写坏时静默按默认值跑，会让人以为「改配置没用」，查无可查。
+    """
+    try:
+        return RouteTable.from_mapping(knowledge)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422, detail=f"知识库 {game_id} 的路由表读不了：{exc}"
+        ) from exc
+
+
+def _games(container: Container) -> tuple[Game, ...]:
+    """游戏候选：`(显示名, 知识库 id)`。
+
+    候选值必须是**用户问句里会出现的那种写法**。知识库 id 同时是 Milvus 的 collection 名，
+    只能是英文标识符（`collection_name`），用户不会这么问——拿 id 去当候选，模型只会把
+    「黑神话」判成不在候选里，这一步于是永远判不出东西来。所以给显示名，拿回来再换回 id
+    （`ragamer.conversations._game_id`）。显示名没配就回落 id，与知识库管理页一个口径。
+    """
+    candidates = []
+    for game_id in container.docs.list_ids(KB_COLLECTION):
+        knowledge = container.docs.get(KB_COLLECTION, game_id) or {}
+        candidates.append((str(knowledge.get("name", "")) or game_id, game_id))
+    return tuple(candidates)
+
+
 def _conversation(chat: Chat, session_id: str) -> Conversation:
     try:
         return chat.open(session_id)
@@ -441,7 +502,13 @@ def _conversation_payload(conversation: Conversation) -> dict[str, Any]:
 
 
 def _citation_payload(citation: Citation) -> dict[str, Any]:
-    return {**asdict(citation), "label": citation.label}
+    """引用对外的样子。
+
+    `label` 与 `origin` 在这里补上：前者是显示用的那一行（怎么拼由 `Citation.label`
+    定，界面照抄就行），后者是「这条是知识库里查到的还是网上搜来的」。**`origin`
+    是个属性、`asdict` 带不出来**，而界面判它不该靠「url 是不是空串」去猜。
+    """
+    return {**asdict(citation), "label": citation.label, "origin": citation.origin}
 
 
 def _result_payload(result: ImportResult) -> dict[str, Any]:

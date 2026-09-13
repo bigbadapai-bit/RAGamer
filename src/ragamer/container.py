@@ -41,6 +41,7 @@ from ragamer.stores.documents import MongoDocStore
 from ragamer.stores.objects import MinioObjectStore
 from ragamer.vectors.base import Embedder, Reranker
 from ragamer.vectors.bge import BgeM3Embedder, BgeReranker
+from ragamer.websearch import BochaWebSearch, WebSearch
 
 logger = get_logger(__name__)
 
@@ -54,7 +55,7 @@ class Container:
     objects: ObjectStore
     embedder: Embedder
     reranker: Reranker
-    #: 语言模型。打标兜底、查询路由、多查询改写、生成都走它。
+    #: 语言模型。打标兜底、查询路由、多查询改写、HyDE、生成都走它。
     llm: LlmClient
     #: 视觉模型。**没配就是 `None`**：补图只做二次 OCR，图里没有文字的那几张
     #: 会少掉可检索的文本，其余照旧（见 `ragamer.config.VisionSettings`）。
@@ -68,6 +69,9 @@ class Container:
     crawler: PageCrawler
     #: 答案缓存与提问计数。**不在 `stores()` 里**，见模块说明。
     cache: AnswerCache
+    #: 联网兜底那一路的外部检索。**没配就是 `None`**——整组配置可以不填，这一路随之
+    #: 跳过，其余几路照常作答（见 `ragamer.websearch`）。
+    search: WebSearch | None = None
 
     def stores(self) -> tuple[Store, ...]:
         """三个存储服务，自检按这个顺序走。缓存不在这里：它不通不影响作答。"""
@@ -126,6 +130,9 @@ def build_container(settings: Settings) -> Container:
             )
         ),
         crawler=HttpCrawler(settings.crawl),
+        # 没配密钥就是没这一路。**不构造一个「搜不到东西」的实现**：那会让「没配」
+        # 与「搜了但没有结果」在日志与答案里长得一模一样，查无可查
+        search=BochaWebSearch(settings.search) if settings.search.api_key else None,
     )
 
 

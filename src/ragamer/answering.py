@@ -1,13 +1,14 @@
 """生成：把检索到的资料交给模型，产出一段**能核对**的答案。
 
-读取侧到这一步为止：问题进，答案与引用出来。中间是主检索路（`ragamer.retrieval`）
-——取候选、精排、断崖截断、按文档聚合父块。
+读取侧到这一步为止：问题进，答案与引用出来。中间是检索（`ragamer.retrieval`）
+——按路由走选中的那几路取候选、融合、精排、断崖截断、按文档聚合父块，外加联网兜底
+搜回来的那几条。
 
 **两种给法**：:meth:`Answerer.answer` 一次给全，:meth:`Answerer.stream` 逐字给。
 两者共用同一段检索与同一份提示词（:meth:`Answerer._sources`），差别只在正文怎么出来；
 引用在流式这一路是**先**出来的，因为它在检索那一步就定下来了。
 
-四件事在这里定死：
+五件事在这里定死：
 
 - **一条资料是一个父块，不是一个切片**。命中并截断之后按文档回查兄弟切片
   （`aggregate_parents`），于是问"二郎神怎么打"时模型拿到的是整页——包括"掉落"，
@@ -21,6 +22,10 @@
   交回，用户才不必跳出去找原图。它跟着引用走，不是另一次检索。
 - **检索不到就直说**。候选一条都没有时**不调模型**：没有内容可依据，让它自由发挥
   只会得到一段编造的游戏攻略，而且看起来和真答案一样。回复是这里的常量。
+- **网络来源与语料分开标**。两者混在一份答案里而不标出来，等于把「这是我们语料里
+  写的」与「这是网上说的」说成同一件事——而网络内容可能过时、也可能与知识库冲突。
+  标注落在两处：资料清单里那一行的前缀（:data:`WEB_PREFIX`，给模型看），
+  以及引用上的 `url`／`origin`（给人看、也给界面判）。
 - **生成失败照抛**：没有答案就是没有答案。降级成一段「抱歉我答不上来」会把故障
   伪装成结果，比报错难查得多（与 `ragamer.query` 那一步的降级不同——那一步降级之后
   整条链路还能继续，这一步降级之后没有东西可以继续）。
@@ -39,16 +44,18 @@ from __future__ import annotations
 import re
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
+from typing import Literal, Protocol, runtime_checkable
 
 from ragamer.chunking import PATH_SEPARATOR
 from ragamer.llm import LlmClient, LlmRequest, Message
 from ragamer.logging import get_logger
 from ragamer.query import version_filter
 from ragamer.retrieval import ParentBlock, aggregate_parents, retrieve
+from ragamer.routing import Route
 from ragamer.sources import image_refs
 from ragamer.stores.base import Chunk, ChunkStore
 from ragamer.vectors.base import Embedder, Reranker
+from ragamer.websearch import WebResult, WebSearch
 
 logger = get_logger(__name__)
 
@@ -61,12 +68,19 @@ NOT_FOUND = (
     "知识库里没有找到与这个问题相关的资料。换个问法试试，或者先把这个游戏的相关资料导入知识库。"
 )
 
-#: 生成用的系统提示。三条约束各对应一种失败：编造资料里没有的、结论与来源对不上、
-#: 以及把提示词本身复述成答案。
+#: 网络来源在资料清单里的前缀。**必须与语料里的资料分开标**：网络内容可能过时、
+#: 也可能与知识库里的说法冲突，两者混在一份答案里而读的人看不出来，等于把
+#: 「这是我们语料里写的」与「这是网上说的」说成同一件事。
+WEB_PREFIX = "【网络】"
+
+#: 生成用的系统提示。这几条约束各对应一种失败：编造资料里没有的、结论与来源对不上、
+#: 把提示词本身复述成答案，以及把网上的说法当成知识库里的说法。
 _INSTRUCTION = (
     "你是游戏攻略助手。只依据下面列出的资料回答用户的问题。\n"
     "资料里没写到的就说资料里没有，不要凭印象补充数值、打法或结论。\n"
     "每条结论后面用 [编号] 标出它出自哪条资料，编号就是资料前面的那个。\n"
+    f"标着{WEB_PREFIX}的那几条来自网络检索，可能滞后或与知识库不一致；"
+    "用到它们时要在答案里说明这是网络上的说法。\n"
     "用中文直接回答，不要复述这几条要求，也不要使用资料之外的编号。\n"
     "资料：\n"
 )
@@ -82,11 +96,34 @@ class Citation:
     `index` 是**正文里 [n] 指的那个编号**，从 1 起；引用在元组里的顺序就是交给模型的
     顺序，两者一一对应。文档标题与祖先标题路径都要给出来——只给标题的话，一份长词条
     里是「打法」那一段还是「获取方式」那一段，读的人仍然对不上。
+
+    **`url` 非空即网络来源**（`origin` 那个属性就是照它判的）。分成两个字段而不是一个
+    `origin` 枚举：对网络来源来说地址本来就要显示出来，而语料里的切片没有地址可给——
+    一个空串与一个有值的串，比「枚举 + 可能为空的地址」少一种对不上的组合。
+
+    这个判据的边界要记住：`url` 说的是**检索期从外面搜回来的那一条**。另一条堆叠线上
+    的 `Chunk.source_url`（导入的网页）是语料自己的出处，不是网络来源——哪天要把它也
+    显示出来，这个判据就得换成显式的来源标记，否则每一份导入的网页都会变成「网络来源」，
+    而那是静默的。
     """
 
     index: int
     doc_title: str
     ancestor_path: str
+    #: 网络来源的地址。语料里查到的切片是空串。
+    url: str = ""
+    #: 网络来源的发布时间，服务给什么就是什么。语料里的是空串。
+    published_at: str = ""
+
+    @property
+    def origin(self) -> Literal["local", "web"]:
+        """这条来源是知识库里查到的，还是网上搜来的。
+
+        读答案的人要分得清——网络内容可能过时、也可能与知识库里的说法冲突，两种来源
+        混在一份答案里而不标出来，等于把「这是我们语料里写的」与「这是网上说的」
+        说成同一件事。
+        """
+        return "web" if self.url else "local"
 
     @property
     def label(self) -> str:
@@ -95,7 +132,16 @@ class Citation:
         祖先标题路径通常以文档标题开头（一级标题就是文档标题，它是标题树的第一层），
         所以对得上时不再重复念一遍。比对前缀时要落在分隔符上：文档「二郎神」与文档
         「二郎神外传」是两份文档，只按字面前缀比会把后者误当成前者的一部分。
+
+        网络来源给的是地址（必要时带发布时间）：它没有祖先标题路径可言，而读的人要能
+        自己去看一眼原文。
         """
+        if self.url:
+            return (
+                f"{self.doc_title}（{self.url}）"
+                if not self.published_at
+                else (f"{self.doc_title}（{self.url}，{self.published_at}）")
+            )
         if not self.ancestor_path:
             return self.doc_title
         if self.ancestor_path == self.doc_title or self.ancestor_path.startswith(
@@ -107,14 +153,17 @@ class Citation:
 
 @dataclass(frozen=True)
 class _Source:
-    """编号好的一个父块：引用 + 它的内容。
+    """编号好的一个来源：引用 + 交给生成的那段文字。
 
     两者绑在一个类型里而不是两个平行序列：编号与内容本来就是同一件事的两面，
     分开放就得靠调用方保证两边同长同序，对不上时是静默的（编号指向另一条内容）。
+
+    语料里来的那段是父块拼出来的整页（:func:`_prompt_text`），网络来的是搜索服务给的
+    摘要——两者的取法不同，但到了这一步都只是「一段要编号的文字」。
     """
 
     citation: Citation
-    block: ParentBlock
+    text: str
 
 
 def require_question(question: str) -> None:
@@ -162,6 +211,7 @@ class ReadSide(Protocol):
         game_id: str,
         version: str = "",
         current_version: str = "",
+        route: Route | None = None,
     ) -> Answer:
         """读一个问题，给出答案与它的来源。"""
         ...
@@ -173,6 +223,7 @@ class ReadSide(Protocol):
         game_id: str,
         version: str = "",
         current_version: str = "",
+        route: Route | None = None,
     ) -> AnswerStream:
         """与 :meth:`answer` 同一套检索与提示，只是正文逐字产出。"""
         ...
@@ -203,8 +254,37 @@ class AnswerStream:
     deltas: Iterator[str]
 
 
+def _numbered(blocks: Sequence[ParentBlock], web: Sequence[WebResult]) -> tuple[_Source, ...]:
+    """语料的父块与网络来源合成一份**连续编号**的资料清单。
+
+    语料在前、网络在后：编号是正文里 [n] 指的那个号，读的人顺着往下看时先看到的是
+    知识库里查到的，网络那几条排在末尾——它是兜底，本该如此。
+
+    编号在**两批之间连续**，不是各编各的：模型看到的是一份资料清单，断号会让它以为
+    中间还有没给它的东西。
+    """
+    sources = [
+        _Source(Citation(index, block.doc_title, block.ancestor_path), _prompt_text(block))
+        for index, block in enumerate(blocks, start=1)
+    ]
+    sources += [
+        _Source(
+            Citation(
+                len(sources) + offset,
+                result.title,
+                "",
+                url=result.url,
+                published_at=result.published_at,
+            ),
+            result.text,
+        )
+        for offset, result in enumerate(web, start=1)
+    ]
+    return tuple(sources)
+
+
 def _citations(sources: Sequence[_Source]) -> tuple[Citation, ...]:
-    """编号好的父块 → 交回给调用方的引用。顺序就是提示词里的顺序，一一对应。"""
+    """编号好的来源 → 交回给调用方的引用。顺序就是提示词里的顺序，一一对应。"""
     return tuple(source.citation for source in sources)
 
 
@@ -235,15 +315,7 @@ def _image_urls(sources: Sequence[_Source]) -> tuple[str, ...]:
 
     认什么样的图片引用由 `ragamer.sources.image_refs` 定，与补图那一层同一处正则。
     """
-    return tuple(
-        dict.fromkeys(
-            url
-            for source in sources
-            for chunk in source.block.chunks
-            for text in (chunk.content, chunk.content_meta)
-            for url in image_refs(text)
-        )
-    )
+    return tuple(dict.fromkeys(url for source in sources for url in image_refs(source.text)))
 
 
 @dataclass(frozen=True)
@@ -258,6 +330,9 @@ class Answerer:
     embedder: Embedder
     reranker: Reranker
     llm: LlmClient
+    #: 联网兜底那一路要用的外部检索。**不配就是 `None`**：这一路跳过，其余照跑
+    #: （见 `ragamer.websearch`）——它不是「答不出来」的理由。
+    search: WebSearch | None = None
 
     def answer(
         self,
@@ -266,8 +341,9 @@ class Answerer:
         game_id: str,
         version: str = "",
         current_version: str = "",
+        route: Route | None = None,
     ) -> Answer:
-        """读一个问题，给出答案与它的来源。**只走主检索路**。
+        """读一个问题，给出答案与它的来源。
 
         截断之后按文档聚合父块，交给生成的是整页而不是命中那几句（§2.5）。
         没有检索到内容时返回 `NOT_FOUND` 与空引用，不调模型。
@@ -276,12 +352,19 @@ class Answerer:
         :param version: 这次按哪个版本检索。空串表示没点名（回落 `current_version`）。
         :param current_version: 知识库标着的现行版本。两个都是空串时不做版本过滤，
             并留一条 warning——见 `ragamer.query.version_filter`。
+        :param route: 这次走哪几路召回。**不给就只走主检索路**——选路要的是查询类型，
+            而那是 `ragamer.query.understand` 的产物，这一层拿不到也不该假装拿得到
+            （`ragamer.conversations` 那边判出来再传进来）。
         :raises ValueError: 问题为空（由 :func:`require_question` 报出来）。
         :raises ragamer.llm.LlmError: 生成失败。没有答案就是没有答案，不降级。
         """
         require_question(question)
         sources = self._sources(
-            question, game_id=game_id, version=version, current_version=current_version
+            question,
+            game_id=game_id,
+            version=version,
+            current_version=current_version,
+            route=route,
         )
         if not sources:
             return Answer(NOT_FOUND, ())
@@ -296,6 +379,7 @@ class Answerer:
         game_id: str,
         version: str = "",
         current_version: str = "",
+        route: Route | None = None,
     ) -> AnswerStream:
         """与 :meth:`answer` 同一套检索与提示，只是正文逐字产出。
 
@@ -310,13 +394,18 @@ class Answerer:
         :param game_id: 进哪个游戏知识库检索。
         :param version: 这次按哪个版本检索。空串表示没点名（回落 `current_version`）。
         :param current_version: 知识库标着的现行版本。
+        :param route: 这次走哪几路召回。理由同 :meth:`answer`。
         :raises ValueError: 问题为空。空问题会让检索查出任意一批切片。
         :raises ragamer.llm.LlmError: 生成失败。`deltas` 迭代到一半才炸是常事——
             这时已经吐出去的内容是收不回的，调用方应当把整轮丢掉而不是记半句。
         """
         require_question(question)
         sources = self._sources(
-            question, game_id=game_id, version=version, current_version=current_version
+            question,
+            game_id=game_id,
+            version=version,
+            current_version=current_version,
+            route=route,
         )
         if not sources:
             return AnswerStream((), (), iter((NOT_FOUND,)))
@@ -331,6 +420,7 @@ class Answerer:
         game_id: str,
         version: str,
         current_version: str,
+        route: Route | None,
     ) -> tuple[_Source, ...]:
         """检索、聚合父块、编号。**一条内容都没有时返回空元组**，不编造内容。
 
@@ -345,23 +435,32 @@ class Answerer:
             embedder=self.embedder,
             reranker=self.reranker,
             where=where,
+            route=route,
+            llm=self.llm,
+            search=self.search,
         )
-        if not found:
+        # 聚合在截断之后：先由断崖定下哪些文档进得来，再按文档把兄弟切片一次查齐
+        blocks = (
+            aggregate_parents(found.hits, game_id=game_id, chunks=self.chunks, where=where)
+            if found.hits
+            else ()
+        )
+        if found.hits and not blocks:
+            # 命中了却一条都回查不出来：索引与数据对不上。这种时候不该
+            # 悄悄换成联网那批顶上——那是两种完全不同的故障，混在一起就查不出了
+            logger.warning(
+                "提问 %r 命中 %d 条切片却聚合不出父块，按检索不到处理", question, len(found.hits)
+            )
+        sources = _numbered(blocks, found.web)
+        if not sources:
             logger.info("提问 %r 没检索到内容，回明确回复，不调模型", question)
             return ()
-        # 聚合在截断之后：先由断崖定下哪些文档进得来，再按文档把兄弟切片一次查齐
-        blocks = aggregate_parents(found, game_id=game_id, chunks=self.chunks, where=where)
-        if not blocks:
-            logger.warning(
-                "提问 %r 命中 %d 条切片却聚合不出父块，按检索不到处理", question, len(found)
-            )
-            return ()
-        sources = tuple(
-            _Source(Citation(index, block.doc_title, block.ancestor_path), block)
-            for index, block in enumerate(blocks, start=1)
-        )
         logger.info(
-            "提问 %r 命中 %d 条切片、聚成 %d 个父块，交给生成", question, len(found), len(sources)
+            "提问 %r 命中 %d 条切片、聚成 %d 个父块、另有 %d 条网络来源，交给生成",
+            question,
+            len(found.hits),
+            len(blocks),
+            len(found.web),
         )
         return sources
 
@@ -391,16 +490,26 @@ def _request(question: str, sources: Sequence[_Source]) -> LlmRequest:
 
 
 def _sources(sources: Sequence[_Source]) -> str:
-    """系统提示 = 约束 + 编号好的切片。
+    """系统提示 = 约束 + 编号好的资料。
 
     编号取自 `source.citation.index`，与随答案交回去的那批是同一个值——不是在这里
-    重新数一遍。
+    重新数一遍。网络来源那一行带 :data:`WEB_PREFIX`：模型据此在答案里交代出处
+    （`:data:`_INSTRUCTION` 里交代了这件事）。
     """
     parts = [
-        f"[{source.citation.index}] {source.citation.label}\n{_prompt_text(source.block)}"
+        f"[{source.citation.index}] {_mark(source.citation)}{source.citation.label}\n{source.text}"
         for source in sources
     ]
     return _INSTRUCTION + "\n\n".join(parts)
+
+
+def _mark(citation: Citation) -> str:
+    """资料清单里那一行的来路前缀。语料里查到的不标——标的是少数那一类。
+
+    判据取 `citation.origin` 而不是「url 是不是空串」：两者今天等价，但来源的判法
+    只该有一处（`Citation.origin`），在这里重写一遍就等着哪天两处对不上。
+    """
+    return WEB_PREFIX if citation.origin == "web" else ""
 
 
 def _warn_on_unknown_citations(text: str, given: int) -> None:

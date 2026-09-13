@@ -41,6 +41,7 @@ from ragamer.knowledge import list_knowledge_bases
 from ragamer.llm import LlmClient, Message
 from ragamer.logging import get_logger
 from ragamer.query import Understanding, understand
+from ragamer.routing import QueryType
 from ragamer.stores.base import ChunkStore, DocStore
 
 logger = get_logger(__name__)
@@ -123,6 +124,9 @@ class Resolved:
     game_id: str
     #: 这一轮按哪个版本过滤。空串表示没定下来，检索回落知识库的现行版本。
     version: str
+    #: 这个问题属于哪一类，决定这次走哪几路召回（`ragamer.routing`）。
+    #: **`None` 是「没判出来」**，路由侧按默认组合回落。
+    query_type: QueryType | None = None
 
 
 @dataclass(frozen=True)
@@ -157,6 +161,10 @@ class Pending:
     #: 已经定下来的版本。只有确定度过线的那种才带得走；问版本时它是要问的东西，留空。
     version: str
     choices: tuple[Choice, ...]
+    #: 判出来的查询类型，存 `QueryType` 的原样取值。恢复时要用它选路——不存的话，
+    #: 从暂停点继续的那一轮会退回默认组合，而那在答案上看不出来。
+    #: 这一条上线前写下的记录里没有这个键，读回来是空串，同样按默认组合走。
+    query_type: str = ""
 
     def payload(self) -> dict[str, Any]:
         """落库的形态。键名与 `_from_payload` 一一对应，两边一起改。"""
@@ -166,6 +174,7 @@ class Pending:
             "game_id": self.game_id,
             "version": self.version,
             "choices": [{"label": choice.label, "value": choice.value} for choice in self.choices],
+            "query_type": self.query_type,
         }
 
 
@@ -260,7 +269,12 @@ class Clarifier:
         resolved_version = self._version(understanding, versions, version)
         if resolved_version is None:
             return self._ask(understanding, VERSION, versions, game_id=resolved_game)
-        return Resolved(understanding.rewritten_query, resolved_game, resolved_version)
+        return Resolved(
+            understanding.rewritten_query,
+            resolved_game,
+            resolved_version,
+            understanding.query_type,
+        )
 
     def resolve(self, pending_id: str, label: str) -> Resolved:
         """从暂停点继续：用户点的那一项补进那次判定，交回这一次的落脚点。
@@ -280,7 +294,12 @@ class Clarifier:
         else:
             game_id, version = pending.game_id, choice.value
         logger.info("从暂停点 %s 继续：%s 取 %r", pending_id, pending.dimension, choice.value)
-        return Resolved(pending.rewritten_query, game_id, version)
+        return Resolved(
+            pending.rewritten_query,
+            game_id,
+            version,
+            QueryType(pending.query_type) if pending.query_type else None,
+        )
 
     def _game(
         self, understanding: Understanding, choices: Sequence[Choice], game_id: str
@@ -341,6 +360,7 @@ class Clarifier:
             game_id=game_id,
             version=version,
             choices=tuple(choices),
+            query_type=understanding.query_type.value if understanding.query_type else "",
         )
         self.docs.put(PENDING_COLLECTION, pending.pending_id, pending.payload())
         logger.info(
@@ -408,4 +428,5 @@ def _from_payload(pending_id: str, payload: Mapping[str, Any]) -> Pending:
             Choice(label=str(choice["label"]), value=str(choice["value"]))
             for choice in payload["choices"]
         ),
+        query_type=str(payload.get("query_type", "")),
     )

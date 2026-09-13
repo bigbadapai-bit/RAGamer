@@ -487,6 +487,8 @@ def test_暂停点里存着恢复所需的那几样():
             {"label": "黑神话·悟空", "value": GAME_ID},
             {"label": "燕云十六声", "value": OTHER_ID},
         ],
+        # 选路要它：恢复那一轮不再问一次模型，查询类型只能一并存下来
+        "query_type": "",
     }
     assert len(asker.llm.calls) == 1
 

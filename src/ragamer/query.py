@@ -1,7 +1,9 @@
-"""提问理解：读取侧的第一道处理，**一次调用**判定游戏、版本与规范问法。
+"""提问理解：读取侧的第一道处理，**一次调用**判定游戏、版本、规范问法与路由标签。
 
-三个结果出自同一次结构化调用（`docs/ARCHITECTURE.md` §3.1 的联合输出节点）。
+四个结果出自同一次结构化调用（`docs/ARCHITECTURE.md` §3.1 的联合输出节点）。
 拆成三次调用会各错各的、还不止一次网络往返——节点存在的理由就是不拆。
+路由标签尤其如此：它是整个改造里性价比最高的一处，把一个已有调用的输出从三个字段
+扩到四个，**没有新增任何模型调用**（§3.1）。
 
 两件容易做错的事，各有各的静默失效方式：
 
@@ -31,6 +33,12 @@ from pydantic import BaseModel, Field
 
 from ragamer.llm import LlmClient, LlmError, LlmRejected, LlmRequest, Message
 from ragamer.logging import get_logger
+from ragamer.routing import (
+    QUERY_TYPE_HINTS,
+    QUERY_TYPE_LABELS,
+    QueryType,
+    parse_query_type,
+)
 from ragamer.stores.base import ChunkFilter
 
 logger = get_logger(__name__)
@@ -59,6 +67,9 @@ class Understanding:
     game_confidence: float = 0.0
     #: 这个版本判断有多稳，0~1，模型自报。同上。
     version_confidence: float = 0.0
+    #: 这个问题属于哪一类，决定这次走哪几路召回（`ragamer.routing`）。
+    #: **`None` 是「没判出来」**，不是某一类：路由侧按事实型那一行回落，不阻断作答。
+    query_type: QueryType | None = None
 
 
 def understand(
@@ -69,7 +80,8 @@ def understand(
     versions: Sequence[str] = (),
     history: Sequence[Message] = (),
 ) -> Understanding:
-    """读一个问题：问的是哪款游戏、哪个版本、规范问法是什么。**只调一次模型。**
+    """读一个问题：问的是哪款游戏、哪个版本、规范问法是什么、属于哪一类。
+    **只调一次模型。**
 
     **不抛异常**：模型失败时按原问法降级，游戏与版本留空。
 
@@ -93,6 +105,14 @@ def understand(
         return degraded
     game = _pick(guess.game, games, what="游戏")
     version = _pick(guess.version, versions, what="版本")
+    kind = parse_query_type(guess.route)
+    if kind is None and guess.route.strip():
+        # 词表以外的标签与「按提示留了空串」不是一回事：后者是判不出，前者是提示词
+        # 与 schema 没对上或者模型跑偏了。判不出不报，跑偏要留痕——留痕的判据见
+        # `_JointOutput.route`：这个字段只在这一层失手时回落，不该连累另外三个。
+        logger.warning("模型判出的查询类型不在词表里，本次按默认组合走：%r", guess.route)
+    elif kind is None and "route" not in guess.model_fields_set:
+        logger.warning("模型没给查询类型（这个字段整个缺席），本次按默认组合走")
     return Understanding(
         game=game,
         version=version,
@@ -101,6 +121,7 @@ def understand(
         # 确定度走进「确定」那一支，然后拿着空游戏去检索
         game_confidence=guess.game_confidence if game else 0.0,
         version_confidence=guess.version_confidence if version else 0.0,
+        query_type=kind,
     )
 
 
@@ -186,8 +207,18 @@ def _instruction(games: Sequence[str], versions: Sequence[str]) -> str:
         f"{_candidates('游戏', games)}\n"
         f"{_candidates('版本', versions)}\n"
         "游戏与版本各自还要给一个 0 到 1 的确定度：问题里明确写了、没有第二种可能给 1 附近；"
-        "只是从上下文猜的、也可能不对，给 0.5 附近；判不出来时取值留空串、确定度给 0。"
+        "只是从上下文猜的、也可能不对，给 0.5 附近；判不出来时取值留空串、确定度给 0。\n"
+        f"{_query_type_options()}"
     )
+
+
+def _query_type_options() -> str:
+    """查询类型的可选值。叫法与典型问法都写上——只给名字，模型会在「事实型」与
+    「表格型」之间猜，而这两类问的都是数值。"""
+    options = "；".join(
+        f"{QUERY_TYPE_LABELS[kind]}（{QUERY_TYPE_HINTS[kind]}）" for kind in QueryType
+    )
+    return f"查询类型只能从这些里原样取一个：{options}；都不符就留空串。"
 
 
 def _candidates(what: str, values: Sequence[str]) -> str:
@@ -197,7 +228,16 @@ def _candidates(what: str, values: Sequence[str]) -> str:
 
 
 class _JointOutput(BaseModel):
-    """一次联合输出的全部字段。字段描述会随 schema 一起进提示词。"""
+    """一次联合输出的全部字段。字段描述会随 schema 一起进提示词。
+
+    `route` 是路由标签（`ragamer.routing.QueryType` 的一个）。它**有默认值，但缺席要
+    留痕**：整个返不回来时，联合输出那一步会以 `LlmInvalidOutput` 重试一次（错误带回去，
+    见 `ragamer.llm`），重试用尽就整套降级——为一个**本来就定义了回落**的字段赔上
+    游戏、版本、改写问法这三个没得回落的，不划算。
+
+    所以缺字段只有这一个字段自己吃亏，代价是「缺席」与「按提示留了空串」在 schema
+    层面分不开，得靠 `model_fields_set` 认——判据在 `understand` 里。
+    """
 
     game: str = Field(
         description="用户问的是哪款游戏，只能从候选里原样取一个；判断不出或候选里没有就留空串"
@@ -217,4 +257,8 @@ class _JointOutput(BaseModel):
     )
     rewritten_query: str = Field(
         description="改写后的规范问法：补齐指代的主体名，语义与原问题一致，不回答问题"
+    )
+    route: str = Field(
+        default="",
+        description="问题属于哪一类，只能从系统提示列出的几类里原样取一个；判断不出就留空串",
     )

@@ -10,6 +10,9 @@
   从上一轮看出来——所以历史进 `ragamer.query.understand`，检索用它吐出来的
   `rewritten_query`（「二郎神掉什么」）。会话里记下的仍是**用户的原话**：历史要给人看，
   改写是给检索用的中间产物。**版本不参与这一步的判定**，理由见 :meth:`Chat.ask`。
+- **走哪几路召回由查询类型决定**，类型是 `ragamer.query.understand` 那一次调用的产物
+  （多吐一个字段，不多一次调用）。组合本身是知识库里的一份配置（`ragamer.routing`），
+  这一层只负责把「判出来的类型」对到「这一类的组合」上再传下去。
 - **历史只进提问理解，不进生成**。生成拿到的是一句已经补全的问题加一批原文父块，
   引用因此永远指向语料。把上一轮的**答案**也塞进提示词，模型就有了一处引用不到的
   来源可以顺着往下编，而它看起来与真答案一模一样。
@@ -48,6 +51,7 @@ from ragamer.container import Container
 from ragamer.llm import Message
 from ragamer.logging import get_logger
 from ragamer.query import effective_version
+from ragamer.routing import DEFAULT_TABLE, QUERY_TYPE_LABELS, QueryType, RouteTable
 from ragamer.stores.base import DocStore
 
 logger = get_logger(__name__)
@@ -366,6 +370,8 @@ class Chat:
         current_version: str = "",
         pending_id: str = "",
         label: str = "",
+        games: Sequence[Game] = (),
+        routes: RouteTable = DEFAULT_TABLE,
     ) -> Iterator[Reply]:
         """问一句，逐字拿回答案：若干条 :class:`Status`，一个 :class:`Sources`，
         然后若干个 :class:`Delta`。
@@ -395,6 +401,12 @@ class Chat:
             这时 `question` 只用来记这一轮的用户原话，检索用的是暂停点里存着的改写问法。
         :param label: 用户点的那个候选项，原样回传。**必须是他当时看到的那些之一**，
             按钮之外的值当场报错而不是拿去检索（错的是请求，不是语料）。
+        :param games: 游戏候选（:data:`Game`，显示名与知识库 id 成对）。**显示名是用户
+            问句里会出现的那种写法**——知识库 id 是 collection 名，只能是英文标识符，
+            拿 id 当候选，模型只会把「黑神话」判成不在候选里。判出来的显示名在这里换回
+            id；没有候选、或者判不出来，都回落会话选定的知识库。
+        :param routes: 这个知识库的路由表（`ragamer.routing`）。库里配了就传配的那份，
+            不传就用默认表——组合是每个库一份的配置，与打标词表同一个姿势。
         :raises ConversationNotFound: 没有这个会话。
         :raises ValueError: 问题为空。空问题会让检索查出任意一批切片。
         :raises ragamer.clarifying.UnknownPending: 没有这个暂停点。
@@ -409,6 +421,8 @@ class Chat:
             current_version=current_version,
             pending_id=pending_id,
             label=label,
+            games=games,
+            routes=routes,
         )
 
     def _replies(
@@ -420,6 +434,8 @@ class Chat:
         current_version: str,
         pending_id: str = "",
         label: str = "",
+        games: Sequence[Game],
+        routes: RouteTable,
     ) -> Iterator[Reply]:
         """把这一轮从头做到尾，**每一步之前先报一条进度**，最后收完正文才落库。
 
@@ -431,6 +447,7 @@ class Chat:
         就结束，不检索、不生成、也不落库。用户点完候选再发一次请求（带 `pending_id`），
         那一轮才算走完——所以「反问过的提问」在会话里只留下最终那一问一答，
         不会先留一条等不到回复的提问。
+        选路夹在理解与检索之间，**没有自己的进度条**：它是一次字典查表，不是一段等待。
 
         迭代器被丢掉时（客户端断开）最后那一行写不进会话——这正是要的效果：
         已经吐出去的那半句与它那批引用一起消失，历史里不留痕迹。
@@ -451,11 +468,13 @@ class Chat:
                 return
             resolved = outcome
         yield Status("正在检索资料")
+        route = routes.route_for(resolved.query_type)
         stream = self.answerer.stream(
             resolved.rewritten_query,
             game_id=resolved.game_id,
             version=resolved.version,
             current_version=current_version,
+            route=route,
         )
         sources = Sources(
             stream.citations,
@@ -463,12 +482,14 @@ class Chat:
             effective_version(resolved.version, current_version=current_version),
         )
         logger.info(
-            "会话 %s 提问 %r（改写为 %r），版本 %r，用上 %d 条来源",
+            "会话 %s 提问 %r（改写为 %r，类型 %s），版本 %r，走 %s，用上 %d 条来源",
             conversation.session_id,
             question,
             resolved.rewritten_query,
+            _type_name(resolved.query_type),
             sources.version,
-            len(sources.citations),
+            "、".join(path.value for path in route.paths),
+            len(stream.citations),
         )
         yield sources
         yield Status("正在生成答案")
@@ -510,6 +531,8 @@ def build_chat(container: Container) -> ChatStack:
         embedder=container.embedder,
         reranker=container.reranker,
         llm=container.llm,
+        # 联网兜底那一路：没配就是 None，检索侧据此跳过它
+        search=container.search,
     )
     cache = CachedAnswerer(answers=answers, cache=container.cache)
     return ChatStack(
@@ -534,6 +557,27 @@ def _history(turns: Sequence[Turn]) -> tuple[Message, ...]:
     担心切出半轮——会话里本来就是成对写的（见 `_appended`）。
     """
     return tuple(Message(turn.role, turn.content) for turn in turns[-HISTORY_TURNS * 2 :])
+
+
+def _type_name(query_type: QueryType | None) -> str:
+    """日志里那个类型名的写法。
+
+    「判不出」与「判成了事实型」要分得开：两者的走法一样（都按事实型那一行），
+    但一个是提示词没判出来、一个是真的判成了这一类，排查时看的是不同的地方。
+    """
+    return "判不出" if query_type is None else QUERY_TYPE_LABELS[query_type]
+
+
+def _game_id(picked: str, games: Sequence[Game]) -> str:
+    """理解那一步判出的显示名换回知识库 id。判不出来就留空，由调用方回落。
+
+    `understand` 已经把候选之外的取值丢掉了，所以这里对不上只剩一种可能：
+    调用方压根没给候选。那种情况下留空是对的——宁可用会话选定的知识库，
+    也不要拿一个换不出 id 的名字去检索。
+    """
+    if not picked:
+        return ""
+    return next((game_id for name, game_id in games if name == picked), "")
 
 
 def _appended(

@@ -19,6 +19,7 @@ from ragamer.query import (
     understand,
     version_filter,
 )
+from ragamer.routing import QUERY_TYPE_LABELS, QueryType
 from ragamer.stores.base import UNVERSIONED, ChunkFilter, matches
 from ragamer.stores.memory import InMemoryChunkStore
 
@@ -35,6 +36,7 @@ JOINT_OUTPUT = {
     "version": "2.0",
     "version_confidence": 0.8,
     "rewritten_query": "二郎神怎么打",
+    "route": "攻略型",
 }
 
 
@@ -42,8 +44,8 @@ def _reply(**overrides: object) -> dict[str, object]:
     return {**JOINT_OUTPUT, **overrides}
 
 
-def test_一次调用同时拿回游戏版本与规范问法():
-    """几个结果出自同一次调用。脚本只排了一条——真调第二次会当场炸（FakeLlm）。"""
+def test_一次调用同时拿回游戏版本规范问法与路由标签():
+    """四个结果出自同一次调用。脚本只排了一条——真调第二次会当场炸（FakeLlm）。"""
     llm = FakeLlm(_reply())
 
     result = understand(
@@ -54,7 +56,7 @@ def test_一次调用同时拿回游戏版本与规范问法():
         history=[Message("user", "二郎神是谁")],
     )
 
-    assert result == Understanding("黑神话·悟空", "2.0", "二郎神怎么打", 0.9, 0.8)
+    assert result == Understanding("黑神话·悟空", "2.0", "二郎神怎么打", 0.9, 0.8, QueryType.GUIDE)
     assert len(llm.calls) == 1
 
 
@@ -97,6 +99,69 @@ def test_确定度超出_0_到_1_时按模型返回不合规处理():
     result = understand("二郎神怎么打", llm=llm, games=GAMES, versions=VERSIONS)
 
     assert result == Understanding("", "", "二郎神怎么打")
+
+
+def test_路由标签也认模型吐回来的英文取值():
+    """提示词给的是中文叫法，而模型偶尔会把 schema 里的取值原样吐回来。
+
+    两种写法都认，比让这一条在两者之间随机失效要好——失效时是静默的：路由退回默认
+    组合，答案照样出得来，只是走的不是本该走的那几路。
+    """
+    llm = FakeLlm(_reply(route="tabular"))
+
+    assert understand("寒江雪的属性", llm=llm, games=GAMES).query_type is QueryType.TABULAR
+
+
+def test_路由标签不在词表里时判不出并留痕(caplog):
+    """判不出只是退回默认组合，**不牵连**另外三个字段，也不让整个提问失败。"""
+    llm = FakeLlm(_reply(route="玄学型"))
+
+    with caplog.at_level(logging.WARNING, logger="ragamer.query"):
+        result = understand("二郎神怎么打", llm=llm, games=GAMES, versions=VERSIONS)
+
+    assert result.query_type is None
+    assert result.game == "黑神话·悟空"
+    assert result.rewritten_query == "二郎神怎么打"
+    assert any("查询类型不在词表里" in record.getMessage() for record in caplog.records)
+
+
+def test_按提示留空串是判不出而不是认出个没见过的取值(caplog):
+    """提示词请模型判不出时留空串。那是一个明确答案，不该报成「不在词表里」——
+    真正的跑偏与「本来就没判出来」在排查时看的是不同的地方。"""
+    llm = FakeLlm(_reply(route=""))
+
+    with caplog.at_level(logging.WARNING, logger="ragamer.query"):
+        result = understand("那个很难的 BOSS 怎么过", llm=llm, games=GAMES)
+
+    assert result.query_type is None
+    assert not [record for record in caplog.records if "查询类型" in record.getMessage()]
+
+
+def test_模型整个漏掉查询类型时另外三个字段照用(caplog):
+    """字段**缺席**与「按提示留了空串」要分得开，而两者的走法一样（都回落默认组合）。
+
+    缺席只赔上它自己：`route` 有默认值，另外三个字段照常带走。把它们一起赔进去，
+    等于为一个本来就定义了回落的字段牺牲三个没得回落的——重试一次还好，重试用尽
+    就整套降级了。
+    """
+    llm = FakeLlm({key: value for key, value in JOINT_OUTPUT.items() if key != "route"})
+
+    with caplog.at_level(logging.WARNING, logger="ragamer.query"):
+        result = understand("二郎神怎么打", llm=llm, games=GAMES, versions=VERSIONS)
+
+    assert result == Understanding("黑神话·悟空", "2.0", "二郎神怎么打", 0.9, 0.8)
+    assert any("整个缺席" in record.getMessage() for record in caplog.records)
+
+
+def test_提示词里写全了六类问题():
+    """只给类型名不够：模型判「表格型」与「事实型」的界线时会猜，而这两类问的都是数值。
+    叫法与典型问法都要进提示词（与游戏、版本候选同一个姿势）。"""
+    llm = FakeLlm(_reply())
+
+    understand("二郎神怎么打", llm=llm, games=GAMES, versions=VERSIONS)
+
+    system = llm.calls[0].messages[0].content
+    assert all(QUERY_TYPE_LABELS[kind] in system for kind in QueryType)
 
 
 def test_指代被改写成带主体的规范问法():
