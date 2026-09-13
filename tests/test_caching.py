@@ -156,16 +156,16 @@ def test_命中时引用与图片一并回来():
 
 
 def test_命中时仍然逐字流式():
-    """缓存里的答案是一整段，一次吐出去就是「流式」在缓存路径上静默失效。"""
-    cached = reader(boss_chunks(), FakeLlm(LONG_REPLY))
-    cached.answer(QUESTION, game_id=GAME, version="1.0")
+    """缓存里的答案是一整段，一次吐出去就是「流式」在缓存路径上静默失效。
+    **粒度与引用都要与未命中那条路一样**——命中反而是最常走的那条路。"""
+    cached = reader(boss_chunks(), FakeLlm(LONG_REPLY, LONG_REPLY))
+    missed = cached.stream(QUESTION, game_id=GAME, version="1.0")
+    hit = cached.stream(QUESTION, game_id=GAME, version="1.0")
 
-    streamed = cached.stream(QUESTION, game_id=GAME, version="1.0")
-    pieces = list(streamed.text)
-
-    assert len(pieces) > 1
-    assert "".join(pieces) == LONG_REPLY
-    assert streamed.citations and streamed.images
+    assert list(hit.text) == list(missed.text)  # 假模型逐字，重放也逐字
+    assert len(list(replay(LONG_REPLY))) == len(LONG_REPLY)
+    assert hit.citations == missed.citations
+    assert hit.images == missed.images
 
 
 def test_未命中时边走边吐并把整段写回缓存():
@@ -357,31 +357,18 @@ def test_热门问题只数本游戏的():
     assert cached.top_questions(OTHER) == ()
 
 
-# --- 伪装流式的分片 ---
+# --- 伪装流式的粒度 ---
 
 
-def test_分片拼回去等于原文():
+def test_重放逐字_拼回去等于原文():
+    """粒度与未命中那条路取齐（那边吐的是模型的 delta），不是按短句成片地给。"""
     text = "先定身[1]。二阶段躲开红光，等它收招再上[2]。"
+    pieces = list(replay(text))
 
-    assert "".join(replay(text)) == text
-    assert len(list(replay(text))) > 1
-
-
-def test_长句在标点处再切一刀():
-    pieces = list(replay("，".join(["二郎神的打法"] * 10)))
-
-    assert len(pieces) > 1
-    assert "".join(pieces) == "，".join(["二郎神的打法"] * 10)
+    assert "".join(pieces) == text
+    assert all(len(piece) == 1 for piece in pieces)
+    assert len(pieces) == len(text)
 
 
-def test_一个标点都没有的长文本也分片():
-    """只有「遇到标点才切」是不够的：模型偶尔会写出一整段不带动点的文字，
-    那时它仍会一次性吐出来，缓存路径的「流式」也就白伪装了——所以还有一条兜底上限。"""
-    pieces = list(replay("二郎神的打法" * 40))
-
-    assert len(pieces) > 1
-    assert "".join(pieces) == "二郎神的打法" * 40
-
-
-def test_空答案不吐任何分片():
+def test_空答案不吐任何字():
     assert list(replay("")) == []
