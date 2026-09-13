@@ -367,12 +367,20 @@ def test_分片拼回去等于原文():
     assert len(list(replay(text))) > 1
 
 
-def test_没有句末标点的长句也分片():
-    """一段没有句末标点的长文本要被一次吐出来，缓存路径的「流式」就白伪装了。"""
+def test_长句在标点处再切一刀():
     pieces = list(replay("，".join(["二郎神的打法"] * 10)))
 
     assert len(pieces) > 1
     assert "".join(pieces) == "，".join(["二郎神的打法"] * 10)
+
+
+def test_一个标点都没有的长文本也分片():
+    """只有「遇到标点才切」是不够的：模型偶尔会写出一整段不带动点的文字，
+    那时它仍会一次性吐出来，缓存路径的「流式」也就白伪装了——所以还有一条兜底上限。"""
+    pieces = list(replay("二郎神的打法" * 40))
+
+    assert len(pieces) > 1
+    assert "".join(pieces) == "二郎神的打法" * 40
 
 
 def test_空答案不吐任何分片():

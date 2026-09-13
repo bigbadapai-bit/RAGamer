@@ -38,9 +38,12 @@ from ragamer.query import effective_version, normalize_query
 
 logger = get_logger(__name__)
 
-#: 伪装成流式时一片的字符数上限。一句话比它还长就从标点处再切一刀——
-#: 没有这一刀，一段没有句末标点的长文本会一次性吐出来，缓存路径的「流式」也就白伪装了。
+#: 伪装成流式时一片的字符数上限。一句话比它还长就从标点处再切一刀。
 MAX_PIECE_CHARS = 40
+
+#: 一片的兜底上限：到了这里还没遇到任何标点就硬切。没有它，一段不带动点的长文本
+#: （模型偶尔会这么写）仍会一次性吐出来，缓存路径的「流式」也就白伪装了。
+FORCED_PIECE_CHARS = 80
 
 #: 硬边界：句末标点与换行。切下来的分片带着标点，拼回去才是原文。
 _HARD_BREAK = "。！？!?…\n"
@@ -52,17 +55,31 @@ _SOFT_BREAK = "，,、；;：: "
 def replay(text: str) -> Iterator[str]:
     """把一条答案切成短句吐出来。**命中缓存时用它伪装成流式**（§4）。
 
-    分片之间不带等待：节奏是传输层的事（假模型逐字吐也是这个口径），
-    这一层只负责「不要退化成一次性返回」。
+    「逐字流式」这条验收口径按架构文档 §4 读作**按短句分片**：要的都是「不要退化成
+    一次性返回」（同一段答案，未命中时一个字一个字出来，命中时整段砸下来，界面上是
+    两种东西），而分片少一点，SSE 的事件也就少一点。
+
+    分片之间不带等待：节奏是传输层的事（假模型逐字吐也是这个口径）。
     """
     piece = ""
     for char in text:
         piece += char
-        if char in _HARD_BREAK or (len(piece) >= MAX_PIECE_CHARS and char in _SOFT_BREAK):
+        if _cut_here(piece, char):
             yield piece
             piece = ""
     if piece:
         yield piece
+
+
+def _cut_here(piece: str, char: str) -> bool:
+    """刚读进来的这个字是不是该收一片了。
+
+    三条：句末标点与换行随时切；一片到了兜底上限就硬切（哪怕正卡在词中间——
+    不切的话这段文本会一次性吐出去）；逗号顿号这类停顿处，只在已经够长时才切。
+    """
+    if char in _HARD_BREAK or len(piece) >= FORCED_PIECE_CHARS:
+        return True
+    return char in _SOFT_BREAK and len(piece) >= MAX_PIECE_CHARS
 
 
 @dataclass(frozen=True)
@@ -112,7 +129,7 @@ class CachedAnswerer:
             question, game_id=game_id, version=version, current_version=current_version
         )
         if key is not None:
-            self._write(key, CachedAnswer(answer.text, answer.citations, answer.images), question)
+            self._write(key, CachedAnswer.of(answer), question)
         return answer
 
     def stream(

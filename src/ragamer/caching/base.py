@@ -26,10 +26,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
-from ragamer.answering import Citation
+from ragamer.answering import Answer, Citation
 from ragamer.query import normalize_query
 
 #: 缓存键的根。提问计数那个 ZSET 另起一个根，**刻意不落在缓存前缀里**：
@@ -43,7 +44,8 @@ HOT_ROOT = "hot"
 TTL_SECONDS = 7 * 24 * 60 * 60
 
 #: 一个 ZSET 里最多记多少条热门问法。计数本身不设上限会长到没人看，
-#: 取前 N 条才是这个功能的产出。
+#: 取前 N 条才是这个功能的产出。**10 是没有依据的占位**（§11）：界面上能看几条、
+#: 看的人想看到第几名，都得先有真实数据才谈得上定，现在只是给列表一个上界。
 TOP_QUESTIONS = 10
 
 
@@ -102,6 +104,24 @@ def hot_key(game_id: str) -> str:
     return f"{HOT_ROOT}:{game_id}"
 
 
+def counted_question(rewritten_query: str) -> str | None:
+    """一条问法计入提问频次时的形态：归一后的问法；空问法没有可数的东西，返回 `None`。
+
+    内存假件与 Redis 适配器共用它——两边各自判断一次空串，就可能一边记一边不记。
+    """
+    asked = normalize_query(rewritten_query)
+    return asked or None
+
+
+def rank_questions(answers: Sequence[tuple[str, int]]) -> tuple[tuple[str, int], ...]:
+    """热门问法的次序：次数降序，次数相同按问法字典序。
+
+    两个实现共用它。存储那边的并列次序是它自己的（Redis 的 ZREVRANGE 按成员倒序），
+    排一遍才不随后端换实现而变——顺序是给人看的。
+    """
+    return tuple(sorted(answers, key=lambda item: (-item[1], item[0])))
+
+
 @dataclass(frozen=True)
 class CachedAnswer:
     """缓存里的一条答案。**整份结果**，不是一段文本。
@@ -114,6 +134,11 @@ class CachedAnswer:
     citations: tuple[Citation, ...] = ()
     #: 这条答案引到的图片地址，按首次出现的顺序去重。
     images: tuple[str, ...] = ()
+
+    @staticmethod
+    def of(answer: Answer) -> CachedAnswer:
+        """一次作答 → 缓存值。三个字段一起搬，别在调用点上一个个抄。"""
+        return CachedAnswer(answer.text, answer.citations, answer.images)
 
     @property
     def not_found(self) -> bool:
@@ -171,7 +196,7 @@ def _citation(item: object) -> Citation:
 
 @runtime_checkable
 class AnswerCache(Protocol):
-    """答案缓存的全部对外能力（架构文档模块 10）。
+    """答案缓存的全部对外能力（docs/ARCHITECTURE.md §4）。
 
     接口刻意做小：取、存、按游戏批量失效、记一次提问、列热门问法。**没有删除单条**——
     单条过期由 TTL 管，要动就是「这个游戏的语料变了」，那是前缀批量失效那一条。
@@ -201,5 +226,9 @@ class AnswerCache(Protocol):
     def top_questions(
         self, game_id: str, limit: int = TOP_QUESTIONS
     ) -> tuple[tuple[str, int], ...]:
-        """问得最多的问法，次数多的在前。次数相同按问法字典序，顺序才是确定的。"""
+        """问得最多的问法，次数多的在前。次数相同按问法字典序，顺序才是确定的。
+
+        并列且正好卡在第 `limit` 条上时，进来的是哪一条由存储定（两边都是先按分数取
+        前 N 条再排），这一条不承诺跨后端一致。
+        """
         ...

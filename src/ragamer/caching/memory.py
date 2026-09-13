@@ -17,10 +17,11 @@ from ragamer.caching.base import (
     TOP_QUESTIONS,
     TTL_SECONDS,
     CachedAnswer,
+    counted_question,
     game_prefix,
     hot_key,
+    rank_questions,
 )
-from ragamer.query import normalize_query
 
 
 class InMemoryAnswerCache:
@@ -53,8 +54,8 @@ class InMemoryAnswerCache:
         return len(keys)
 
     def record_question(self, game_id: str, rewritten_query: str) -> None:
-        asked = normalize_query(rewritten_query)
-        if not asked:
+        asked = counted_question(rewritten_query)
+        if asked is None:
             return
         self._counts.setdefault(hot_key(game_id), Counter())[asked] += 1
 
@@ -62,5 +63,4 @@ class InMemoryAnswerCache:
         self, game_id: str, limit: int = TOP_QUESTIONS
     ) -> tuple[tuple[str, int], ...]:
         counts = self._counts.get(hot_key(game_id), Counter())
-        ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
-        return tuple(ranked[:limit])
+        return rank_questions(counts.most_common(limit))

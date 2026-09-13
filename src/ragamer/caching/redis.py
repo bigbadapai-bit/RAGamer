@@ -24,13 +24,14 @@ from ragamer.caching.base import (
     TOP_QUESTIONS,
     TTL_SECONDS,
     CachedAnswer,
+    counted_question,
     game_prefix,
     hot_key,
+    rank_questions,
     unavailable,
 )
 from ragamer.config import RedisSettings
 from ragamer.logging import get_logger
-from ragamer.query import normalize_query
 from ragamer.redaction import redact_address
 
 logger = get_logger(__name__)
@@ -99,27 +100,22 @@ class RedisAnswerCache:
         return self._run(sweep)
 
     def record_question(self, game_id: str, rewritten_query: str) -> None:
-        asked = normalize_query(rewritten_query)
-        if not asked:
+        asked = counted_question(rewritten_query)
+        if asked is None:
             return
         self._run(lambda client: client.zincrby(self._name(hot_key(game_id)), 1, asked))
 
     def top_questions(
         self, game_id: str, limit: int = TOP_QUESTIONS
     ) -> tuple[tuple[str, int], ...]:
-        """问得最多的问法。并列时的次序由存储定（Redis 按成员字典序倒序），
-        所以这里自己按「次数降序、问法字典序」重排一遍——顺序是给人看的，
-        不该随后端换一个实现就变。"""
+        """问得最多的问法：先按分数取前 `limit` 条，再按共用的口径重排一遍
+        （并列时 Redis 给的是成员倒序，而顺序是给人看的）。"""
         pairs = self._run(
             lambda client: client.zrange(
                 self._name(hot_key(game_id)), 0, limit - 1, desc=True, withscores=True
             )
         )
-        ranked = sorted(
-            ((str(member), int(score)) for member, score in pairs),
-            key=lambda item: (-item[1], item[0]),
-        )
-        return tuple(ranked)
+        return rank_questions([(str(member), int(score)) for member, score in pairs])
 
     def _name(self, key: str) -> str:
         """带上命名空间的键。读写与按前缀删都过这里，三者不会各拼一遍。"""

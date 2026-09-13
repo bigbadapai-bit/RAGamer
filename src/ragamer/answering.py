@@ -41,6 +41,7 @@ from ragamer.llm import LlmClient, LlmRequest, Message
 from ragamer.logging import get_logger
 from ragamer.query import version_filter
 from ragamer.retrieval import ParentBlock, aggregate_parents, retrieve
+from ragamer.sources import image_refs
 from ragamer.stores.base import Chunk, ChunkStore
 from ragamer.vectors.base import Embedder, Reranker
 
@@ -67,9 +68,6 @@ _INSTRUCTION = (
 
 #: 正文里的引用编号。答案里出现范围之外的编号，指向的是一条不存在的来源。
 _MARKER = re.compile(r"\[(\d+)\]")
-
-#: 正文里的图片引用。图片地址是留在正文里的（§1.3），答案要把原图带回去就得从这儿取。
-_MD_IMAGE = re.compile(r"!\[[^\]]*\]\(\s*([^)\s]+)")
 
 
 @dataclass(frozen=True)
@@ -170,22 +168,22 @@ def _citations(sources: Sequence[_Source]) -> tuple[Citation, ...]:
     return tuple(source.citation for source in sources)
 
 
-def image_urls(sources: Sequence[_Source]) -> tuple[str, ...]:
+def _image_urls(sources: Sequence[_Source]) -> tuple[str, ...]:
     """交给生成的这批内容里出现过的图片地址，按首次出现的顺序去重。
 
     图片地址本来就留在正文里（§1.3：原图保留，供答案展示），所以这里是从**已经要
     交给模型的那批内容**里取，不是另查一次——另查一次就会与引用对不上。
     `content_meta` 也算：表格的长文本列整列降级在那里（§2.5），里面同样可以有图。
 
-    只认 Markdown 的 `![alt](地址)`：管道里的一切先归一成 md（ADR-0006）。
+    认什么样的图片引用由 `ragamer.sources.image_refs` 定，与补图那一层同一处正则。
     """
     return tuple(
         dict.fromkeys(
-            match.group(1)
+            url
             for source in sources
             for chunk in source.block.chunks
             for text in (chunk.content, chunk.content_meta)
-            for match in _MD_IMAGE.finditer(text)
+            for url in image_refs(text)
         )
     )
 
@@ -230,7 +228,7 @@ class Answerer:
             return Answer(NOT_FOUND, ())
         text = self.llm.complete(_request(question, sources))
         _warn_on_unknown_citations(text, len(sources))
-        return Answer(text, _citations(sources), image_urls(sources))
+        return Answer(text, _citations(sources), _image_urls(sources))
 
     def stream_answer(
         self,
@@ -257,7 +255,7 @@ class Answerer:
         if not sources:
             return StreamingAnswer((), (), iter((NOT_FOUND,)))
         return StreamingAnswer(
-            _citations(sources), image_urls(sources), self._stream(question, sources)
+            _citations(sources), _image_urls(sources), self._stream(question, sources)
         )
 
     def _prepare(

@@ -22,6 +22,15 @@ from typing import Any, Protocol, runtime_checkable
 _IMAGE_REF = re.compile(r"!\[[^\]]*\]\(\s*([^)\s]+)")
 
 
+def image_refs(markdown: str) -> tuple[str, ...]:
+    """正文里的图片引用地址（`![alt](地址)`），按出现顺序，**不去重**。
+
+    补图那一层据此去取原图，生成那一层据此把原图随答案带回去
+    （`ragamer.answering`）——正则只有这一处，两边的口径不会各漂各的。
+    """
+    return tuple(_IMAGE_REF.findall(markdown))
+
+
 @dataclass(frozen=True)
 class SourceDocument:
     """一份待导入的原始资料：文件名 + 字节。
@@ -97,7 +106,7 @@ class MarkdownParser:
                 "PDF 与图片走 MinerU、网页走爬虫，两条路都还没接上"
             )
         markdown = _decode(source)
-        return NormalizedDoc(markdown=markdown, images=tuple(_IMAGE_REF.findall(markdown)))
+        return NormalizedDoc(markdown=markdown, images=image_refs(markdown))
 
 
 def _decode(source: SourceDocument) -> str:
