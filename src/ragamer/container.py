@@ -7,6 +7,9 @@
 **三个模型都不进自检**——两个本地模型的权重是几个 G，要等第一次真的用到时才加载；
 语言模型则要发一次网络请求，那是运行期的事。自检卡在这些上面，
 `ragamer` 这条命令就没法当"配置对不对"的快速检查用了。
+
+**缓存也不进自检**，理由不同：它不通的后果只是「这次没缓存可用」，而自检失败会拦住
+进程起来。少了缓存不该拦住任何事，所以它是唯一一个连不上也不影响作答的外部依赖。
 """
 
 from __future__ import annotations
@@ -14,6 +17,8 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from ragamer.caching.base import AnswerCache
+from ragamer.caching.redis import RedisAnswerCache
 from ragamer.config import Settings
 from ragamer.llm import LlmClient, OpenAiLlm
 from ragamer.logging import get_logger
@@ -45,9 +50,11 @@ class Container:
     reranker: Reranker
     #: 语言模型。打标兜底、查询路由、多查询改写、生成都走它。
     llm: LlmClient
+    #: 答案缓存与提问计数。**不在 `stores()` 里**，见模块说明。
+    cache: AnswerCache
 
     def stores(self) -> tuple[Store, ...]:
-        """三个存储服务，自检按这个顺序走。"""
+        """三个存储服务，自检按这个顺序走。缓存不在这里：它不通不影响作答。"""
         return (self.chunks, self.docs, self.objects)
 
     def check(self) -> None:
@@ -87,6 +94,7 @@ def build_container(settings: Settings) -> Container:
         chunks=MilvusChunkStore(settings.milvus, timeout=timeout),
         docs=MongoDocStore(settings.mongo, timeout=timeout),
         objects=MinioObjectStore(settings.minio, timeout=timeout),
+        cache=RedisAnswerCache(settings.redis, timeout=timeout),
         embedder=BgeM3Embedder(settings.embed, settings.models),
         reranker=BgeReranker(settings.rerank, settings.models),
         llm=OpenAiLlm(settings.llm),

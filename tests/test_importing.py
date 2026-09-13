@@ -11,6 +11,8 @@ import logging
 import pytest
 
 from ragamer import importing
+from ragamer.answering import Citation
+from ragamer.caching import CachedAnswer, CacheUnavailableError, InMemoryAnswerCache, cache_key
 from ragamer.chunking import Chunk, ChunkRules
 from ragamer.importing import (
     Importer,
@@ -418,3 +420,81 @@ def test_版本原样落库(version):
     make_importer(chunks).import_one(markdown(), game_id=GAME, version=version)
 
     assert {chunk.version for chunk in stored(chunks, version=version)} == {version}
+
+
+# --- 缓存失效 ---
+
+
+class RecordingCache(InMemoryAnswerCache):
+    """记下每一次按前缀删，其余行为与内存假件一致。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.invalidated: list[str] = []
+
+    def invalidate(self, game_id: str) -> int:
+        self.invalidated.append(game_id)
+        return super().invalidate(game_id)
+
+
+class UnreachableCache(RecordingCache):
+    """一个连不上的缓存：按前缀删会抛「不可达」。"""
+
+    def invalidate(self, game_id: str) -> int:
+        self.invalidated.append(game_id)
+        raise CacheUnavailableError("Redis", "redis.test:6379", 5.0, "连接被拒绝")
+
+
+def test_导入完成后按游戏前缀清缓存():
+    """语料变了，基于旧语料的答案不该再命中（架构文档 §4）。"""
+    cache = RecordingCache()
+    cached_answer = CachedAnswer("先定身再贴身输出[1]。", (Citation(1, "二郎神", ""),))
+    cache.set(cache_key(GAME, UNVERSIONED, "二郎神怎么打"), cached_answer)
+
+    make_importer(cache=cache).batch([markdown()], game_id=GAME)
+
+    assert cache.invalidated == [GAME]
+    assert cache.get(cache_key(GAME, UNVERSIONED, "二郎神怎么打")) is None
+
+
+def test_一个文件都没成时不清缓存():
+    """库里什么都没变，删了只是让一批热问题白重算一遍。"""
+    cache = RecordingCache()
+    importer = make_importer(cache=cache)
+
+    results = importer.batch([SourceDocument(filename="攻略.pdf", data=b"%PDF-1.7")], game_id=GAME)
+
+    assert not any(result.ok for result in results)
+    assert cache.invalidated == []
+
+
+def test_一批里有一个成功就清缓存():
+    cache = RecordingCache()
+
+    make_importer(cache=cache).batch(
+        [SourceDocument(filename="攻略.pdf", data=b"%PDF-1.7"), markdown()], game_id=GAME
+    )
+
+    assert cache.invalidated == [GAME]
+
+
+def test_缓存清不掉不影响这一批的结果(caplog):
+    """导入本身已经成功了，缓存的账是另一本——缓存不通时照常作答，只是下次仍要重算。"""
+    chunks = InMemoryChunkStore()
+
+    with caplog.at_level(logging.WARNING):
+        results = make_importer(chunks, cache=UnreachableCache()).batch([markdown()], game_id=GAME)
+
+    assert results[0].ok
+    assert stored(chunks)
+    assert "没清掉" in caplog.text
+
+
+def test_没接缓存时照常导入():
+    """没接缓存就没有要失效的东西，这一步整个不做。"""
+    chunks = InMemoryChunkStore()
+
+    results = make_importer(chunks).batch([markdown()], game_id=GAME)
+
+    assert results[0].ok
+    assert stored(chunks)

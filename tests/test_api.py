@@ -12,7 +12,9 @@ import logging
 import pytest
 from fastapi.testclient import TestClient
 
+from ragamer.answering import Citation
 from ragamer.api import KB_COLLECTION, create_app
+from ragamer.caching import CachedAnswer, cache_key
 from ragamer.stores.base import UNVERSIONED
 
 from .conftest import make_container
@@ -231,6 +233,22 @@ def test_一批的条数按文件算(client):
 
     assert (payload["imported"], payload["failed"]) == (2, 0)
     assert [result["filename"] for result in payload["results"]] == ["甲.md", "乙.md"]
+
+
+# --- 导入后清缓存 ---
+
+
+def test_导入完成后清掉这个游戏的缓存(client, container):
+    """缓存接在导入编排器上：语料变了，基于旧语料的答案不该再命中（架构文档 §4）。"""
+    stale = CachedAnswer("先定身再贴身输出[1]。", (Citation(1, "二郎神", ""),))
+    container.cache.set(cache_key(GAME, "1.0", "二郎神怎么打"), stale)
+    container.cache.set(cache_key("wuthering_waves", "1.0", "今汐怎么养"), stale)
+
+    import_articles(client, upload("二郎神.md"))
+
+    assert container.cache.get(cache_key(GAME, "1.0", "二郎神怎么打")) is None
+    # 另一款游戏的缓存不牵连：前缀带的那一段把两款游戏隔开了
+    assert container.cache.get(cache_key("wuthering_waves", "1.0", "今汐怎么养")) is not None
 
 
 # --- 库与游戏 ---

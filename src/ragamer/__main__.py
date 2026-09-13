@@ -34,6 +34,8 @@ def describe(settings: Settings) -> str:
             f"minio: endpoint={redact_address(settings.minio.endpoint)}"
             f" bucket={settings.minio.bucket}"
             f" secure={settings.minio.secure} access_key=已配置 secret_key=已配置",
+            # 缓存不进自检，但仍然报出来。连接串里可能内嵌密码，只报「已配置」
+            f"redis: url=已配置 prefix={settings.redis.prefix}",
             f"llm: base_url={redact_address(settings.llm.base_url)} model={settings.llm.model}"
             " api_key=已配置",
             f"models: device={settings.models.device} fp16={settings.models.fp16}",

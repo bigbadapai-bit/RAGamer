@@ -13,6 +13,8 @@
   路径」一起进提示词，也一起随答案交回。没有引用的答案是一段无从核对的话——
   用户没法知道它是切片里写的还是模型编的。编号对不对得上由「引用与内容同批同序」
   保证：两者绑在同一个 :class:`_Source` 里，不是两个各排一遍的序列。
+- **答案还要带图片地址**。图片留在正文里（§1.3），从交给模型的那批内容里取出来随答案
+  交回，用户才不必跳出去找原图。它跟着引用走，不是另一次检索。
 - **检索不到就直说**。候选一条都没有时**不调模型**：没有内容可依据，让它自由发挥
   只会得到一段编造的游戏攻略，而且看起来和真答案一样。回复是这里的常量。
 - **生成失败照抛**：没有答案就是没有答案。降级成一段「抱歉我答不上来」会把故障
@@ -31,7 +33,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 
 from ragamer.chunking import PATH_SEPARATOR
@@ -65,6 +67,9 @@ _INSTRUCTION = (
 
 #: 正文里的引用编号。答案里出现范围之外的编号，指向的是一条不存在的来源。
 _MARKER = re.compile(r"\[(\d+)\]")
+
+#: 正文里的图片引用。图片地址是留在正文里的（§1.3），答案要把原图带回去就得从这儿取。
+_MD_IMAGE = re.compile(r"!\[[^\]]*\]\(\s*([^)\s]+)")
 
 
 @dataclass(frozen=True)
@@ -115,10 +120,31 @@ class Answer:
 
     `citations` 为空即「没有检索到内容」，这时 `text` 是 `NOT_FOUND` 那段常量。
     调用方不必另外判断有没有答案——空引用就是那个信号。
+
+    `images` 是交给生成的那批内容里出现过的图片地址：答案里要能直接展示原图，
+    用户不必跳出去找（用户故事 52）。它是**跟着引用走**的，不是另一次检索的结果。
     """
 
     text: str
     citations: tuple[Citation, ...]
+    images: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class StreamingAnswer:
+    """一次作答的流式形态：正文一片片出来，引用与图片在第一个字之前就已确定。
+
+    引用与图片之所以能提前给出，是因为检索在生成之前——不必等答案写完才知道它出自哪里。
+    两者与正文放在同一层返回，而不是各成一路：分开成两个平行序列就得靠调用方保证
+    两边对得上，对不上时是静默的（引用指向另一段正文）。
+
+    `text` 是一个生成器：**消费它才会真的去走模型**（未命中缓存时），也可能一次都不走
+    （命中缓存后重放，或压根没检索到内容）。
+    """
+
+    citations: tuple[Citation, ...]
+    images: tuple[str, ...]
+    text: Iterator[str]
 
 
 def _prompt_text(block: ParentBlock) -> str:
@@ -137,6 +163,31 @@ def _chunk_text(chunk: Chunk) -> str:
     """
     meta = chunk.content_meta.strip()
     return f"{chunk.content}\n{meta}" if meta else chunk.content
+
+
+def _citations(sources: Sequence[_Source]) -> tuple[Citation, ...]:
+    """编号好的这批来源，顺序即交给模型的顺序。"""
+    return tuple(source.citation for source in sources)
+
+
+def image_urls(sources: Sequence[_Source]) -> tuple[str, ...]:
+    """交给生成的这批内容里出现过的图片地址，按首次出现的顺序去重。
+
+    图片地址本来就留在正文里（§1.3：原图保留，供答案展示），所以这里是从**已经要
+    交给模型的那批内容**里取，不是另查一次——另查一次就会与引用对不上。
+    `content_meta` 也算：表格的长文本列整列降级在那里（§2.5），里面同样可以有图。
+
+    只认 Markdown 的 `![alt](地址)`：管道里的一切先归一成 md（ADR-0006）。
+    """
+    return tuple(
+        dict.fromkeys(
+            match.group(1)
+            for source in sources
+            for chunk in source.block.chunks
+            for text in (chunk.content, chunk.content_meta)
+            for match in _MD_IMAGE.finditer(text)
+        )
+    )
 
 
 @dataclass(frozen=True)
@@ -172,6 +223,56 @@ class Answerer:
         :raises ValueError: 问题为空。空问题会让检索查出任意一批切片。
         :raises ragamer.llm.LlmError: 生成失败。没有答案就是没有答案，不降级。
         """
+        sources = self._prepare(
+            question, game_id=game_id, version=version, current_version=current_version
+        )
+        if not sources:
+            return Answer(NOT_FOUND, ())
+        text = self.llm.complete(_request(question, sources))
+        _warn_on_unknown_citations(text, len(sources))
+        return Answer(text, _citations(sources), image_urls(sources))
+
+    def stream_answer(
+        self,
+        question: str,
+        *,
+        game_id: str,
+        version: str = "",
+        current_version: str = "",
+    ) -> StreamingAnswer:
+        """与 :meth:`answer` 同一条路，只是正文逐字流出来。
+
+        两条路的取内容与编号完全一致（共用 :meth:`_prepare`）：同一个问题走不走流式，
+        拿到的引用与图片必须是同一批，否则缓存命中与否会给出两种结果。
+
+        **只在真的有内容可依据时才调模型**：没有检索到时吐出的就是 `NOT_FOUND`
+        那一段常量（与 :meth:`answer` 同一个），不编一个答案。
+
+        :raises ValueError: 问题为空。
+        :raises ragamer.llm.LlmError: 生成失败。流到一半失败也照抛——半个答案比报错难查。
+        """
+        sources = self._prepare(
+            question, game_id=game_id, version=version, current_version=current_version
+        )
+        if not sources:
+            return StreamingAnswer((), (), iter((NOT_FOUND,)))
+        return StreamingAnswer(
+            _citations(sources), image_urls(sources), self._stream(question, sources)
+        )
+
+    def _prepare(
+        self,
+        question: str,
+        *,
+        game_id: str,
+        version: str,
+        current_version: str,
+    ) -> tuple[_Source, ...] | None:
+        """检索、聚合、编号。没有内容可依据时返回 `None`。
+
+        返回 `None` 的两条路各自留痕：候选一条都没检到，以及命中了却按文档回查不出父块
+        （索引与数据对不上）。两种情况下手里都没有内容，不调模型。
+        """
         if not question.strip():
             raise ValueError("问题不能为空：空问题会让检索查出任意一批切片，答案也就是编的")
         where = version_filter(version, current_version=current_version)
@@ -185,15 +286,14 @@ class Answerer:
         )
         if not found:
             logger.info("提问 %r 没检索到内容，回明确回复，不调模型", question)
-            return Answer(NOT_FOUND, ())
+            return None
         # 聚合在截断之后：先由断崖定下哪些文档进得来，再按文档把兄弟切片一次查齐
         blocks = aggregate_parents(found, game_id=game_id, chunks=self.chunks, where=where)
         if not blocks:
-            # 命中了却一条都回查不出来：索引与数据对不上。没有内容可依据时不调模型
             logger.warning(
                 "提问 %r 命中 %d 条切片却聚合不出父块，按检索不到处理", question, len(found)
             )
-            return Answer(NOT_FOUND, ())
+            return None
         sources = tuple(
             _Source(Citation(index, block.doc_title, block.ancestor_path), block)
             for index, block in enumerate(blocks, start=1)
@@ -201,9 +301,19 @@ class Answerer:
         logger.info(
             "提问 %r 命中 %d 条切片、聚成 %d 个父块，交给生成", question, len(found), len(sources)
         )
-        text = self.llm.complete(_request(question, sources))
-        _warn_on_unknown_citations(text, len(sources))
-        return Answer(text, tuple(source.citation for source in sources))
+        return sources
+
+    def _stream(self, question: str, sources: Sequence[_Source]) -> Iterator[str]:
+        """模型的流：一边吐一边攒，吐完才检查正文里有没有越界的编号。
+
+        越界编号只有拿到整段答案才判得出来，而流式恰恰不留全文——所以在这里攒一份。
+        调用方中途断开时这个生成器不会被走完，那次检查也就不做：没有答案可检查。
+        """
+        pieces: list[str] = []
+        for piece in self.llm.stream(_request(question, sources)):
+            pieces.append(piece)
+            yield piece
+        _warn_on_unknown_citations("".join(pieces), len(sources))
 
 
 def _request(question: str, sources: Sequence[_Source]) -> LlmRequest:

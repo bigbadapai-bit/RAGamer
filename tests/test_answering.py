@@ -280,6 +280,110 @@ def test_问题没点名版本时用知识库标的现行版本():
     assert "初版的打法" not in llm.calls[0].messages[0].content
 
 
+# --- 图片与流式 ---
+
+
+def test_答案带出内容里的图片地址():
+    """图片留在正文里（§1.3），随答案一起交回，用户不必跳出去找原图。
+    `content_meta` 里的也算：表格的长文本列整列降级在那里。"""
+    store = chunk_store(
+        GAME,
+        make_chunk(
+            1,
+            content="二郎神怎么打\n![打法](images/black_myth/boss.jpg)",
+            content_meta="| 图 | ![](images/black_myth/phase2.jpg) |",
+        ),
+    )
+    llm = FakeLlm(REPLY)
+
+    answer = answerer(store, llm).answer(QUESTION, game_id=GAME, version="1.0")
+
+    assert answer.images == (
+        "images/black_myth/boss.jpg",
+        "images/black_myth/phase2.jpg",
+    )
+
+
+def test_同一张图出现两次只交回一次():
+    store = chunk_store(
+        GAME,
+        make_chunk(1, content="二郎神怎么打\n![](images/black_myth/boss.jpg)", chunk_index=1),
+        make_chunk(2, content="![](images/black_myth/boss.jpg)", chunk_index=2),
+    )
+    llm = FakeLlm(REPLY)
+
+    answer = answerer(store, llm).answer(QUESTION, game_id=GAME, version="1.0")
+
+    assert answer.images == ("images/black_myth/boss.jpg",)
+
+
+def test_检索不到时没有图片与引用():
+    llm = FakeLlm()
+
+    answer = answerer(InMemoryChunkStore(), llm).answer(QUESTION, game_id=GAME, version="1.0")
+
+    assert answer.images == ()
+
+
+def test_流式一个字一个字吐出来():
+    """逐字：假模型默认一片一个字。"""
+    llm = FakeLlm(REPLY)
+
+    streamed = answerer(chunk_store(GAME, *BOSS_CHUNKS), llm).stream_answer(
+        QUESTION, game_id=GAME, version="1.0"
+    )
+    pieces = list(streamed.text)
+
+    assert "".join(pieces) == REPLY
+    assert len(pieces) == len(REPLY)
+    assert [citation.label for citation in streamed.citations] == ["二郎神"]
+
+
+def test_流式与不流式给出同一批引用与图片():
+    """两条路共用同一套取内容与编号：同一个问题走不走流式，拿到的必须是同一批，
+    否则缓存命中与否会给出两种结果。"""
+    store = chunk_store(
+        GAME,
+        make_chunk(1, content="二郎神怎么打\n![](images/black_myth/boss.jpg)"),
+    )
+
+    answer = answerer(store, FakeLlm(REPLY)).answer(QUESTION, game_id=GAME, version="1.0")
+    streamed = answerer(store, FakeLlm(REPLY)).stream_answer(QUESTION, game_id=GAME, version="1.0")
+
+    assert streamed.citations == answer.citations
+    assert streamed.images == answer.images
+
+
+def test_检索不到时流式不调模型():
+    """与不流式那条一样：没有内容可依据时不编一个答案，吐出来的就是那段常量。"""
+    llm = FakeLlm()  # 一条脚本都没排，真被调用会当场炸
+
+    streamed = answerer(InMemoryChunkStore(), llm).stream_answer(
+        QUESTION, game_id=GAME, version="1.0"
+    )
+
+    assert list(streamed.text) == [NOT_FOUND]
+    assert streamed.citations == ()
+    assert llm.calls == []
+
+
+def test_流式里出现范围外的编号也留痕(caplog):
+    """越界编号要拿到整段答案才判得出来，流式那一侧因此攒一份再检查。"""
+    llm = FakeLlm("先定身[1]，三阶段有隐藏机制[9]。")
+
+    with caplog.at_level(logging.WARNING):
+        list(
+            answerer(chunk_store(GAME, *BOSS_CHUNKS), llm)
+            .stream_answer(QUESTION, game_id=GAME, version="1.0")
+            .text
+        )
+
+    warnings = [
+        record.getMessage() for record in caplog.records if record.levelno == logging.WARNING
+    ]
+    assert any("[9]" in message for message in warnings)
+
+
 # --- 边界与失败 ---
 
 

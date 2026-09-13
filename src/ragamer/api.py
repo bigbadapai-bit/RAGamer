@@ -37,6 +37,8 @@ def create_app(container: Container) -> FastAPI:
         embedder=container.embedder,
         llm=container.llm,
         on_progress=_log_progress,
+        # 导入完成时按游戏前缀清缓存（架构文档 §4）：语料变了，基于旧语料的答案不该再命中
+        cache=container.cache,
     )
 
     @app.post("/api/kb/{game_id}/import")

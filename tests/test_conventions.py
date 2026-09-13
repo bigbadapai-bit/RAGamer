@@ -31,10 +31,11 @@ _ADAPTERS = {
     "BgeM3Embedder",
     "BgeReranker",
     "OpenAiLlm",
+    "RedisAnswerCache",
 }
 
-#: 供应商库只允许出现在各自的适配器模块里：其余模块只认 ragamer.stores 与
-#: ragamer.vectors 的协议，换后端、换模型都不动业务代码。
+#: 供应商库只允许出现在各自的适配器模块里：其余模块只认 ragamer.stores、
+#: ragamer.vectors 与 ragamer.caching 的协议，换后端、换模型都不动业务代码。
 #: 测试不在扫描范围内——造假件要用到供应商的异常类型。
 _VENDOR_MODULES = {
     "pymilvus": _PACKAGE / "stores" / "chunks.py",
@@ -43,6 +44,7 @@ _VENDOR_MODULES = {
     "urllib3": _PACKAGE / "stores" / "objects.py",
     # 真实模型是可选的 models 组，bge 里对它是懒导入（没装也能 import 本模块）
     "FlagEmbedding": _PACKAGE / "vectors" / "bge.py",
+    "redis": _PACKAGE / "caching" / "redis.py",
 }
 
 
@@ -68,6 +70,8 @@ def test_守则扫到了源码():
         "query.py",
         "retrieval.py",
         "answering.py",
+        "redis.py",
+        "answer.py",
         "api.py",
         "logging.py",
         "memory.py",

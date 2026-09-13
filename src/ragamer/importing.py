@@ -13,6 +13,9 @@
   二是**入库时按文档整体替换**，先删掉这份文档在这个版本下的旧切片再写。
   少了第二条，新一次切出来的片数变少时，只靠覆盖会留下一截旧切片——
   查得出来、还会进聚合父块，而且不报错。
+- **语料变了要让缓存失效**（`docs/ARCHITECTURE.md` §4）。缓存里存的是基于旧语料写出来的
+  答案，新资料进来之后它们可能已经不对了——而「不对」是看不出来的：同样的答案、
+  同样漂亮的引用。按 `cache:{游戏}:` 前缀批量删，是那儿唯一要动缓存的地方。
 """
 
 from __future__ import annotations
@@ -24,6 +27,7 @@ from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
 
+from ragamer.caching.base import AnswerCache, CacheError
 from ragamer.chunking import ChunkRules, chunk_document
 from ragamer.llm import LlmClient
 from ragamer.logging import get_logger
@@ -173,6 +177,8 @@ class Importer:
     #: 切分参数。不传用 `ChunkRules` 的默认值。
     rules: ChunkRules | None = None
     on_progress: ProgressCallback | None = None
+    #: 答案缓存。不传时这一步不做——没接缓存就没有要失效的东西，报出来反而是假动作。
+    cache: AnswerCache | None = None
 
     def batch(
         self,
@@ -196,7 +202,26 @@ class Importer:
             for number, source in enumerate(sources, start=1)
         )
         _warn_on_repeated_documents(results, version=version)
+        self._invalidate(game_id, results)
         return results
+
+    def _invalidate(self, game_id: str, results: Sequence[ImportResult]) -> None:
+        """这一批之后，把这个游戏的缓存按前缀批量删（架构文档 §4）。
+
+        **一个文件都没成时不删**：库里什么都没变，删了只是让一批热问题白重算一遍。
+        删失败也不影响这一批的结果——导入本身已经成功了，缓存的账是另一本；
+        缓存不通时照常作答，只是下次仍要重算（见 `ragamer.caching.answer`）。
+        """
+        if self.cache is None or not any(result.ok for result in results):
+            return
+        try:
+            deleted = self.cache.invalidate(game_id)
+        except CacheError as exc:
+            logger.warning(
+                "导入完成，但 %s 的缓存没清掉，下次提问仍可能命中旧答案：%s", game_id, exc
+            )
+            return
+        logger.info("导入完成，按前缀清掉 %s 的 %d 条缓存", game_id, deleted)
 
     def import_one(
         self,
