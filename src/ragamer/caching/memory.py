@@ -53,6 +53,13 @@ class InMemoryAnswerCache:
             del self._entries[key]
         return len(keys)
 
+    def drop(self, game_id: str) -> int:
+        """答案连提问计数一起删：与真实那边同一套口径（见协议里的说明）。"""
+        removed = self.invalidate(game_id)
+        if self._counts.pop(hot_key(game_id), None) is not None:
+            removed += 1
+        return removed
+
     def record_question(self, game_id: str, rewritten_query: str) -> None:
         asked = counted_question(rewritten_query)
         if asked is None:

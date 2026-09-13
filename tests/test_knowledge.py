@@ -13,11 +13,14 @@ from dataclasses import replace
 
 import pytest
 
+from ragamer.caching import CachedAnswer, CacheUnavailableError, InMemoryAnswerCache, cache_key
+from ragamer.conversations import CONVERSATIONS
 from ragamer.knowledge import (
     KB_COLLECTION,
     BrokenKnowledgeBase,
     KnowledgeBase,
     PurgeError,
+    PurgeInventory,
     UnknownKnowledgeBase,
     create_knowledge_base,
     list_knowledge_bases,
@@ -195,34 +198,83 @@ def test_改一个不存在的库时报错而不是凭空建一个(docs):
 # --- 删库 ---
 
 
+#: 删库要清四处，会话那一处存在哪个集合由调用方给（见 `ragamer.knowledge` 的模块说明）
+SESSIONS = CONVERSATIONS
+#: 一条缓存，用来验证「删库把缓存也清了」
+CACHED_KEY = cache_key(GAME, "1.0", "二郎神怎么打")
+
+
 def _stocked(container) -> None:
-    """一个建好、导过资料、存过原图的库。"""
+    """一个建好、导过资料、存过原图、聊过一句、缓存里有东西的库。"""
     create_knowledge_base(container.docs, KnowledgeBase.new(GAME, "黑神话·悟空"))
     container.chunks.upsert(GAME, [make_chunk(1), make_chunk(2)])
     container.objects.put(image_key(GAME, "a1b2", "立绘.png"), b"PNG")
+    container.docs.put(SESSIONS, "s1", {"game_id": GAME, "title": "二郎神怎么打"})
+    container.cache.set(CACHED_KEY, CachedAnswer("先定身再贴身输出[1]。"))
+    container.cache.record_question(GAME, "二郎神怎么打")
+
+
+def _purge(container, chunks=None, objects=None, cache=None) -> PurgeInventory:
+    """按四处清一遍。默认都用容器里那套，用例只覆盖自己关心的那一个。"""
+    return purge_knowledge_base(
+        chunks if chunks is not None else container.chunks,
+        container.docs,
+        objects if objects is not None else container.objects,
+        cache if cache is not None else container.cache,
+        GAME,
+        sessions=SESSIONS,
+    )
 
 
 def test_数一遍这个库在各处占着多少东西(container):
     """确认页照着它列「将要清理什么」，所以它自己必须先能数准，而且只读。"""
     _stocked(container)
 
-    inventory = purge_inventory(container.chunks, container.objects, GAME)
+    inventory = purge_inventory(
+        container.chunks, container.docs, container.objects, GAME, sessions=SESSIONS
+    )
 
-    assert (inventory.chunk_count, inventory.image_count) == (2, 1)
+    assert (inventory.chunk_count, inventory.image_count, inventory.session_count) == (2, 1, 1)
     # 数一遍不动任何数据
     assert container.chunks.count(GAME) == 2
     assert container.docs.get(KB_COLLECTION, GAME) is not None
+    assert container.docs.find(SESSIONS, {"game_id": GAME}) != []
 
 
-def test_删库把切片_原图与配置一并清掉(container):
+def test_删库把四处一并清掉(container):
+    """切片、原图、会话、缓存、配置——**一处都不能留**。
+
+    会话与缓存那两处漏掉的话，用同一个 id 重建库会把旧会话放回左栏、把旧的热门问题
+    顶回来，而引用的来源早就删了。
+    """
     _stocked(container)
 
-    inventory = purge_knowledge_base(container.chunks, container.docs, container.objects, GAME)
+    inventory = _purge(container)
 
-    assert (inventory.chunk_count, inventory.image_count) == (2, 1)
+    assert (inventory.chunk_count, inventory.image_count, inventory.session_count) == (2, 1, 1)
     assert container.chunks.count(GAME) == 0
     assert container.objects.list_keys(image_prefix(GAME)) == []
+    assert container.docs.find(SESSIONS, {"game_id": GAME}) == []
+    assert container.cache.get(CACHED_KEY) is None
+    # **提问计数也要清**：它不在缓存前缀里，只清答案那半截会留下旧库的热门问题
+    assert container.cache.top_questions(GAME) == ()
     assert container.docs.get(KB_COLLECTION, GAME) is None
+
+
+def test_删一个库不牵连别的库的会话与缓存(container):
+    """与「清前缀时不碰 id 是它前缀的另一个库」同一条道理，只是换到会话与缓存上。"""
+    sibling = f"{GAME}_2"
+    _stocked(container)
+    container.docs.put(SESSIONS, "s9", {"game_id": sibling, "title": "别个库的"})
+    other_key = cache_key(sibling, "1.0", "今汐怎么养")
+    container.cache.set(other_key, CachedAnswer("先堆暴击[1]。"))
+    container.cache.record_question(sibling, "今汐怎么养")
+
+    _purge(container)
+
+    assert [item["_id"] for item in container.docs.find(SESSIONS, {"game_id": sibling})] == ["s9"]
+    assert container.cache.get(other_key) is not None
+    assert container.cache.top_questions(sibling) != ()
 
 
 def test_一处清不掉时不跳过其余_并且配置留着(container):
@@ -230,10 +282,12 @@ def test_一处清不掉时不跳过其余_并且配置留着(container):
     _stocked(container)
 
     with pytest.raises(PurgeError, match="向量库") as caught:
-        purge_knowledge_base(BrokenChunkStore(), container.docs, container.objects, GAME)
+        _purge(container, chunks=BrokenChunkStore())
 
-    # 一次看清还差什么：向量库没清掉，原图照清
+    # 一次看清还差什么：向量库没清掉，原图、会话、缓存照清
     assert container.objects.list_keys(image_prefix(GAME)) == []
+    assert container.docs.find(SESSIONS, {"game_id": GAME}) == []
+    assert container.cache.get(CACHED_KEY) is None
     # 库还在列表上，可以重来
     assert container.docs.get(KB_COLLECTION, GAME) is not None
     assert GAME in str(caught.value)
@@ -243,12 +297,12 @@ def test_重来一次能把没清掉的补上(container):
     """上一处失败留下的状态是可重入的：已经清掉的那几处再清一次不出错。"""
     _stocked(container)
     with pytest.raises(PurgeError):
-        purge_knowledge_base(BrokenChunkStore(), container.docs, container.objects, GAME)
+        _purge(container, chunks=BrokenChunkStore())
 
-    inventory = purge_knowledge_base(container.chunks, container.docs, container.objects, GAME)
+    inventory = _purge(container)
 
-    # 原图上一轮已经清掉了，这一轮报 0；切片这一轮才清掉
-    assert (inventory.chunk_count, inventory.image_count) == (2, 0)
+    # 原图与会话上一轮已经清掉了，这一轮报 0；切片这一轮才清掉
+    assert (inventory.chunk_count, inventory.image_count, inventory.session_count) == (2, 0, 0)
     assert container.docs.get(KB_COLLECTION, GAME) is None
 
 
@@ -264,7 +318,24 @@ def test_不是存储错误的那种失败也保住配置(container):
     _stocked(container)
 
     with pytest.raises(PurgeError, match="对象存储"):
-        purge_knowledge_base(container.chunks, container.docs, ExplodingObjectStore(), GAME)
+        _purge(container, objects=ExplodingObjectStore())
+
+    assert container.docs.get(KB_COLLECTION, GAME) is not None
+
+
+class ExplodingCache(InMemoryAnswerCache):
+    """删缓存时炸的缓存。缓存连不上本该降级，但**删库这一路不能静默跳过**：
+    漏掉的那一处会让重建出来的库顶着旧库的答案与热门问题。"""
+
+    def drop(self, game_id: str) -> int:
+        raise CacheUnavailableError("Redis", "redis.test:6379", 5.0, "连接被拒绝")
+
+
+def test_缓存清不掉也保住配置(container):
+    _stocked(container)
+
+    with pytest.raises(PurgeError, match="缓存"):
+        _purge(container, cache=ExplodingCache())
 
     assert container.docs.get(KB_COLLECTION, GAME) is not None
 
@@ -277,8 +348,10 @@ def test_清前缀时不碰_id_是它前缀的另一个库(container):
     container.objects.put(image_key(sibling, "a1b2", "它的立绘.png"), b"PNG")
     container.chunks.upsert(sibling, [make_chunk(9, game_id=sibling)])
 
-    inventory = purge_inventory(container.chunks, container.objects, GAME)
-    purge_knowledge_base(container.chunks, container.docs, container.objects, GAME)
+    inventory = purge_inventory(
+        container.chunks, container.docs, container.objects, GAME, sessions=SESSIONS
+    )
+    _purge(container)
 
     assert inventory.image_count == 1  # 只数自己那一张
     assert container.objects.list_keys(image_prefix(sibling)) == [

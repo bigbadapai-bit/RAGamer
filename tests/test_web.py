@@ -17,6 +17,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from ragamer.app import create_app
+from ragamer.caching import CachedAnswer, cache_key
+from ragamer.conversations import CONVERSATIONS
 from ragamer.knowledge import (
     KB_COLLECTION,
     KnowledgeBase,
@@ -524,11 +526,23 @@ def test_配置读不了的库不让改术语映射(client, container):
 # --- 验收：删库前有确认，四处一并清理 ---
 
 
+#: 一个库名下的一条会话，用来验证删库把会话也清了
+SESSION_ID = "sessions-of-black-myth"
+#: 一条缓存，用来验证删库把缓存（含提问计数）也清了
+CACHED_KEY = cache_key(GAME, "1.0", "二郎神怎么打")
+
+
 def stocked(client, container) -> int:
-    """导一份资料、存两张原图，返回切片数。删库那几条要的就是「有东西可清」。"""
+    """导一份资料、存两张原图、聊过一句、缓存里有东西，返回切片数。
+
+    删库那几条要的就是「四处都有东西可清」——少铺一处，漏清那一处就测不出来。
+    """
     do_import(client)
     for name in ("立绘.png", "地图.png"):
         container.objects.put(image_key(GAME, "a1b2", name), b"PNG")
+    container.docs.put(CONVERSATIONS, SESSION_ID, {"game_id": GAME, "title": "二郎神怎么打"})
+    container.cache.set(CACHED_KEY, CachedAnswer("先定身再贴身输出[1]。"))
+    container.cache.record_question(GAME, "二郎神怎么打")
     return len(stored(container))
 
 
@@ -540,6 +554,9 @@ def test_删库前的确认页列出将要清理的东西与条数(client, conta
     assert "将要清理的数据" in page
     assert f"<strong>{count}</strong> 条切片" in page
     assert "<strong>2</strong> 个原图" in page
+    assert "<strong>1</strong> 条" in page  # 会话
+    assert "conversations" in page
+    assert "提问计数" in page  # 缓存那一处连热门问题一起清
     assert "knowledge_bases" in page
     assert "术语映射" in page
     assert "确认删除" in page
@@ -566,10 +583,14 @@ def test_删库把各处数据一并清掉_不留孤儿(client, container):
         "deleted": [GAME],
         "chunks": [str(count)],
         "images": ["2"],
+        "sessions": ["1"],
     }
-    # 三处存储里都问不到这个库的东西了
+    # 四处里都问不到这个库的东西了
     assert container.chunks.count(GAME) == 0
     assert container.objects.list_keys(image_prefix(GAME)) == []
+    assert container.docs.find(CONVERSATIONS, {"game_id": GAME}) == []
+    assert container.cache.get(CACHED_KEY) is None
+    assert container.cache.top_questions(GAME) == ()
     assert container.docs.get(KB_COLLECTION, GAME) is None
     # 列表页上也看不见了
     assert GAME not in client.get("/kb").text
@@ -582,7 +603,7 @@ def test_删完回列表页并说清清掉了多少(client, container):
     response = client.post(DELETE_URL, data={"confirm": "yes"}, follow_redirects=True)
 
     assert f"已删除知识库 {GAME}" in response.text
-    assert f"清掉 {count} 条切片、2 个原图" in response.text
+    assert f"清掉 {count} 条切片、2 个原图、1 条会话" in response.text
     assert "还没有知识库" in response.text
 
 

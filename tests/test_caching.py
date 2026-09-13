@@ -372,3 +372,48 @@ def test_重放逐字_拼回去等于原文():
 
 def test_空答案不吐任何字():
     assert list(replay("")) == []
+
+
+# --- 删库：连提问计数一起清 ---
+
+
+def test_删库把答案与提问计数一起清掉():
+    """`drop` 与 `invalidate` 分开是必须的：导入时也调后者，让计数器跟着走的话，
+    每导入一次资料，「大家都在问什么」就被清空一次。"""
+    cache = InMemoryAnswerCache()
+    cached = reader(boss_chunks(), FakeLlm(REPLY), cache=cache)
+    cached.answer(QUESTION, game_id=GAME, version="1.0")
+    cache.record_question(GAME, QUESTION)
+    assert cache.get(cache_key(GAME, "1.0", QUESTION)) is not None
+
+    cache.drop(GAME)
+
+    assert cache.get(cache_key(GAME, "1.0", QUESTION)) is None
+    assert cache.top_questions(GAME) == ()
+
+
+def test_导入时那一次失效不动提问计数():
+    """`invalidate` 是导入完成时调的：它只清答案，热门问题照旧——理由见 `AnswerCache.drop`。
+
+    问答那一步本身就会记一次数（命中与否都记），所以这里不必再手动记一次。
+    """
+    cache = InMemoryAnswerCache()
+    cached = reader(boss_chunks(), FakeLlm(REPLY), cache=cache)
+    cached.answer(QUESTION, game_id=GAME, version="1.0")
+
+    cache.invalidate(GAME)
+
+    assert cache.get(cache_key(GAME, "1.0", QUESTION)) is None
+    assert cache.top_questions(GAME) == ((QUESTION, 1),)
+
+
+def test_删库不牵连别的库的缓存与计数():
+    cache = InMemoryAnswerCache()
+    cached = reader(boss_chunks(), FakeLlm(REPLY, REPLY), cache=cache)
+    cached.answer(QUESTION, game_id=GAME, version="1.0")
+    cached.answer(QUESTION, game_id=OTHER, version="1.0")
+
+    cache.drop(GAME)
+
+    assert cache.get(cache_key(OTHER, "1.0", QUESTION)) is not None
+    assert cache.top_questions(OTHER) == ((QUESTION, 1),)

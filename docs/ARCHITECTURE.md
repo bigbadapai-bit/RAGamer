@@ -331,7 +331,7 @@ flowchart TB
 | 4 | 切分预览（只读） | 切片 + 祖先标题路径 + 标签 —— 把 `chunks.json` 渲染出来即可 |
 | 5 | 评测面板 | 见第七节（待定） |
 
-**不做** chunk 可视化编辑。**删库要清理四处**：Milvus collection + MinIO 前缀 + Mongo（会话 + 知识库元数据 + 术语映射）+ Redis 缓存。
+**不做** chunk 可视化编辑。**删库要清理四处**：Milvus collection + MinIO 前缀 + Mongo（会话 + 知识库元数据 + 术语映射）+ Redis 缓存。四处由 `ragamer.knowledge.purge_knowledge_base` **一处编排**，知识库配置排在最后删（它是「这个库还在」的凭据，前面哪一处没清干净就留着它，界面上还能再点一次）。缓存那一路走 `AnswerCache.drop`（答案 + 提问计数），**不是 `invalidate`**——后者导入完成时也调，顺手清计数就会让「大家在问什么」每导入一次被清空一次。
 
 聚合父块不在此列 —— 它是查出来的（见 2.5），不占独立存储。
 

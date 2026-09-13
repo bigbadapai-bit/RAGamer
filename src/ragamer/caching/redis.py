@@ -81,23 +81,35 @@ class RedisAnswerCache:
         """按前缀批量删。`SCAN` 游标扫，边扫边按批删，返回删掉的条数。
 
         提问计数那个 ZSET 不在这里的前缀里（`base.HOT_ROOT` 是另一个根），
-        所以一次导入不会把「大家都在问什么」一起抹掉。
+        所以一次导入不会把「大家都在问什么」一起抹掉。删库那一路见 `drop`。
         """
-        pattern = f"{self._name(game_prefix(game_id))}*"
+        return self._run(lambda client: self._sweep(client, game_prefix(game_id)))
 
-        def sweep(client: Redis) -> int:
-            deleted = 0
-            batch: list[str] = []
-            for key in client.scan_iter(match=pattern, count=SCAN_COUNT):
-                batch.append(key)
-                if len(batch) >= DELETE_BATCH:
-                    deleted += client.delete(*batch)
-                    batch.clear()
-            if batch:
+    def drop(self, game_id: str) -> int:
+        """答案连提问计数一起删。**只在删库时调**，理由见协议里的说明。"""
+        return self._run(
+            lambda client: (
+                self._sweep(client, game_prefix(game_id))
+                + client.delete(self._name(hot_key(game_id)))
+            )
+        )
+
+    def _sweep(self, client: Redis, prefix: str) -> int:
+        """按前缀扫着删。`SCAN` 游标扫，边扫边按批删，返回删掉的条数。
+
+        用 `SCAN` 而不是 `KEYS`：后者会把整个实例阻塞住，而缓存里可能就是几万条。
+        """
+        pattern = f"{self._name(prefix)}*"
+        deleted = 0
+        batch: list[str] = []
+        for key in client.scan_iter(match=pattern, count=SCAN_COUNT):
+            batch.append(key)
+            if len(batch) >= DELETE_BATCH:
                 deleted += client.delete(*batch)
-            return deleted
-
-        return self._run(sweep)
+                batch.clear()
+        if batch:
+            deleted += client.delete(*batch)
+        return deleted
 
     def record_question(self, game_id: str, rewritten_query: str) -> None:
         asked = counted_question(rewritten_query)

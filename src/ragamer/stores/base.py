@@ -310,6 +310,17 @@ class DocStore(Store, Protocol):
         """删一份文档；不存在也算成功。"""
         ...
 
+    def delete_where(self, collection: str, where: Mapping[str, Any]) -> int:
+        """按**等值条件**批量删，返回删掉的条数。**删库清会话走它**。
+
+        与 `find` 同一套等值语义（`matches_where`）。有它是因为一条一条 `delete` 要先把
+        id 全查回来再逐条发请求，几十上百条会话就是几十上百次往返；而这里一次就够，
+        条数还由存储自己数——**确认页数的与真删掉的因此是同一批东西**。
+
+        删不中任何一条时返回 0，不报错：**「本来就没有」与「删干净了」对调用方是同一件事**。
+        """
+        ...
+
     def list_ids(self, collection: str) -> list[str]:
         """列出该集合的全部文档 id，按字典序。"""
         ...

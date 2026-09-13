@@ -198,8 +198,9 @@ def _citation(item: object) -> Citation:
 class AnswerCache(Protocol):
     """答案缓存的全部对外能力（docs/ARCHITECTURE.md §4）。
 
-    接口刻意做小：取、存、按游戏批量失效、记一次提问、列热门问法。**没有删除单条**——
-    单条过期由 TTL 管，要动就是「这个游戏的语料变了」，那是前缀批量失效那一条。
+    接口刻意做小：取、存、按游戏批量失效、删掉整个游戏、记一次提问、列热门问法。
+    **没有删除单条**——单条过期由 TTL 管，要动就是「这个游戏的语料变了」，那是
+    `invalidate` 那一条；再要动就是「这个游戏没了」，那是 `drop` 那一条。
     """
 
     def get(self, key: str) -> CachedAnswer | None:
@@ -208,6 +209,18 @@ class AnswerCache(Protocol):
 
     def set(self, key: str, answer: CachedAnswer, *, ttl: int = TTL_SECONDS) -> None:
         """写一条缓存，带存活时间。按 key 覆盖。"""
+        ...
+
+    def drop(self, game_id: str) -> int:
+        """**这个库没了**：把它的缓存与提问计数一起删掉，返回删掉的键数。
+
+        与 :meth:`invalidate` 分开是必须的，不是啰嗦：导入完成时也调 `invalidate`，
+        而提问计数**刻意不在缓存前缀里**（见 :data:`HOT_ROOT`）——让 `invalidate` 顺手
+        把它清掉的话，每导入一次资料，「大家都在问什么」就被清空一次。
+
+        所以这条只在删库时调：那个库连同它的热门问题都已经不存在了，留着只会让
+        同一个 id 重建出来的新库顶着旧库的热门问题。
+        """
         ...
 
     def invalidate(self, game_id: str) -> int:

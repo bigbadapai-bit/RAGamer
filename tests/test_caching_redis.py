@@ -21,6 +21,7 @@ from ragamer.caching import (
     RedisAnswerCache,
     cache_key,
     game_prefix,
+    hot_key,
 )
 from ragamer.caching import redis as caching_redis
 from ragamer.config import RedisSettings
@@ -265,3 +266,35 @@ def test_空问法不计数(cache, redis_client):
     cache.record_question(GAME, "   ")
 
     assert client(redis_client).rankings == {}
+
+
+def test_删库时把答案与提问计数一起删(cache, redis_client):
+    """答案那一半走 `SCAN` 扫，计数那一半是另一个根下的一个键——两半一起收。
+
+    **扫描的模式不能顺手把 `hot:` 也匹配进来**：那样一次导入就会把热门问题清空。
+    """
+    other = "wuthering_waves"
+    cache.set(KEY, ANSWER)
+    cache.set(cache_key(other, "1.0", "今汐怎么养"), ANSWER)
+    cache.record_question(GAME, "二郎神怎么打")
+    cache.record_question(other, "今汐怎么养")
+    client = redis_client.instances[-1]
+
+    removed = cache.drop(GAME)
+
+    assert f"ragamer-test:{KEY}" not in client.strings
+    assert f"ragamer-test:{cache_key(other, '1.0', '今汐怎么养')}" in client.strings
+    assert f"ragamer-test:{hot_key(GAME)}" not in client.rankings
+    assert f"ragamer-test:{hot_key(other)}" in client.rankings
+    assert removed == 2  # 一条答案 + 那个 ZSET
+
+
+def test_导入那一次失效不碰提问计数(cache, redis_client):
+    cache.set(KEY, ANSWER)
+    cache.record_question(GAME, "二郎神怎么打")
+    client = redis_client.instances[-1]
+
+    cache.invalidate(GAME)
+
+    assert f"ragamer-test:{KEY}" not in client.strings
+    assert client.rankings[f"ragamer-test:{hot_key(GAME)}"] == {"二郎神怎么打": 1.0}

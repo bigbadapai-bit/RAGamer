@@ -459,3 +459,21 @@ def test_不传游标时与从前一样(memory_container):
 def test_建索引在内存上是空动作(memory_container):
     """内存里没有索引这回事——方法的契约是「幂等且不报错」，这里如实做到。"""
     memory_container.docs.ensure_indexes("conversations", (("game_id", 1), ("updated_at", -1)))
+
+
+def test_按条件批量删(memory_container):
+    """删库清会话走它：一条一条删要先把 id 全查回来，而这里一次就够，条数还由存储自己数。"""
+    docs = memory_container.docs
+    docs.put("conversations", "s1", {"game_id": "black_myth"})
+    docs.put("conversations", "s2", {"game_id": "black_myth"})
+    docs.put("conversations", "s3", {"game_id": "another_game"})
+
+    assert docs.delete_where("conversations", {"game_id": "black_myth"}) == 2
+
+    assert [document["_id"] for document in docs.find("conversations")] == ["s3"]
+
+
+def test_按条件删不中时返回零(memory_container):
+    """「本来就没有」与「删干净了」对调用方是同一件事，不报错。"""
+    assert memory_container.docs.delete_where("conversations", {"game_id": "没这个库"}) == 0
+    assert memory_container.docs.delete_where("还没有这个集合", {}) == 0

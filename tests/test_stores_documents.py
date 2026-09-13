@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Iterator
+from types import SimpleNamespace
 from typing import Any, ClassVar
 
 import pytest
@@ -48,6 +49,7 @@ class FakeCollection:
         self.calls: list[tuple[str, Any]] = []
         self.document: dict[str, Any] | None = None
         self.created_indexes: list[Any] = []
+        self.deleted_count = 0
 
     def create_index(self, keys: Any) -> None:
         self.created_indexes.append(keys)
@@ -63,6 +65,11 @@ class FakeCollection:
 
     def delete_one(self, filter: dict[str, Any]) -> None:
         self.calls.append(("delete_one", filter))
+
+    def delete_many(self, filter: dict[str, Any]) -> Any:
+        self.calls.append(("delete_many", filter))
+        # 真客户端回一个带 `deleted_count` 的结果对象，适配器读的就是它
+        return SimpleNamespace(deleted_count=self.deleted_count)
 
     def find(self, filter: dict[str, Any], projection: dict[str, Any] | None = None) -> FakeCursor:
         self.calls.append(("find", {"filter": filter, "projection": projection}))
@@ -304,3 +311,14 @@ def test_建索引按复合键的顺序落下去(store, mongo):
 
     collection = _client(mongo)["ragamer-test"]["conversations"]
     assert collection.created_indexes == [[("game_id", 1), ("updated_at", -1)]]
+
+
+def test_按条件批量删走一次_delete_many(store, mongo):
+    """一次发出去，条数由存储数回来——确认页数的与真删掉的是同一批。"""
+    store.check()  # 先连上，才拿得到那个假集合
+    collection = _client(mongo)["ragamer-test"]["conversations"]
+    collection.deleted_count = 1
+
+    assert store.delete_where("conversations", {"game_id": "black_myth"}) == 1
+
+    assert collection.calls == [("delete_many", {"game_id": "black_myth"})]

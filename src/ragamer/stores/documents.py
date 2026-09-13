@@ -107,6 +107,9 @@ class MongoDocStore:
     def ensure_indexes(self, collection: str, fields: Sequence[tuple[str, int]]) -> None:
         self._collection(collection).create_index(list(fields))
 
+    def delete_where(self, collection: str, where: Mapping[str, Any]) -> int:
+        return int(self._collection(collection).delete_many(dict(where)).deleted_count)
+
     def _connect(self) -> MongoClient:
         if self._client is None:
             timeout_ms = int(self._timeout * 1000)

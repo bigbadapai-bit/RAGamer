@@ -11,9 +11,13 @@ collection 名（ADR-0002），所以合法性校验直接复用 `collection_nam
 「配置读不了」与「库不存在」是两件事，这里分成两个异常：前者的数据坏了，后者是游戏选错了。
 `ragamer.api` 把它们映射成 422 与 404，界面把它们渲染成两句话——判断只在这一处做。
 
-**删库要清四处**（架构文档 §5）：向量库 collection、对象存储前缀、Mongo 里的配置与会话、
-缓存。会话（T16）与缓存（T21）的存储都已经就位，但 **`purge_knowledge_base` 还没接上这两处**
-——今天清的是前三处，删完库会话与缓存会留下来。补的时候各加一行，确认页那张清单也要跟着加。
+**删库要清四处**（架构文档 §5）：向量库 collection、对象存储前缀、Mongo 里的会话与配置、
+缓存。四处都在 `purge_knowledge_base` 里接上了，删完不留孤儿；确认页那张清单逐条列着它们
+将要清掉多少。
+
+**会话那个集合的名字由调用方给**（`sessions` 参数）：它由 `ragamer.conversations` 认领，
+而这一层反过来 import 它会成环（knowledge ← clarifying ← conversations）。名字是唯一需要
+从那边拿的东西——读写都走这个模块已经拿着的 `DocStore`。
 """
 
 from __future__ import annotations
@@ -22,6 +26,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Any
 
+from ragamer.caching.base import AnswerCache
 from ragamer.logging import get_logger
 from ragamer.stores.base import (
     UNVERSIONED,
@@ -218,6 +223,8 @@ class PurgeInventory:
 
     chunk_count: int
     image_count: int
+    #: 这个库名下的会话条数。
+    session_count: int
 
 
 class PurgeError(KnowledgeBaseError):
@@ -240,26 +247,48 @@ class PurgeError(KnowledgeBaseError):
         )
 
 
-def purge_inventory(chunks: ChunkStore, objects: ObjectStore, game_id: str) -> PurgeInventory:
+def purge_inventory(
+    chunks: ChunkStore,
+    docs: DocStore,
+    objects: ObjectStore,
+    game_id: str,
+    *,
+    sessions: str,
+) -> PurgeInventory:
     """数一遍这个库在各处占着多少东西。**只读**，不动任何数据。
 
     确认页在人按下「确认删除」之前调它。数不出来的话，那份确认就只剩一句「会删掉一些
     东西」——而删除是不可逆的，说清楚要删什么正是这一步的用处。
+
+    `sessions` 是会话所在的那个集合名，见模块说明。
     """
     return PurgeInventory(
         chunk_count=chunks.count(game_id),
         # 前缀带尾随斜杠：少了它会把 id 是它前缀的另一个库的原图也数进来（见 `image_folder`）
         image_count=len(objects.list_keys(image_folder(game_id))),
+        # **只取 `_id`**：一份会话的 `turns` 可能很长，为了一行数字把正文全读回来，
+        # 正是 `find` 的投影要避免的那件事
+        session_count=len(docs.find(sessions, {"game_id": game_id}, fields=("_id",))),
     )
 
 
 def purge_knowledge_base(
-    chunks: ChunkStore, docs: DocStore, objects: ObjectStore, game_id: str
+    chunks: ChunkStore,
+    docs: DocStore,
+    objects: ObjectStore,
+    cache: AnswerCache,
+    game_id: str,
+    *,
+    sessions: str,
 ) -> PurgeInventory:
     """把这个库在各处的数据清干净，**最后才删它自己的配置**。
 
-    前三处各自兜住失败，一处清了不跳过其余：一次就能看清还差什么，而不是修一处再删一次。
-    配置排在最后（且只有前面全清了才动它），失败时它就是重来的凭据，见 `PurgeError`。
+    **四处**（架构文档 §5）：向量库 collection、对象存储前缀、Mongo 里的会话与知识库配置、
+    缓存。前三处（会话也算一处存储）各自兜住失败，一处清了不跳过其余：一次就能看清还差什么，
+    而不是修一处再删一次。配置排在最后（且只有前面全清了才动它），失败时它就是重来的凭据，
+    见 `PurgeError`。
+
+    `sessions` 是会话所在的那个集合名，见模块说明。
 
     **兜住的是全部异常，不只是 `StoreError`**：三个适配器只把连不上包成 `StoreError`，
     连上之后操作失败（Mongo 掉线、表被并发删掉）漏出来的是供应商自己的异常类型。这一处
@@ -269,10 +298,12 @@ def purge_knowledge_base(
     :raises PurgeError: 有哪一处没清干净；此时知识库配置原样留着。
 
     ⚠️ 这里多清一处，`knowledge_base_delete.html` 里那张「将要清理的数据」清单就要跟着加一条：
-    确认页上少一行，人按下确认时看到的就不是全部。
+    确认页上少一行，人按下确认时看到的就不是全部。`PurgeInventory` 同理——它带着确认页要
+    显示的那几个数，**数的与删的必须是同一批**。
     """
     chunk_count = 0
     image_count = 0
+    session_count = 0
     failures: list[str] = []
 
     try:
@@ -288,16 +319,36 @@ def purge_knowledge_base(
     except Exception as exc:
         failures.append(f"对象存储：{exc}")
 
+    try:
+        # 会话与配置在同一个库里（Mongo），但错开列：一处出岔子时，报出来的得是能查的那一处
+        session_count = docs.delete_where(sessions, {"game_id": game_id})
+    except Exception as exc:
+        failures.append(f"会话：{exc}")
+
+    try:
+        # 缓存走 `drop` 而不是 `invalidate`：删库要连提问计数一起清，理由见 `AnswerCache.drop`
+        cache.drop(game_id)
+    except Exception as exc:
+        failures.append(f"缓存：{exc}")
+
     if not failures:
         try:
             docs.delete(KB_COLLECTION, game_id)
         except Exception as exc:
-            failures.append(f"MongoDB：{exc}")
+            failures.append(f"知识库配置：{exc}")
 
     if failures:
         raise PurgeError(game_id, failures)
-    logger.info("删除知识库 %s：清掉 %d 条切片、%d 个原图", game_id, chunk_count, image_count)
-    return PurgeInventory(chunk_count=chunk_count, image_count=image_count)
+    logger.info(
+        "删除知识库 %s：清掉 %d 条切片、%d 个原图、%d 条会话，缓存一并清空",
+        game_id,
+        chunk_count,
+        image_count,
+        session_count,
+    )
+    return PurgeInventory(
+        chunk_count=chunk_count, image_count=image_count, session_count=session_count
+    )
 
 
 def knowledge_base_of(docs: DocStore, game_id: str) -> KnowledgeBase:

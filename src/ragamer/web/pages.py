@@ -37,6 +37,7 @@ from fastapi.templating import Jinja2Templates
 from ragamer.clarifying import Clarification, NotACandidate, UnknownPending, version_choices
 from ragamer.container import Container
 from ragamer.conversations import (
+    CONVERSATIONS,
     ChatStack,
     ConversationNotFound,
     Turn,
@@ -118,15 +119,19 @@ def create_router(container: Container, stack: ChatStack) -> APIRouter:
 
     @router.get("/kb")
     def knowledge_bases(
-        request: Request, deleted: str = "", chunks: int = 0, images: int = 0
+        request: Request,
+        deleted: str = "",
+        chunks: int = 0,
+        images: int = 0,
+        sessions: int = 0,
     ) -> Response:
         """知识库列表与新建表单。每个库点进去配术语映射与版本，或者删掉它。"""
         return _knowledge_bases_page(
             request,
             container,
             message=(
-                f"已删除知识库 {deleted}：清掉 {chunks} 条切片、{images} 个原图，"
-                "向量库、对象存储与 MongoDB 里的数据都清干净了。"
+                f"已删除知识库 {deleted}：清掉 {chunks} 条切片、{images} 个原图、"
+                f"{sessions} 条会话，缓存也一并清空了。"
                 if deleted
                 else ""
             ),
@@ -242,7 +247,7 @@ def create_router(container: Container, stack: ChatStack) -> APIRouter:
 
     @router.post("/kb/{game_id}/delete")
     def delete_kb(request: Request, game_id: str, confirm: Annotated[str, Form()] = "") -> Response:
-        """真删。三处存储一并清，知识库配置排在最后（见 `purge_knowledge_base`）。"""
+        """真删。**四处一并清**（向量库、对象存储、会话、缓存），配置排在最后。"""
         try:
             knowledge_base_of(container.docs, game_id)
         except (ValueError, KnowledgeBaseError) as exc:
@@ -256,7 +261,12 @@ def create_router(container: Container, stack: ChatStack) -> APIRouter:
             )
         try:
             inventory = purge_knowledge_base(
-                container.chunks, container.docs, container.objects, game_id
+                container.chunks,
+                container.docs,
+                container.objects,
+                container.cache,
+                game_id,
+                sessions=CONVERSATIONS,
             )
         except PurgeError as exc:
             return _delete_page(request, container, game_id, error=str(exc), status_code=exc.status)
@@ -267,6 +277,7 @@ def create_router(container: Container, stack: ChatStack) -> APIRouter:
                 "deleted": game_id,
                 "chunks": inventory.chunk_count,
                 "images": inventory.image_count,
+                "sessions": inventory.session_count,
             }
         )
         return RedirectResponse(f"/kb?{query}", status_code=303)
@@ -963,7 +974,9 @@ def _delete_page(
             request, container, error=str(exc), status_code=_status_of(exc)
         )
     try:
-        inventory = purge_inventory(container.chunks, container.objects, game_id)
+        inventory = purge_inventory(
+            container.chunks, container.docs, container.objects, game_id, sessions=CONVERSATIONS
+        )
     except Exception as exc:
         # 条数报不出来就不让人确认：闭着眼睛删不是确认。兜住全部异常的理由与
         # `purge_knowledge_base` 那边一样——适配器只把「连不上」包成 StoreError

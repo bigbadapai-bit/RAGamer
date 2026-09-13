@@ -138,6 +138,13 @@ class InMemoryDocStore:
     def delete(self, collection: str, doc_id: str) -> None:
         self._collections.get(collection, {}).pop(doc_id, None)
 
+    def delete_where(self, collection: str, where: Mapping[str, Any]) -> int:
+        rows = self._collections.get(collection, {})
+        stale = [doc_id for doc_id, document in rows.items() if matches_where(document, where)]
+        for doc_id in stale:
+            del rows[doc_id]
+        return len(stale)
+
     def list_ids(self, collection: str) -> list[str]:
         return sorted(self._collections.get(collection, {}))
 
