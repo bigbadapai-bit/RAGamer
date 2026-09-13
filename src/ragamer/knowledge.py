@@ -28,7 +28,15 @@ KB_COLLECTION = "knowledge_bases"
 
 
 class KnowledgeBaseError(Exception):
-    """知识库本身的问题——不是这次导入的资料的问题。"""
+    """知识库本身的问题——不是这次导入的资料的问题。
+
+    两个 HTTP 面（JSON 端点与页面）都要把它翻成状态码，**翻法必须一致**：各自维护一份
+    映射，迟早会变成「同一个问题在接口上是 404、在页面上是 400」。所以状态码跟着异常走，
+    两边都从这里取。
+    """
+
+    #: 该报哪个 HTTP 状态码。由子类给。
+    status = 500
 
 
 class UnknownKnowledgeBase(KnowledgeBaseError):
@@ -37,13 +45,20 @@ class UnknownKnowledgeBase(KnowledgeBaseError):
     与「配置读不了」分开，是因为处理方式不同：这一个要人去建库，那一个是库的数据坏了。
     """
 
+    status = 404
+
     def __init__(self, game_id: str) -> None:
         self.game_id = game_id
         super().__init__(f"知识库 {game_id} 不存在。先在知识库管理里建一个，再导入资料")
 
 
 class BrokenKnowledgeBase(KnowledgeBaseError):
-    """库在，但配置读不了——比如配了个不认识的主体类型。"""
+    """库在，但配置读不了——比如配了个不认识的主体类型。
+
+    这是库自己的数据坏了：不该长成一个 500，那样界面上只会看见「服务器错误」，查无可查。
+    """
+
+    status = 422
 
     def __init__(self, game_id: str, reason: str) -> None:
         self.game_id = game_id

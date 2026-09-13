@@ -217,6 +217,32 @@ def test_htmx_提交只回结果那一块(client):
     assert "导入结果" in response.text
 
 
+@pytest.mark.parametrize(
+    ("game_id", "with_file", "message"),
+    [
+        (GAME, False, "先选一份资料再提交"),
+        ("zelda", True, "知识库 zelda 不存在"),
+        ("黑神话", True, "游戏 id 不合法"),
+    ],
+)
+def test_htmx_提交出错时那句话也换得进去(client, game_id, with_file, message):
+    """出错时同样只回片段，而且**一律 200**。
+
+    htmx 默认不换入非 2xx 的响应：回 404 的话片段根本不会进 DOM，人只会对着一个空的
+    结果区发呆。整页那条路仍然报真实状态码（另有用例兜着）。
+    """
+    response = client.post(
+        IMPORT_URL,
+        data={"game_id": game_id, "version": ""},
+        files=[upload("二郎神.md")] if with_file else [],
+        headers={"HX-Request": "true"},
+    )
+
+    assert response.status_code == 200
+    assert "<html" not in response.text
+    assert message in response.text
+
+
 def test_前端没有本地构建产物(client):
     """页面上的脚本全在 CDN 上：没有 npm、没有打包、没有 /static（ADR-0005）。"""
     page = client.get("/kb").text

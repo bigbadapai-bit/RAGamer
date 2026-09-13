@@ -26,9 +26,8 @@ from fastapi.templating import Jinja2Templates
 from ragamer.container import Container
 from ragamer.importing import STAGE_LABELS, Importer, ImportResult
 from ragamer.knowledge import (
-    BrokenKnowledgeBase,
     KnowledgeBase,
-    UnknownKnowledgeBase,
+    KnowledgeBaseError,
     create_knowledge_base,
     list_knowledge_bases,
     vocabulary_of,
@@ -114,6 +113,33 @@ def create_router(container: Container) -> APIRouter:
 
         htmx 发来的请求只回结果那一块，原生表单提交回整页，两块内容一模一样。
         """
+
+        def reply(
+            message: str = "",
+            result: Mapping[str, Any] | None = None,
+            status: int = 200,
+        ) -> Response:
+            """结果区该显示什么——**整页与 htmx 片段走同一个出口**。
+
+            片段一律 200：htmx 默认不换入非 2xx 的响应，出错时回 4xx 的话人会对着一个
+            空的结果区发呆。整页那条路仍报真实状态码，curl 与别的工具看得见。
+            """
+            if request.headers.get("HX-Request"):
+                return templates.TemplateResponse(
+                    request,
+                    "partials/import_result.html",
+                    {"result": result, "message": message, "empty": EMPTY},
+                )
+            return _import_page(
+                request,
+                container,
+                selected=game_id,
+                version=version,
+                message=message,
+                result=result,
+                status_code=status,
+            )
+
         game_id = game_id.strip()
         version = version.strip()
         sources = [
@@ -123,39 +149,15 @@ def create_router(container: Container) -> APIRouter:
             if file.filename
         ]
         if not sources:
-            return _import_page(
-                request, container, selected=game_id, version=version, error="先选一份资料再提交"
-            )
+            return reply("先选一份资料再提交")
         try:
             collection_name(game_id)
             vocabulary = vocabulary_of(container.docs, game_id)
         except ValueError as exc:
-            return _import_page(
-                request,
-                container,
-                selected=game_id,
-                version=version,
-                error=str(exc),
-                status_code=400,
-            )
-        except UnknownKnowledgeBase as exc:
-            return _import_page(
-                request,
-                container,
-                selected=game_id,
-                version=version,
-                error=str(exc),
-                status_code=404,
-            )
-        except BrokenKnowledgeBase as exc:
-            return _import_page(
-                request,
-                container,
-                selected=game_id,
-                version=version,
-                error=str(exc),
-                status_code=422,
-            )
+            return reply(str(exc), status=400)
+        except KnowledgeBaseError as exc:
+            # 状态码跟着异常走：接口与页面两条路翻出来的是同一个（见 ragamer.knowledge）
+            return reply(str(exc), status=exc.status)
 
         results = importer.batch(
             sources,
@@ -163,12 +165,7 @@ def create_router(container: Container) -> APIRouter:
             version=version or UNVERSIONED,
             vocabulary=vocabulary,
         )
-        result = _import_result(results, game_id=game_id, version=version)
-        if request.headers.get("HX-Request"):
-            return templates.TemplateResponse(
-                request, "partials/import_result.html", {"result": result, "empty": EMPTY}
-            )
-        return _import_page(request, container, selected=game_id, version=version, result=result)
+        return reply(result=_import_result(results, game_id=game_id, version=version))
 
     @router.get("/kb/{game_id}/preview")
     def preview(
@@ -182,13 +179,11 @@ def create_router(container: Container) -> APIRouter:
         try:
             collection_name(game_id)
         except ValueError as exc:
-            return _preview_page(request, container, game_id, doc_title, version, [], str(exc))
+            return _preview_page(request, game_id, doc_title, version, error=str(exc))
         if not doc_title:
-            return _preview_page(
-                request, container, game_id, doc_title, version, [], "没说要预览哪一份文档"
-            )
+            return _preview_page(request, game_id, doc_title, version, error="没说要预览哪一份文档")
         chunks = container.chunks.fetch_document(game_id, doc_title, version=version)
-        return _preview_page(request, container, game_id, doc_title, version, chunks)
+        return _preview_page(request, game_id, doc_title, version, chunks)
 
     # 两个还没做的页面。留位置是这一票的要求，所以点进来要有一句人话，而不是一个 404。
     @router.get("/chat")
@@ -267,10 +262,15 @@ def _import_page(
     *,
     selected: str = "",
     version: str = "",
-    error: str = "",
+    message: str = "",
     result: Mapping[str, Any] | None = None,
     status_code: int = 200,
 ) -> Response:
+    """导入页整页。`message` 与 `result` 落在结果区里，与 htmx 拿到的片段是同一份内容。
+
+    **不经 base.html 的那条 `error` 通道**：那条画在表单上方，片段换入时看不见；
+    要显示的东西得在结果区里，两条路才一致。
+    """
     bases = _knowledge_base_rows(list_knowledge_bases(container.docs))
     known = {base["game_id"] for base in bases}
     return _page(
@@ -282,7 +282,7 @@ def _import_page(
         # 直接打开这个页面时默认选中第一个库，省得每回都挑一次
         selected=selected if selected in known else next(iter(sorted(known)), ""),
         version=version,
-        error=error,
+        message=message,
         result=result,
         status_code=status_code,
     )
@@ -290,11 +290,10 @@ def _import_page(
 
 def _preview_page(
     request: Request,
-    container: Container,
     game_id: str,
     doc_title: str,
     version: str,
-    chunks: Sequence[Chunk],
+    chunks: Sequence[Chunk] = (),
     error: str = "",
 ) -> Response:
     if not chunks and not error:

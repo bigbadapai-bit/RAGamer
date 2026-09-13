@@ -21,11 +21,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 
 from ragamer.container import Container
 from ragamer.importing import STAGE_LABELS, Importer, ImportResult, ProgressEvent
-from ragamer.knowledge import (
-    BrokenKnowledgeBase,
-    UnknownKnowledgeBase,
-    vocabulary_of,
-)
+from ragamer.knowledge import KnowledgeBaseError, vocabulary_of
 from ragamer.sources import SourceDocument
 from ragamer.stores.base import UNVERSIONED, collection_name
 from ragamer.tagging import TagVocabulary
@@ -82,16 +78,13 @@ def _check_game_id(game_id: str) -> None:
 def _vocabulary(container: Container, game_id: str) -> TagVocabulary:
     """这个知识库的打标词表。
 
-    判断在 `ragamer.knowledge` 里（界面那条写入路径用的是同一份），这里只把两种问题
-    翻成状态码：库不存在是游戏选错了，当场 404，不静默按默认词表建内容；配置读不了是
-    库自己的数据坏了，不该长成一个 500——那样界面上只会看见「服务器错误」，查无可查。
+    判断在 `ragamer.knowledge` 里（界面那条写入路径用的是同一份），这里只把问题翻成
+    它自带的那个状态码——库不存在 404、配置读不了 422，两种问题的分法见那边的类文档。
     """
     try:
         return vocabulary_of(container.docs, game_id)
-    except UnknownKnowledgeBase as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except BrokenKnowledgeBase as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except KnowledgeBaseError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
 
 
 def _result_payload(result: ImportResult) -> dict[str, Any]:
