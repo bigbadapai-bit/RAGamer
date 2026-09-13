@@ -65,6 +65,10 @@ def test_每个配置键都能从环境变量读入(settings_env):
     assert settings.rerank.model == "test-rerank-model"
     assert settings.rerank.batch_size == 32
     assert settings.rerank.max_length == 2048
+    assert settings.crawl.user_agent == "RAGamerTest/0.1 (+https://crawl.test/bot)"
+    assert settings.crawl.timeout == 7.5
+    assert settings.crawl.min_interval == 0.25
+    assert settings.crawl.max_bytes == 1048576
 
 
 def test_未给出可选项时取默认值(settings_env, monkeypatch):
@@ -81,6 +85,10 @@ def test_未给出可选项时取默认值(settings_env, monkeypatch):
         "RAGAMER_MODELS_FP16",
         "RAGAMER_EMBED_BATCH_SIZE",
         "RAGAMER_RERANK_BATCH_SIZE",
+        "RAGAMER_CRAWL_USER_AGENT",
+        "RAGAMER_CRAWL_TIMEOUT",
+        "RAGAMER_CRAWL_MIN_INTERVAL",
+        "RAGAMER_CRAWL_MAX_BYTES",
     ):
         monkeypatch.delenv(key)
 
@@ -100,6 +108,11 @@ def test_未给出可选项时取默认值(settings_env, monkeypatch):
     assert settings.models.fp16 is False
     assert settings.embed.batch_size == 8
     assert settings.rerank.batch_size == 8
+    # 抓取默认留一秒间隔：不配也该是「按主机的礼貌速度」，而不是能跑多快跑多快
+    assert settings.crawl.timeout == 15.0
+    assert settings.crawl.min_interval == 1.0
+    assert settings.crawl.max_bytes == 5_000_000
+    assert settings.crawl.user_agent.startswith("RAGamerBot/")
 
 
 def test_模型上下文上限默认是长上下文而不是_512(settings_env, monkeypatch):
@@ -136,6 +149,33 @@ def test_重试次数与超时超出可接受范围时报错并指出键名(sett
         load_settings(env_file=None)
 
     assert key in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        "RAGAMER_CRAWL_TIMEOUT=0",
+        "RAGAMER_CRAWL_MIN_INTERVAL=-1",  # 负的间隔等于没有间隔
+        "RAGAMER_CRAWL_MAX_BYTES=10",  # 小到任何页面都过不去
+    ],
+)
+def test_抓取参数超出可接受范围时报错并指出键名(settings_env, monkeypatch, override):
+    """这几项都会静默生效：间隔填成负的照样跑，页面上限填成 10 字节也只是每页都失败。"""
+    key, _, value = override.partition("=")
+    monkeypatch.setenv(key, value)
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_settings(env_file=None)
+
+    assert key in str(excinfo.value)
+
+
+def test_抓取身份留空时回落到默认值而不是变成匿名(settings_env, monkeypatch):
+    """空串按没配处理（与其余可选项同一条规则）。落回默认仍然是**有名有姓**的那一个——
+    回到空串就等于匿名抓取，而站点拦匿名爬虫是对的。"""
+    monkeypatch.setenv("RAGAMER_CRAWL_USER_AGENT", "")
+
+    assert load_settings(env_file=None).crawl.user_agent.startswith("RAGamerBot/")
 
 
 def test_milvus_的库名不能叫_default(settings_env, monkeypatch):

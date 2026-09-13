@@ -135,6 +135,22 @@ class RerankSettings(BaseModel):
     max_length: int = Field(default=8192, ge=1, le=32768)
 
 
+class CrawlSettings(BaseModel):
+    """网页抓取。合规要的三件事在这里，另一件（robots）在 `ragamer.crawl` 里做。"""
+
+    #: 请求头里的身份。**不要改成匿名的通用值**：站点按 UA 匹配 robots 规则，
+    #: 而不肯说自己是谁的爬虫被拦下来是应该的。带上联系地址，站长才找得到人。
+    user_agent: NonEmptyStr = "RAGamerBot/0.1 (+https://github.com/bigbadapai-bit/RAGamer)"
+    #: 单次请求超时（秒）
+    timeout: float = Field(default=15.0, gt=0, le=300)
+    #: 同一台主机两次请求之间的最小间隔（秒）。限的是主机不是页面——并发抓一个站的
+    #: 十个页面，压力全落在同一台服务器上。0 表示不限，只在自己搭的站上这么配。
+    min_interval: float = Field(default=1.0, ge=0, le=60)
+    #: 单个页面的字节上限。**超了当场报错而不是截断**：截断的 HTML 会安静地少掉后半篇，
+    #: 而导入看着是成功的。
+    max_bytes: int = Field(default=5_000_000, ge=64_000, le=64_000_000)
+
+
 class Settings(BaseSettings):
     """全部配置。由 :func:`load_settings` 或 :func:`get_settings` 构造。"""
 
@@ -166,6 +182,8 @@ class Settings(BaseSettings):
     models: ModelSettings = Field(default_factory=ModelSettings)
     embed: EmbedSettings = Field(default_factory=EmbedSettings)
     rerank: RerankSettings = Field(default_factory=RerankSettings)
+    # 抓取也只有完整默认值：不配也能跑，配了才落进 .env
+    crawl: CrawlSettings = Field(default_factory=CrawlSettings)
 
 
 def load_settings(env_file: str | Path | None = DEFAULT_ENV_FILE) -> Settings:

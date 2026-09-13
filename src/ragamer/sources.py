@@ -47,6 +47,9 @@ class NormalizedDoc:
     #: 切分用不到它——正文已经在 `markdown` 里了；补图的二次 OCR 回填要用，
     #: 因为「哪个条目是图片」只有条目级结构说得清。md 来源留空。
     content_list: tuple[Mapping[str, Any], ...] = ()
+    #: 这份资料从哪来的地址。**只有网页来源有**：本地文件没有地址可填。
+    #: 它一路跟着切片进库，答案的引用里显示的就是它。
+    source_url: str = ""
 
 
 class SourceError(Exception):
@@ -63,6 +66,19 @@ class SourceParser(Protocol):
 
     def parse(self, source: SourceDocument) -> NormalizedDoc:
         """读不了时抛 :class:`SourceError`。"""
+        ...
+
+
+@runtime_checkable
+class PageCrawler(Protocol):
+    """一个网址 → 归一后的文档。与解析适配器同一个位置、同一种产物。
+
+    它自己不碰切分与打标：抓回来的东西和本地文件在 `NormalizedDoc` 这一层汇合，
+    下游那条链路分不出手上这份资料是从哪来的（验收要求「走完全相同的后续链路」）。
+    """
+
+    def crawl(self, url: str) -> NormalizedDoc:
+        """抓不了时抛 :class:`SourceError`。"""
         ...
 
 
@@ -97,7 +113,16 @@ class MarkdownParser:
                 "PDF 与图片走 MinerU、网页走爬虫，两条路都还没接上"
             )
         markdown = _decode(source)
-        return NormalizedDoc(markdown=markdown, images=tuple(_IMAGE_REF.findall(markdown)))
+        return NormalizedDoc(markdown=markdown, images=image_refs(markdown))
+
+
+def image_refs(markdown: str) -> tuple[str, ...]:
+    """正文里引用到的图片地址，按出现顺序、去重前原样。
+
+    md／txt 与抓回来的网页共用它：两处各写一遍正则，迟早会漂成两个口径——
+    而漂掉的那一边不报错，只是图片再也补不上。
+    """
+    return tuple(_IMAGE_REF.findall(markdown))
 
 
 def _decode(source: SourceDocument) -> str:

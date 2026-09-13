@@ -31,6 +31,7 @@ _ADAPTERS = {
     "BgeM3Embedder",
     "BgeReranker",
     "OpenAiLlm",
+    "HttpCrawler",
 }
 
 #: 供应商库只允许出现在各自的适配器模块里：其余模块只认 ragamer.stores 与
@@ -43,6 +44,8 @@ _VENDOR_MODULES = {
     "urllib3": _PACKAGE / "stores" / "objects.py",
     # 真实模型是可选的 models 组，bge 里对它是懒导入（没装也能 import 本模块）
     "FlagEmbedding": _PACKAGE / "vectors" / "bge.py",
+    # 网页正文抽取只发生在抓取适配器里：wikitext 那条路自己写，不碰它
+    "trafilatura": _PACKAGE / "crawl.py",
 }
 
 
@@ -64,6 +67,8 @@ def test_守则扫到了源码():
         "chunking.py",
         "tagging.py",
         "sources.py",
+        "crawl.py",
+        "wikitext.py",
         "importing.py",
         "api.py",
         "logging.py",
