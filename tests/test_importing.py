@@ -6,8 +6,6 @@
 
 from __future__ import annotations
 
-import logging
-
 import pytest
 
 from ragamer import importing
@@ -60,6 +58,22 @@ WIKI_ARTICLE = """\
 
 [[Category:角色]]
 [[Category:妖王]]
+"""
+
+#: 另一份词条页：一级标题与上面那份不同，一批里各成一篇。
+SECOND_ARTICLE = """\
+# 白骨精
+
+{{信息框
+| 名称 = 白骨精
+| 类型 = 妖王
+}}
+
+白骨精在第二章，总共三条命。
+
+## 打法
+
+先破盾，再贴身。
 """
 
 #: 同一份资料的另一版：只剩开头，用来验「重导之后旧的那一截被清掉」。
@@ -245,21 +259,75 @@ def test_不同版本的一份资料并存():
     assert {chunk.version for chunk in stored(chunks, version=UNVERSIONED)} == {UNVERSIONED}
 
 
-def test_同一批里两份同标题的文件留一条覆盖的痕(caplog):
-    """同名即同一份文档（文档标题是重导替换的范围），但两条结果都会报成功。
+def test_同一批里两份同标题的文件不互相覆盖():
+    """文档标题是重导替换的范围：两份一级标题相同的文件，后一份会把前一份删掉。
 
-    这不是错，是界面上「导入了 2 份」的读法要打折扣——所以留一条日志，不假装没发生。
+    一批里出现这种撞车时后一份失败，**宁可少一份也不静默丢一份**——两条都报成功而
+    库里只剩一条，是这一层最难查的一种结果。
+    """
+    chunks = InMemoryChunkStore()
+    reference = InMemoryChunkStore()
+    make_importer(reference).import_one(markdown("甲.md"), game_id=GAME, vocabulary=BLACK_MYTH)
+
+    results = make_importer(chunks).batch(
+        [markdown("甲.md"), markdown("乙.md", text=SHORT_ARTICLE)],
+        game_id=GAME,
+        vocabulary=BLACK_MYTH,
+    )
+
+    assert [result.ok for result in results] == [True, False]
+    assert results[1].stage is ImportStage.STORE
+    assert "甲.md" in results[1].error and "二郎神" in results[1].error
+    assert results[1].chunk_count == 0
+    # 乙是同一篇的短版本：真写下去的话甲那一批切片会被它替掉
+    assert [chunk.content for chunk in stored(chunks)] == [
+        chunk.content for chunk in stored(reference)
+    ]
+
+
+def test_同一批里同一份资料提交两次不算撞车():
+    """同一份内容再导一次是幂等的：文档标识一样，切片主键也一样，写下去等于没写。
+
+    撞车的判断因此不只看标题：**同一批里同一份资料重复提交要放行**，
+    否则「全选文件夹」把同一个文件带进来两次就成了一个假失败。
     """
     chunks = InMemoryChunkStore()
 
-    with caplog.at_level(logging.WARNING, logger="ragamer.importing"):
-        results = make_importer(chunks).batch(
-            [markdown("甲.md"), markdown("乙.md")], game_id=GAME, vocabulary=BLACK_MYTH
-        )
+    results = make_importer(chunks).batch(
+        [markdown("二郎神.md"), markdown("二郎神.md")], game_id=GAME, vocabulary=BLACK_MYTH
+    )
 
     assert [result.ok for result in results] == [True, True]
-    assert "甲.md" in caplog.text and "乙.md" in caplog.text
-    assert len(stored(chunks)) == results[-1].chunk_count  # 库里只剩后写的那一份
+    assert len(stored(chunks)) == results[0].chunk_count
+
+
+def test_两个不同网址切成同一个标题时后一条失败():
+    """撞车不只发生在文件之间：两条来源只要落成同一个文档标识就一样会互相覆盖。"""
+    other_url = "https://wiki.test/wiki/二郎神/打法"
+    chunks = InMemoryChunkStore()
+    importer = make_importer(
+        chunks, crawler=FakeCrawler(**{PAGE_URL: WIKI_ARTICLE, other_url: WIKI_ARTICLE})
+    )
+
+    results = importer.batch_urls([PAGE_URL, other_url], game_id=GAME, vocabulary=BLACK_MYTH)
+
+    assert [result.ok for result in results] == [True, False]
+    assert PAGE_URL in results[1].error
+    assert {chunk.source_url for chunk in stored(chunks)} == {PAGE_URL}
+
+
+def test_同一标题的两个版本互不相干():
+    """文档标识是「标题 + 版本」：两个版本本来就要并存（ADR-0004），不是撞车。"""
+    chunks = InMemoryChunkStore()
+    importer = make_importer(chunks)
+
+    importer.batch([markdown("甲.md")], game_id=GAME, version="1.0", vocabulary=BLACK_MYTH)
+    results = importer.batch(
+        [markdown("乙.md")], game_id=GAME, version="2.0", vocabulary=BLACK_MYTH
+    )
+
+    assert results[0].ok
+    assert stored(chunks, version="1.0") and stored(chunks, version="2.0")
 
 
 def test_重导时换了版本不动别的版本():
@@ -576,6 +644,37 @@ def test_一批网址逐个独立():
 
     assert [result.ok for result in results] == [True, False]
     assert stored(chunks)  # 失败的那一条没有牵连成功的那一条
+
+
+def test_一次提交里文件与网址混在一起():
+    """界面上一次提交可以同时带文件与网址，那它们就是**一批**：
+
+    编号连着往后排（进度里说得出「第几条 / 共几条」），两条来源也共用同一份文档标识
+    的认领表——否则同一次提交里一个文件与一个网址撞上，谁也拦不住。
+    """
+    chunks = InMemoryChunkStore()
+    seen: list[importing.ProgressEvent] = []
+    page = "# 金角大王\n\n银角大王的哥哥，拿着紫金红葫芦与羊脂玉净瓶，在平顶山占山为王。\n"
+    importer = make_importer(
+        chunks, crawler=FakeCrawler(**{PAGE_URL: page}), on_progress=seen.append
+    )
+
+    results = importer.batch(
+        [markdown("甲.md"), markdown("乙.md", text=SECOND_ARTICLE)],
+        urls=[PAGE_URL, MISSING_URL],
+        game_id=GAME,
+        vocabulary=BLACK_MYTH,
+    )
+
+    assert [result.source for result in results] == ["甲.md", "乙.md", PAGE_URL, MISSING_URL]
+    assert [result.ok for result in results] == [True, True, True, False]
+    assert {event.file_total for event in seen} == {4}
+    assert [event.file_number for event in seen if event.stage is ImportStage.NORMALIZE] == [
+        1,
+        2,
+        3,
+        4,
+    ]
 
 
 def test_没接抓取器时导入网址当场报错():

@@ -91,6 +91,26 @@ class ProgressEvent:
 ProgressCallback = Callable[[ProgressEvent], None]
 
 
+@dataclass(frozen=True)
+class _Entry:
+    """编排器内部的一条待导入：显示名、怎么拿到归一化文档、以及它在「是不是同一份」上的身份。"""
+
+    #: 这一条是从哪来的：文件名，或网址。进度与结果里指认它用的就是它。
+    source: str
+    #: 取正文那一步。本地资料读字节再解析，网址去抓——差异只到这一层为止。
+    normalize: Callable[[], NormalizedDoc]
+    #: 同一份来源的凭据。同一次提交里两条身份相同即同一份资料，不是撞车。
+    identity: str
+
+
+@dataclass(frozen=True)
+class _Claim:
+    """一批里先占下某个文档标识的那条来源。撞车时要说清是跟谁撞的。"""
+
+    identity: str
+    source: str
+
+
 def log_progress(event: ProgressEvent) -> None:
     """进度回调的默认实现：每进入一个阶段落一行日志。
 
@@ -219,27 +239,35 @@ class Importer:
 
     def batch(
         self,
-        sources: Sequence[SourceDocument],
+        sources: Sequence[SourceDocument] = (),
         *,
+        urls: Sequence[str] = (),
         game_id: str,
         version: str = UNVERSIONED,
         vocabulary: TagVocabulary | None = None,
     ) -> tuple[ImportResult, ...]:
-        """一批资料，顺序即提交顺序。**逐个独立**：某个文件失败时其余照常入库。"""
-        total = len(sources)
-        results = tuple(
-            self.import_one(
-                source,
+        """一次提交：若干份本地资料、若干个网址，按提交顺序一条条来。
+
+        **逐个独立**：某一条失败时其余照常入库。两类来源合成一个入口是因为它们本来
+        就是「同一次提交」的两半——编号连着往后排，文档标识也共用一份认领表，
+        同一次提交里一个文件与一个网址撞上才不会互相覆盖。
+        """
+        total = len(sources) + len(urls)
+        claimed: dict[tuple[str, str], _Claim] = {}
+        entries = [self._file_entry(source, game_id) for source in sources]
+        entries += [self._url_entry(url) for url in urls]
+        return tuple(
+            self._run(
+                entry,
                 game_id=game_id,
                 version=version,
                 vocabulary=vocabulary,
                 file_number=number,
                 file_total=total,
+                claimed=claimed,
             )
-            for number, source in enumerate(sources, start=1)
+            for number, entry in enumerate(entries, start=1)
         )
-        _warn_on_repeated_documents(results, version=version)
-        return results
 
     def batch_urls(
         self,
@@ -249,25 +277,8 @@ class Importer:
         version: str = UNVERSIONED,
         vocabulary: TagVocabulary | None = None,
     ) -> tuple[ImportResult, ...]:
-        """一批网址，顺序即提交顺序。**逐个独立**：某个地址失败时其余照常入库。
-
-        与 :meth:`batch` 分成两个方法而不是合成一个收「文件或网址」的入口：
-        两者的差别只在归一化那一步，那就不该让类型判断扩散到这一层。
-        """
-        total = len(urls)
-        results = tuple(
-            self.import_url(
-                url,
-                game_id=game_id,
-                version=version,
-                vocabulary=vocabulary,
-                file_number=number,
-                file_total=total,
-            )
-            for number, url in enumerate(urls, start=1)
-        )
-        _warn_on_repeated_documents(results, version=version)
-        return results
+        """一批网址。与 :meth:`batch` 是同一个入口，只是这一批里没有本地资料。"""
+        return self.batch((), urls=urls, game_id=game_id, version=version, vocabulary=vocabulary)
 
     def import_one(
         self,
@@ -286,9 +297,7 @@ class Importer:
         :param vocabulary: 该知识库的词表。不传则全部主体类型、映射为空。
         """
         return self._run(
-            source.filename,
-            # 解析产物里的原图在这里进对象存储；抓回来的网页没有附件，不走这一步
-            lambda: self._publish(self.parser.parse(source), source, game_id),
+            self._file_entry(source, game_id),
             game_id=game_id,
             version=version,
             vocabulary=vocabulary,
@@ -311,12 +320,8 @@ class Importer:
         结果与进度事件里的 `source` 报的是这个地址——网页没有文件名，
         而「这一批里是哪一条失败了」总得有个能指认的东西。
         """
-        crawler = self.crawler
-        if crawler is None:
-            raise ValueError("这个导入器没有接上抓取器，导入不了网址（组合根里接）")
         return self._run(
-            url,
-            lambda: crawler.crawl(url),
+            self._url_entry(url),
             game_id=game_id,
             version=version,
             vocabulary=vocabulary,
@@ -324,22 +329,42 @@ class Importer:
             file_total=file_total,
         )
 
+    def _file_entry(self, source: SourceDocument, game_id: str) -> _Entry:
+        """一份本地资料 → 这一次要跑的那条。原图在这里进对象存储。"""
+        return _Entry(
+            source=source.filename,
+            # 抓回来的网页没有附件，附件这一步只在文件这条路上
+            normalize=lambda: self._publish(self.parser.parse(source), source, game_id),
+            # 同一批里再提交一次同一份文件是幂等的，靠它认出来
+            identity=_source_digest(source.data),
+        )
+
+    def _url_entry(self, url: str) -> _Entry:
+        """一个网址 → 这一次要跑的那条。抓不了的当场报错，不兜成一条失败的结果。"""
+        crawler = self.crawler
+        if crawler is None:
+            raise ValueError("这个导入器没有接上抓取器，导入不了网址（组合根里接）")
+        return _Entry(source=url, normalize=lambda: crawler.crawl(url), identity=url)
+
     def _run(
         self,
-        source: str,
-        normalize: Callable[[], NormalizedDoc],
+        entry: _Entry,
         *,
         game_id: str,
         version: str,
         vocabulary: TagVocabulary | None,
         file_number: int,
         file_total: int,
+        claimed: dict[tuple[str, str], _Claim] | None = None,
     ) -> ImportResult:
-        """六个阶段走一遍。`normalize` 是这里唯一的变量：本地资料读字节、网址去抓。
+        """六个阶段走一遍。`entry.normalize` 是这里唯一的变量：本地资料读字节、网址去抓。
 
         两条入口合流得这么早是有意的——「抓回来的与本地文件走完全相同的后续链路」
         这条验收要求，与其靠两处代码长得一样来保证，不如让它们本来就是同一处。
+
+        `claimed` 是这一批已经占下的文档标识。单条导入没有第二个来源，不必传。
         """
+        source = entry.source
         reported: list[ProgressEvent] = []
         current = ImportStage.NORMALIZE
 
@@ -354,7 +379,7 @@ class Importer:
         doc_title = ""
         try:
             enter(ImportStage.NORMALIZE)
-            doc = normalize()
+            doc = entry.normalize()
             doc_title = document_title(doc.markdown, source)
             if self.enricher is not None:
                 enter(ImportStage.ENRICH)
@@ -372,6 +397,7 @@ class Importer:
                 source_url=doc.source_url,
             )
             enter(ImportStage.STORE)
+            _claim(claimed, doc_title, version, entry)
             self._store(game_id, doc_title, version, rows)
         # 兜住全部异常是「一个文件失败不牵连其余」要求的：读文件、抓网页、调模型、写库
         # 都可能以各自的异常类型挂掉，而这一批的其余文件不该跟着陪葬。兜住不等于吞掉
@@ -508,23 +534,28 @@ def _unique(values: Iterable[str]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(values))
 
 
-def _warn_on_repeated_documents(results: Sequence[ImportResult], *, version: str) -> None:
-    """同一批里两份文件切成同一个文档标识时提醒一声。
+def _claim(
+    claimed: dict[tuple[str, str], _Claim] | None,
+    doc_title: str,
+    version: str,
+    entry: _Entry,
+) -> None:
+    """在一批里认下「标题 + 版本」这个文档标识。**撞上了就当场失败，不写下去。**
 
-    文档标识是「文档标题 + 版本」，也是重导替换的范围：两份一级标题相同的文件会互相
-    覆盖——后写的那份先把前一份删掉，两条结果却都报成功，库里最终只剩一份。
-    这不是错（同名即同一份文档），但界面上「导入了 2 份」的读法要打折扣，所以留一条痕。
+    文档标识同时是重导替换的范围：两条来源落成同一个标识时，后写的那条会把前一条整批
+    删掉，而两条结果都报成功——库里只剩一条，界面上却看着两份都进来了。宁可少一份、
+    并且说清为什么。同一份资料重复提交是例外：标识一样、内容也一样，写下去等于没写。
     """
-    claimed: dict[str, str] = {}
-    for result in results:
-        if not result.ok:
-            continue
-        first = claimed.setdefault(result.doc_title, result.source)
-        if first != result.source:
-            logger.warning(
-                "同一批里 %s 与 %s 切出了同一个文档标题 %r（版本 %r）：后写的覆盖了前一份",
-                first,
-                result.source,
-                result.doc_title,
-                version,
-            )
+    if claimed is None:
+        return
+    key = (doc_title, version)
+    first = claimed.get(key)
+    if first is None:
+        claimed[key] = _Claim(identity=entry.identity, source=entry.source)
+        return
+    if first.identity != entry.identity:
+        raise ValueError(
+            f"这一批里的 {first.source} 也叫「{doc_title}」。文档标题是重导替换的范围，"
+            "两份落成同一个标题会互相覆盖，只会留下最后写的那一份。"
+            "改掉其中一份的标题，或者分两次导入。"
+        )
