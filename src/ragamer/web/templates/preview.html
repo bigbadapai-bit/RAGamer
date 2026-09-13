@@ -1,57 +1,102 @@
 {#
   切分预览：只读。**这个模板里不许出现表单控件**——没有编辑入口不是"暂时没做"，
-  是这一页的定位（这一票的验收条目之一）。切片正文按纯文本渲染，不解析 Markdown：
-  要看的是"存进去的到底是什么"，渲染过的反而看不出来。
+  是这一页的定位（T09 的验收条目之一）。
+
+  排成表而不是一张张卡片，是因为这一页要回答的是「这篇东西被切成了什么」：正文、祖先
+  标题路径、两层标签、切片类型各占一列，逐行对得齐才看得出切分质量。正文按纯文本渲染、
+  不解析 Markdown——要看的是「存进去的到底是什么」，渲染过的反而看不出来。
 #}
 {% extends "base.html" %}
-{% block content %}
 
-<dl class="mb-8 grid grid-cols-[auto_1fr] gap-x-5 gap-y-1 text-sm">
-  <dt class="text-slate-500">来源文档</dt>
-  <dd>{{ doc_title or empty }}</dd>
-  <dt class="text-slate-500">知识库</dt>
-  <dd class="font-mono">{{ game_id }}</dd>
-  <dt class="text-slate-500">版本</dt>
-  <dd>{{ version_label }}</dd>
-  <dt class="text-slate-500">主体名</dt>
-  <dd>{{ subject_name or empty }}</dd>
-  <dt class="text-slate-500">切片数</dt>
-  <dd>{{ chunks | length }}</dd>
-</dl>
+{% block head %}
+<style>
+  /* 正文默认压两行，点开看全文。Tailwind 的 line-clamp 要配插件，这里三行 CSS 更省事。 */
+  details.cell > summary {
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    cursor: pointer;
+  }
+  details.cell[open] > summary {
+    display: block;
+    overflow: visible;
+    white-space: pre-wrap;
+  }
+</style>
+{% endblock %}
+
+{% block content %}
+<header class="mb-6 flex flex-wrap items-end justify-between gap-x-6 gap-y-2">
+  <div>
+    <h1 class="text-xl font-semibold tracking-tight">{{ doc_title or empty }}</h1>
+    <p class="mt-1 text-sm text-slate-500">
+      来源文档 {{ doc_title or empty }} · {{ version_label }} · 主体名 {{ subject_name or empty }}
+    </p>
+  </div>
+  <p class="text-sm text-slate-500"><span class="font-mono text-slate-900">{{ chunks | length }}</span> 条切片</p>
+</header>
+
+{% if error %}
+<p class="mb-6 rounded border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">{{ error }}</p>
+{% endif %}
 
 {% if chunks %}
-<ol class="space-y-4">
-  {% for chunk in chunks %}
-  <li class="rounded border border-slate-200 bg-white p-4">
-    <div class="mb-2 flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1 text-xs text-slate-500">
-      <span>#{{ chunk.index }} · {{ chunk.ancestor_path }}</span>
-      <span class="flex items-center gap-2">
-        {% if not chunk.is_plain_text %}
-        <span class="rounded bg-slate-100 px-2 py-0.5">{{ chunk.chunk_type }}</span>
-        {% endif %}
-        {% if chunk.other_version %}
-        <span class="rounded bg-amber-100 px-2 py-0.5 text-amber-900">未标注版本，不随版本变化</span>
-        {% endif %}
-      </span>
-    </div>
-
-    <p class="mb-3 whitespace-pre-wrap text-sm leading-relaxed">{{ chunk.content }}</p>
-
-    <p class="text-xs text-slate-500">
-      主体类型：{{ chunk.subject_types | join("、") or empty }} ·
-      内容性质：{{ chunk.content_natures | join("、") or empty }}
-      {%- if chunk.game_terms %} · 游戏术语：{{ chunk.game_terms | join("、") }}{% endif %}
-    </p>
-
-    {% if chunk.content_meta %}
-    <details class="mt-2 text-xs text-slate-500">
-      <summary class="cursor-pointer">不参与检索的附加文本</summary>
-      <p class="mt-1 whitespace-pre-wrap">{{ chunk.content_meta }}</p>
-    </details>
-    {% endif %}
-  </li>
-  {% endfor %}
-</ol>
+<div class="overflow-x-auto rounded-md border border-slate-200 bg-white shadow-sm">
+  <table class="w-full border-collapse text-sm">
+    <thead class="bg-slate-50 text-left text-[11px] uppercase tracking-wider text-slate-500">
+      <tr>
+        <th class="w-12 px-3 py-2.5 font-medium">#</th>
+        <th class="w-56 px-3 py-2.5 font-medium">祖先标题路径</th>
+        <th class="px-3 py-2.5 font-medium">正文</th>
+        <th class="w-24 px-3 py-2.5 font-medium">主体类型</th>
+        <th class="w-28 px-3 py-2.5 font-medium">内容性质</th>
+        <th class="w-16 px-3 py-2.5 font-medium">类型</th>
+        <th class="w-24 px-3 py-2.5 font-medium">版本</th>
+        <th class="w-16 px-3 py-2.5 text-right font-medium">字数</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for chunk in chunks %}
+      <tr class="border-t border-slate-100 align-top hover:bg-sky-50/50">
+        <td class="px-3 py-2.5 font-mono text-xs text-slate-400">{{ chunk.index }}</td>
+        <td class="px-3 py-2.5 text-xs leading-5 text-slate-500">{{ chunk.ancestor_path }}</td>
+        <td class="px-3 py-2.5">
+          <details class="cell text-slate-800">
+            <summary>{{ chunk.content }}</summary>
+          </details>
+          {% if chunk.content_meta %}
+          <p class="mt-1.5 border-t border-dashed border-slate-200 pt-1.5 text-xs text-slate-400">
+            附加文本：{{ chunk.content_meta }}
+          </p>
+          {% endif %}
+        </td>
+        <td class="px-3 py-2.5 text-xs">
+          {% for name in chunk.subject_types %}<span class="mr-1 inline-block rounded bg-slate-100 px-1.5 py-0.5">{{ name }}</span>{% endfor %}
+          {% if not chunk.subject_types %}<span class="text-slate-300">{{ empty }}</span>{% endif %}
+        </td>
+        <td class="px-3 py-2.5 text-xs">
+          {% for name in chunk.content_natures %}<span class="mr-1 inline-block rounded bg-slate-100 px-1.5 py-0.5">{{ name }}</span>{% endfor %}
+          {% if not chunk.content_natures %}<span class="text-slate-300">{{ empty }}</span>{% endif %}
+        </td>
+        <td class="px-3 py-2.5 text-xs">
+          <span class="{% if chunk.is_plain_text %}text-slate-300{% else %}rounded bg-slate-800 px-1.5 py-0.5 text-white{% endif %}">{{ chunk.chunk_type }}</span>
+        </td>
+        <td class="px-3 py-2.5 text-xs">
+          {% if chunk.other_version %}
+          {# 未标注版本的内容在任何版本下都会被一并取回（ADR-0004），标出来免得被当成这次导入的 #}
+          <span class="rounded bg-amber-100 px-1.5 py-0.5 text-amber-900" title="不随版本变化，检索任何版本都会一并纳入">未标注版本</span>
+          {% else %}
+          <span class="text-slate-300">{{ empty }}</span>
+          {% endif %}
+        </td>
+        <td class="px-3 py-2.5 text-right font-mono text-xs text-slate-400">{{ chunk.content | length }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+<p class="mt-3 text-xs text-slate-400">点正文那一格展开全文。</p>
 {% endif %}
 
 {% endblock %}

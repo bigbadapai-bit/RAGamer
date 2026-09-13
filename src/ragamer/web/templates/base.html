@@ -1,38 +1,40 @@
+{#
+  全站外壳：左侧深色导航栏 ＋ 右侧主区。所有页面都从这里出去，各页只填 `content`。
+
+  导航放在左侧而不是顶栏，是为了让主区拿到整幅宽度——切分预览页那张表要七列并排，
+  导入结果那段也要同时摆开文件名、文档、结果与切片数，顶栏那版横着挤不下。
+
+  前端依赖走 CDN，零构建步骤（ADR-0005）。连不上外网时页面照常能用（表单是原生 HTML、
+  功能不依赖 JavaScript），只是没有样式、也不会局部刷新。
+#}
 <!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{{ title }} · RAGamer</title>
-  {#
-    两个前端依赖都走 CDN —— 这就够了，没有 npm、没有打包（ADR-0005）。
-    代价是页面第一次加载要连得上外网；连不上时页面照常能用（表单是原生 HTML，
-    功能不依赖 JavaScript），只是没有样式、也不会局部刷新。
-  #}
   <script src="https://cdn.tailwindcss.com"></script>
-  <script src="https://unpkg.com/htmx.org@2.0.4/dist/htmx.min.js"></script>
+  {% block head %}{% endblock %}
 </head>
-<body class="min-h-screen bg-slate-50 text-slate-900">
-  <header class="border-b border-slate-200 bg-white">
-    <div class="mx-auto flex max-w-5xl flex-wrap items-center gap-x-6 gap-y-2 px-4 py-3">
-      <a href="/kb" class="text-lg font-semibold tracking-tight">RAGamer</a>
-      <nav class="flex flex-wrap gap-x-5 gap-y-1 text-sm">
+<body class="min-h-screen bg-slate-100 text-slate-900">
+
+  <div class="flex min-h-screen">
+    <aside class="w-52 shrink-0 bg-slate-900 px-3 py-5 text-slate-300">
+      <p class="mb-6 px-3 text-sm font-semibold text-white">RAGamer</p>
+      <nav class="space-y-1 text-sm">
         {% for item in nav %}
         <a href="{{ item.url }}"
-           class="{% if item.active %}font-semibold text-slate-900{% else %}text-slate-500 hover:text-slate-900{% endif %}">{{ item.label }}</a>
+           class="block rounded px-3 py-2 {% if item.active %}bg-white/10 font-medium text-white{% else %}hover:bg-white/10{% endif %}">{{ item.label }}</a>
         {% endfor %}
       </nav>
-    </div>
-  </header>
 
-  <main class="mx-auto max-w-5xl px-4 py-8">
-    <h1 class="mb-6 text-2xl font-semibold tracking-tight">{{ title }}</h1>
+      {# 在哪个库里，预览页尤其需要——同一份文档名在两个库里是完全不同的两份资料 #}
+      {% if game_id %}<p class="mt-8 border-t border-white/10 px-3 pt-4 font-mono text-xs text-slate-500">{{ game_id }}</p>{% endif %}
+    </aside>
 
-    {% if error %}
-    <p class="mb-6 rounded border border-red-300 bg-red-50 px-4 py-3 text-sm text-red-800">{{ error }}</p>
-    {% endif %}
-
-    {% block content %}{% endblock %}
-  </main>
+    <main class="min-w-0 flex-1 p-8">
+      {% block content %}{% endblock %}
+    </main>
+  </div>
 </body>
 </html>

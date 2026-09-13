@@ -2,44 +2,64 @@
   导入结果区。整页渲染时被 import.html 包在 #import-result 里；htmx 提交时单独回这一个片段，
   换掉那个 div 的内容。两处渲染的是同一份数据，所以两条路看到的东西一模一样——
   出错时也一样：那条消息得落在这个区域里，才不至于被换掉之后看不见。
+
+  排成表而不是一段段说明文字，是因为这一页要回答的是「哪些成了、哪些没成、卡在哪一步」，
+  逐行对齐才扫得出来。
 #}
 {% if message %}
-<p class="mb-6 rounded border border-red-300 bg-red-50 px-4 py-3 text-sm text-red-800">{{ message }}</p>
+<p class="mb-6 rounded border border-red-300 bg-red-50 px-4 py-2.5 text-sm text-red-800">{{ message }}</p>
 {% endif %}
 
 {% if result %}
-<section class="rounded border border-slate-200 bg-white p-5">
-  <h2 class="mb-1 text-lg font-medium">导入结果</h2>
-  <p class="mb-4 text-sm text-slate-500">
-    共 {{ result.rows | length }} 份，成功 {{ result.imported }} 份{% if result.failed %}，失败 {{ result.failed }} 份{% endif %}。
-  </p>
+<section class="overflow-hidden rounded-md border border-slate-200 bg-white shadow-sm">
+  <div class="flex flex-wrap items-baseline justify-between gap-x-6 border-b border-slate-100 bg-slate-50 px-4 py-2.5">
+    <h2 class="text-[11px] uppercase tracking-wider text-slate-500">导入结果</h2>
+    <p class="text-sm text-slate-500">
+      共 {{ result.rows | length }} 份 · 成功 <span class="font-mono text-slate-900">{{ result.imported }}</span>
+      {%- if result.failed %} · 失败 <span class="font-mono text-red-700">{{ result.failed }}</span>{% endif %}
+    </p>
+  </div>
 
-  <ul class="space-y-3">
-    {% for row in result.rows %}
-    <li class="border-t border-slate-200 pt-3 first:border-0 first:pt-0">
-      <div class="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
-        <span class="text-sm font-medium">{{ row.filename }}</span>
-        {% if row.ok %}
-        <span class="text-sm text-slate-500">
-          《{{ row.doc_title }}》· 入库 {{ row.chunk_count }} 条{% if row.skipped %}，跳过 {{ row.skipped }} 条{% endif %}
-        </span>
-        {% else %}
-        <span class="text-sm text-red-700">卡在「{{ row.stage_label }}」：{{ row.error }}</span>
-        {% endif %}
-      </div>
-
-      {% if row.ok %}
-      <p class="mt-1 text-xs text-slate-500">
-        主体名 {{ row.subject_name or empty }}
-        {%- if row.subject_types %} · 主体类型 {{ row.subject_types | join("、") }}{% endif %}
-        {%- if row.content_natures %} · 内容性质 {{ row.content_natures | join("、") }}{% endif %}
-      </p>
-      <p class="mt-2 text-sm">
-        <a class="underline" href="{{ row.preview_url }}">看切分结果</a>
-      </p>
-      {% endif %}
-    </li>
-    {% endfor %}
-  </ul>
+  <table class="w-full border-collapse text-sm">
+    <thead class="text-left text-[11px] uppercase tracking-wider text-slate-500">
+      <tr class="border-b border-slate-100">
+        <th class="w-48 px-3 py-2.5 font-medium">文件</th>
+        <th class="w-40 px-3 py-2.5 font-medium">存成文档</th>
+        <th class="px-3 py-2.5 font-medium">结果</th>
+        <th class="w-28 px-3 py-2.5 text-right font-medium">切片</th>
+        <th class="w-20 px-3 py-2.5 font-medium">操作</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in result.rows %}
+      <tr class="border-t border-slate-100 align-top {% if not row.ok %}bg-red-50/40{% endif %}">
+        <td class="px-3 py-2.5 text-slate-800">{{ row.filename }}</td>
+        <td class="px-3 py-2.5 text-slate-600">{{ row.doc_title or empty }}</td>
+        <td class="px-3 py-2.5 text-xs">
+          {% if row.ok %}
+          <span class="rounded bg-emerald-50 px-1.5 py-0.5 text-emerald-700">成功</span>
+          <span class="ml-2 text-slate-500">
+            主体名 {{ row.subject_name or empty }}
+            {%- if row.subject_types %} · {{ row.subject_types | join("、") }}{% endif %}
+            {%- if row.content_natures %} · {{ row.content_natures | join("、") }}{% endif %}
+          </span>
+          {% else %}
+          <span class="rounded bg-red-100 px-1.5 py-0.5 text-red-800">卡在「{{ row.stage_label }}」</span>
+          <span class="ml-2 text-red-700">{{ row.error }}</span>
+          {% endif %}
+        </td>
+        <td class="px-3 py-2.5 text-right font-mono text-xs">
+          {% if row.ok %}
+          <span class="text-slate-900">{{ row.chunk_count }}</span>
+          {% if row.skipped %}<span class="text-slate-400">（跳过 {{ row.skipped }}）</span>{% endif %}
+          {% else %}<span class="text-slate-300">{{ empty }}</span>{% endif %}
+        </td>
+        <td class="px-3 py-2.5 text-xs">
+          {% if row.ok %}<a class="underline" href="{{ row.preview_url }}">看切分</a>{% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
 </section>
 {% endif %}
