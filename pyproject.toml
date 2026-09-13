@@ -23,6 +23,10 @@ dependencies = [
     "python-multipart>=0.0.20",
     # minio 的传输层就是 urllib3；要自定义 PoolManager 才能设连接超时并关掉重试
     "urllib3>=2.0",
+    # 普通网页的正文抽取：导航栏、页脚、侧边栏这些 boilerplate 由它识别并丢掉，
+    # 顺带把正文转成 Markdown（`output_format="markdown"`）。自己写一遍是重造轮子，
+    # 而这正是它唯一做的事。MediaWiki 那条路不用它——那条走接口拿 wikitext
+    "trafilatura>=2.0",
 ]
 
 [project.scripts]
