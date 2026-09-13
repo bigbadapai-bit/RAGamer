@@ -521,6 +521,24 @@ def test_删库是幂等的(store, milvus):
     assert _client(milvus).called("drop_collection") == [{"collection_name": "black_myth"}]
 
 
+def test_数出这个游戏有多少切片(store, existing):
+    """删库前的确认页要报出「将清掉多少条」，`count(*)` 是 Milvus 的算法。"""
+    existing.rows = [{"count(*)": 128}]
+
+    assert store.count("black_myth") == 128
+
+    call = _client(existing).called("query")[0]
+    assert call["collection_name"] == "black_myth"
+    assert call["output_fields"] == ["count(*)"]
+    assert call["filter"] == ""
+
+
+def test_数切片时表还没建起来算零条(store, milvus):
+    """空库也数得出「0 条」——为它报一个供应商的异常，删库那一步就白断了。"""
+    assert store.count("black_myth") == 0
+    assert _client(milvus).called("query") == []
+
+
 def test_远端不可达时在超时内失败并点名服务与地址():
     """验收标准里的快速失败：不能挂在启动上，且要说得清是哪个服务、哪个地址。"""
     settings = MilvusSettings(uri="http://127.0.0.1:1", token="tok", db="ragamer_test")

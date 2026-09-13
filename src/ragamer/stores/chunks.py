@@ -390,6 +390,21 @@ class MilvusChunkStore:
         )
         logger.info("删除 %s 在版本 %r 下的 %d 个旧切片", doc_title, version, len(stale))
 
+    def count(self, game_id: str) -> int:
+        client = self._client()
+        name = collection_name(game_id)
+        if not client.has_collection(name, timeout=self._timeout):
+            return 0  # 没有表就是没有切片，与 `fetch_document` 同一条口径
+        rows = client.query(
+            collection_name=name,
+            # `count(*)` 要求过滤表达式为空：带上条件就成了「符合条件的行数」，
+            # 而这里问的是整张表有多少行
+            filter="",
+            output_fields=["count(*)"],
+            timeout=self._timeout,
+        )
+        return int(rows[0]["count(*)"])
+
     def drop(self, game_id: str) -> None:
         client = self._client()
         name = collection_name(game_id)

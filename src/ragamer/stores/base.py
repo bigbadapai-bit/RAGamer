@@ -248,6 +248,14 @@ class ChunkStore(Store, Protocol):
         """
         ...
 
+    def count(self, game_id: str) -> int:
+        """该游戏 collection 里的切片数。**还没建表就是 0**，不报错。
+
+        删库前的确认页用它说清「将清掉多少条」——报一个异常的话，一个空库会把
+        整条确认路径断在那里，而「0 条」本来就是一个说得通的答案。
+        """
+        ...
+
     def drop(self, game_id: str) -> None:
         """删掉该游戏的 collection。删库要清四处，这是其中一处。"""
         ...

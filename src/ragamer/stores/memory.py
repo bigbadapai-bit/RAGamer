@@ -90,6 +90,9 @@ class InMemoryChunkStore:
             if chunk.version == version:
                 del rows[chunk.chunk_id]
 
+    def count(self, game_id: str) -> int:
+        return len(self._collections.get(collection_name(game_id), {}))
+
     def drop(self, game_id: str) -> None:
         self._collections.pop(collection_name(game_id), None)
 

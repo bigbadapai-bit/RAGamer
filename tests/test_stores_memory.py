@@ -223,6 +223,17 @@ def test_删库后检索不到该游戏的切片(memory_container):
     assert store.search("black_myth", dense=fake_vector(1)) == []
 
 
+def test_数出这个游戏有多少切片(memory_container):
+    """没建过表的游戏算 0 条，与真实适配器同一条口径。"""
+    store = memory_container.chunks
+    assert store.count("black_myth") == 0
+
+    store.upsert("black_myth", [make_chunk(1), make_chunk(2)])
+
+    assert store.count("black_myth") == 2
+    assert store.count("zelda") == 0
+
+
 def test_文档存储的增改删查(memory_container):
     docs = memory_container.docs
     assert docs.get("knowledge_bases", "black_myth") is None
