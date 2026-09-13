@@ -281,6 +281,39 @@ class DocStore(Store, Protocol):
         """列出该集合的全部文档 id，按字典序。"""
         ...
 
+    def find(
+        self,
+        collection: str,
+        where: Mapping[str, Any] | None = None,
+        *,
+        fields: Sequence[str] = (),
+        order_by: str | None = None,
+        descending: bool = False,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """按字段取一批文档。**只读**。
+
+        有 `get` 还要有它的理由只有一个：**列表**。界面上的会话列表、知识库列表要的是
+        「某个游戏下的最近若干条，且不要正文」——先 `list_ids` 再逐条 `get` 会把每份文档
+        都读出来，几十条会话就是几十次往返，而其中有用的只有标题和时间那两个字段。
+
+        - `where`：**等值**匹配，`None` 即不过滤。刻意只做到等值——比较、数组包含那些
+          是 `ChunkFilter` 的事，那边有 `matches()` 兜住两套实现的口径；这一层再长出一套
+          过滤语义，两个后端就会有对不上的地方。
+        - `fields`：空即整份返回；非空只返回这几项。**列表这类场景必须给**，否则把一堆
+          用不上的正文拖回来，正是这个方法要避免的事。
+        - `order_by` / `descending`：按哪个字段排、正序还是倒序。不给 `order_by` 时
+          顺序由存储自己定（Mongo 不保证），**不要依赖它**。
+        - `limit`：条数上限。
+
+        **返回的每一条都带 `_id`**。它是文档 id，批量取的时候调用方就是靠它认人的。
+        `get` 那边把 `_id` 摘掉是因为 id 本来就是调用方给的，这里正好反过来。
+
+        一条都没命中时返回空列表，不报错——**「一条都没有」是列表的正常状态**，
+        与「这个集合不存在」也不作区分，两者对调用方是同一件事。
+        """
+        ...
+
 
 @runtime_checkable
 class ObjectStore(Store, Protocol):

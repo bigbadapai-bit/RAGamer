@@ -120,6 +120,20 @@ def create_app(container: Container) -> FastAPI:
         conversation = chat.start(game_id=payload.game_id, version=payload.version)
         return _conversation_payload(conversation)
 
+    @app.get("/api/chat/sessions")
+    def list_sessions(game_id: str) -> dict[str, Any]:
+        """一个知识库下的会话，按最后活跃倒序。**左栏那一份列表**。
+
+        只回标题与时间——正文在 `GET /api/chat/sessions/{session_id}` 那一条上取。
+        库里一条会话都没有时回空列表，不是 404；**「还没聊过」是正常状态**。
+        知识库本身不存在则是 404，与建会话同一个口径：那是游戏选错了。
+        """
+        _kb_document(container, game_id)
+        return {
+            "game_id": game_id,
+            "sessions": [asdict(summary) for summary in chat.list_for_game(game_id)],
+        }
+
     @app.get("/api/chat/sessions/{session_id}")
     def read_session(session_id: str) -> dict[str, Any]:
         """一次会话的全部问答。**刷新页面靠它把历史拿回来**——历史在服务端，不在页面里。

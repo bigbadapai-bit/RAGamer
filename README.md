@@ -145,8 +145,13 @@ uv run pytest -m integration     # 跑真模型的集成测试（首次会下载
 | 端点 | 做什么 |
 |---|---|
 | `POST /api/chat/sessions` | 开一次会话，绑一个知识库 |
+| `GET /api/chat/sessions?game_id=…` | 这个库的会话列表，按最后活跃倒序（左栏那一份） |
 | `GET /api/chat/sessions/{id}` | 把历史读回来（刷新页面靠它） |
 | `GET /api/chat/sessions/{id}/ask?question=…` | 问一句，SSE 逐字回 |
+
+列表只回 `session_id` / `title` / `updated_at` 三样，**正文不读**：会话文档里存着 `title`
+（首轮问句截断，只在第一轮写一次）与 `updated_at`（每次落库刷新），查询带着投影下发到
+Mongo——几十条会话逐条读回来的话，全文都进了内存而界面只显示一行字。
 
 ## 目录
 

@@ -36,8 +36,9 @@
 from __future__ import annotations
 
 import uuid
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
+from datetime import UTC, datetime
 from typing import Any, Literal
 
 from ragamer.answering import Answerer, Citation, require_question
@@ -59,8 +60,32 @@ CONVERSATIONS = "conversations"
 #: 只有「指代基本指向上一两轮」。落不进窗口的旧轮次仍留在会话里，只是不参与理解。
 HISTORY_TURNS = 3
 
+#: 会话列表一次给几条。**「近期」是一个默认值，不是分页**——左栏放得下这么多，
+#: 再多也没人往下翻。真要看更早的，那是另一张票的事（得先有分页游标）。
+LIST_LIMIT = 20
+
+#: 会话标题的长度上限（**字符数**，不是显示宽度）。标题只是列表里的一行提示，
+#: 全文在会话里；截断处补一个省略号，免得看起来像问句本来就断在那里。
+TITLE_CHARS = 24
+
 #: 会话里一条消息的角色。**没有 `system`**：提示词是每一步自己拼的，不存进会话。
 TurnRole = Literal["user", "assistant"]
+
+
+def _utc_now() -> str:
+    """当下时刻，ISO-8601 UTC。
+
+    选字符串而不是时间戳：它在 Mongo 的 shell 里直接看得懂，而**字典序就是时间序**，
+    列表排序不需要再转一次。带时区（`+00:00`）而不是裸的本地时间——换台机器跑，
+    排序结果不该跟着机器的时区变。
+    """
+    return datetime.now(UTC).isoformat()
+
+
+def _title(question: str) -> str:
+    """首轮问句 → 列表里的一行标题。压平空白再截断。"""
+    flat = " ".join(question.split())
+    return flat if len(flat) <= TITLE_CHARS else flat[:TITLE_CHARS] + "…"
 
 
 @dataclass(frozen=True)
@@ -90,6 +115,24 @@ class Conversation:
     #: 这次会话选定的版本。空串表示没选，检索时再回落知识库的现行版本。
     version: str = ""
     turns: tuple[Turn, ...] = ()
+    #: 列表里显示的一行，取**首轮问句**截断。只在第一轮写一次，之后不动——
+    #: 标题跟着最新一句改的话，用户会觉得侧栏里的东西在自己动。
+    title: str = ""
+    #: 最后一次落库的时刻（ISO-8601 UTC）。列表按它倒序，所以**每次写都要刷新**。
+    updated_at: str = ""
+
+
+@dataclass(frozen=True)
+class ConversationSummary:
+    """会话列表里的一条。
+
+    **刻意不含 `turns`**：列表要的是标题与时间，而一份会话的正文可能很长。让这个类型
+    天生装不下正文，比在端点那层记得「不要序列化正文」可靠——那是靠人记住的约定。
+    """
+
+    session_id: str
+    title: str
+    updated_at: str
 
 
 class ConversationNotFound(LookupError):
@@ -157,6 +200,9 @@ class Chat:
     docs: DocStore
     answerer: Answerer
     llm: LlmClient
+    #: 取当下时刻。做成可注入的，与 `OpenAiLlm(sleep=…)` 同一个理由：时间一进断言，
+    #: 测试就得能摆布它，否则「按最后活跃倒序」那条用例会看机器的脸色。
+    clock: Callable[[], str] = _utc_now
 
     def start(self, *, game_id: str, version: str = "") -> Conversation:
         """开一次会话。
@@ -168,10 +214,44 @@ class Chat:
             那是 HTTP 面该判的事（见 `ragamer.api`），这一层不认 HTTP 状态码。
         :param version: 这次会话选定的版本。空串即不选，检索时回落知识库的现行版本。
         """
-        conversation = Conversation(session_id=uuid.uuid4().hex, game_id=game_id, version=version)
+        conversation = Conversation(
+            session_id=uuid.uuid4().hex,
+            game_id=game_id,
+            version=version,
+            updated_at=self.clock(),
+        )
         _save(self.docs, conversation)
         logger.info("新建会话 %s：知识库 %s，版本 %r", conversation.session_id, game_id, version)
         return conversation
+
+    def list_for_game(self, game_id: str) -> tuple[ConversationSummary, ...]:
+        """这个知识库下的会话，**按最后活跃倒序**。
+
+        左栏那一份列表。只取标题与时间：`find` 的投影把正文挡在外面——一条一条读回来的话，
+        几十份会话的全文都进了内存，而界面上只显示一行字。
+
+        **一次查询，不在这一层过滤**：`game_id` 的等值匹配下推给存储，那边有索引可用。
+        取回 id 再逐条筛是另一条路，代价是每次都要读完整份文档。
+
+        「最后一次说话」而不是「什么时候建的」：继续聊过的会话不该沉到下面去。
+        空库返回空元组——**「这个库还没聊过」是正常状态**，不是错误。
+        """
+        found = self.docs.find(
+            CONVERSATIONS,
+            {"game_id": game_id},
+            fields=("title", "updated_at"),
+            order_by="updated_at",
+            descending=True,
+            limit=LIST_LIMIT,
+        )
+        return tuple(
+            ConversationSummary(
+                session_id=str(document["_id"]),
+                title=str(document.get("title", "")),
+                updated_at=str(document.get("updated_at", "")),
+            )
+            for document in found
+        )
 
     def open(self, session_id: str) -> Conversation:
         """把一次会话读回来。刷新页面之后靠它把历史拿回来。
@@ -277,7 +357,10 @@ class Chat:
         for piece in stream.deltas:
             produced.append(piece)
             yield Delta(piece)
-        _save(self.docs, _appended(conversation, question, "".join(produced), stream.citations))
+        _save(
+            self.docs,
+            _appended(conversation, question, "".join(produced), stream.citations, self.clock()),
+        )
 
 
 def _history(turns: Sequence[Turn]) -> tuple[Message, ...]:
@@ -307,10 +390,17 @@ def _appended(
     question: str,
     answer: str,
     citations: tuple[Citation, ...],
+    now: str,
 ) -> Conversation:
-    """把这一问一答接到末尾。**两条一起接**：中途断掉时不会留下一条等不到回复的提问。"""
+    """把这一问一答接到末尾。**两条一起接**：中途断掉时不会留下一条等不到回复的提问。
+
+    标题只在第一轮定下（`conversation.title or …`）：它是这一串问答的招牌，跟着最新
+    一句改会让侧栏里的东西自己动。`updated_at` 反过来，**每次都要刷新**——列表按它排序。
+    """
     return replace(
         conversation,
+        title=conversation.title or _title(question),
+        updated_at=now,
         turns=(
             *conversation.turns,
             Turn("user", question),
@@ -332,6 +422,8 @@ def _payload(conversation: Conversation) -> dict[str, Any]:
     return {
         "game_id": conversation.game_id,
         "version": conversation.version,
+        "title": conversation.title,
+        "updated_at": conversation.updated_at,
         "turns": [_turn_payload(turn) for turn in conversation.turns],
     }
 
@@ -351,6 +443,8 @@ def _read(session_id: str, payload: Mapping[str, Any]) -> Conversation:
         game_id=str(payload.get("game_id", "")),
         version=str(payload.get("version", "")),
         turns=tuple(_read_turn(turn) for turn in payload.get("turns", ())),
+        title=str(payload.get("title", "")),
+        updated_at=str(payload.get("updated_at", "")),
     )
 
 

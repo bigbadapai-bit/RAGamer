@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Iterator
 from typing import Any, ClassVar
 
 import pytest
@@ -16,11 +17,34 @@ from ragamer.stores.base import StoreUnavailableError
 from ragamer.stores.documents import MongoDocStore
 
 
+class FakeCursor:
+    """记录 `sort` / `limit` 的假游标，本身可迭代——真游标就是这么用的。
+
+    `sort` / `limit` 的调用记回集合那一份 `calls` 里：**顺序是有意义的**——
+    先投影、再排序、最后截断，与真实那边发出去的命令必须是这个次序。
+    """
+
+    def __init__(self, documents: list[dict[str, Any]], calls: list[tuple[str, Any]]) -> None:
+        self._documents = documents
+        self._calls = calls
+
+    def sort(self, field: str, direction: int) -> FakeCursor:
+        self._calls.append(("sort", {"field": field, "direction": direction}))
+        return self
+
+    def limit(self, count: int) -> FakeCursor:
+        self._calls.append(("limit", count))
+        return self
+
+    def __iter__(self) -> Iterator[dict[str, Any]]:
+        return iter(self._documents)
+
+
 class FakeCollection:
     """记录调用、返回预置文档的假集合。"""
 
     def __init__(self) -> None:
-        self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.calls: list[tuple[str, Any]] = []
         self.document: dict[str, Any] | None = None
 
     def find_one(self, filter: dict[str, Any]) -> dict[str, Any] | None:
@@ -35,9 +59,9 @@ class FakeCollection:
     def delete_one(self, filter: dict[str, Any]) -> None:
         self.calls.append(("delete_one", filter))
 
-    def find(self, filter: dict[str, Any]) -> list[dict[str, Any]]:
-        self.calls.append(("find", filter))
-        return [{"_id": "b"}, {"_id": "a"}]
+    def find(self, filter: dict[str, Any], projection: dict[str, Any] | None = None) -> FakeCursor:
+        self.calls.append(("find", {"filter": filter, "projection": projection}))
+        return FakeCursor([{"_id": "b"}, {"_id": "a"}], self.calls)
 
 
 class FakeDatabase:
@@ -161,6 +185,41 @@ def test_删除与列出文档_id(store, mongo):
     collection = _client(mongo)["ragamer-test"]["knowledge_bases"]
     assert collection.calls == [("delete_one", {"_id": "black_myth"})]
     assert store.list_ids("knowledge_bases") == ["a", "b"]
+
+
+def test_按字段取一批文档(store, mongo):
+    """列表那一类查询：等值匹配、投影、排序、截断，**一次发出去、按这个次序**。"""
+    store.find(
+        "conversations",
+        {"game_id": "black_myth"},
+        fields=("title", "updated_at"),
+        order_by="updated_at",
+        descending=True,
+        limit=20,
+    )
+
+    collection = _client(mongo)["ragamer-test"]["conversations"]
+    assert collection.calls == [
+        (
+            "find",
+            {
+                "filter": {"game_id": "black_myth"},
+                "projection": {"title": 1, "updated_at": 1},
+            },
+        ),
+        ("sort", {"field": "updated_at", "direction": -1}),
+        ("limit", 20),
+    ]
+
+
+def test_不排序不截断时只发一次_find(store, mongo):
+    """没给的就不发——默认值不该变成一条多余的命令。"""
+    found = store.find("conversations")
+
+    collection = _client(mongo)["ragamer-test"]["conversations"]
+    assert collection.calls == [("find", {"filter": {}, "projection": None})]
+    # `get` 把 `_id` 摘掉是因为 id 是调用方给的；批量取反过来，调用方靠它认人
+    assert [document["_id"] for document in found] == ["b", "a"]
 
 
 def test_远端不可达时在超时内失败并点名服务与地址():

@@ -124,6 +124,37 @@ class InMemoryDocStore:
     def list_ids(self, collection: str) -> list[str]:
         return sorted(self._collections.get(collection, {}))
 
+    def find(
+        self,
+        collection: str,
+        where: Mapping[str, Any] | None = None,
+        *,
+        fields: Sequence[str] = (),
+        order_by: str | None = None,
+        descending: bool = False,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """等值匹配 + 排序 + 截断，与真实那边同一套语义。
+
+        排序前先按 id 定序，所以**同分的排法在这里是确定的**——真实那边不保证，
+        测试依赖的是这里这份确定性。缺 `order_by` 那个字段的按空串算：本项目要排序的
+        字段（时间）都是必有的，真出现缺的，两边排法会不一样，这一点不追平。
+        """
+        wanted = dict(where or {})
+        found = [
+            {"_id": doc_id, **document}
+            for doc_id, document in sorted(self._collections.get(collection, {}).items())
+            if all(document.get(key) == value for key, value in wanted.items())
+        ]
+        if order_by is not None:
+            found.sort(key=lambda document: document.get(order_by, ""), reverse=descending)
+        if fields:
+            found = [
+                {"_id": document["_id"], **{f: document[f] for f in fields if f in document}}
+                for document in found
+            ]
+        return found[:limit] if limit is not None else found
+
 
 class InMemoryObjectStore:
     """内存里的对象存储。桶是隐含的：有对象就算有桶。"""

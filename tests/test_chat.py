@@ -124,6 +124,52 @@ def test_两次会话互不串扰():
     assert len(client.get(f"/api/chat/sessions/{first}").json()["turns"]) == 2
 
 
+# --- 会话列表 ---
+
+
+def test_列出这个库的会话_按最后活跃倒序():
+    """左栏那一份：**最后说过话的排最前**，先建的那个也一样能翻上来。"""
+    client = client_with(FakeLlm(said(QUESTION), REPLY), DOC)
+    first = start(client)
+    second = start(client)
+
+    ask(client, first, QUESTION)  # 先建的会话反而最后说话
+
+    listed = client.get("/api/chat/sessions", params={"game_id": GAME}).json()["sessions"]
+
+    assert [item["session_id"] for item in listed] == [first, second]
+    assert listed[0]["title"] == QUESTION
+    assert listed[1]["title"] == ""  # 还没问过的会话没有标题
+
+
+def test_列表不带正文():
+    """列表只给标题与时间；正文在 `GET /api/chat/sessions/{id}` 那一条上取。"""
+    client = client_with(FakeLlm(said(QUESTION), REPLY), DOC)
+    session_id = start(client)
+    ask(client, session_id, QUESTION)
+
+    listed = client.get("/api/chat/sessions", params={"game_id": GAME}).json()["sessions"]
+
+    assert set(listed[0]) == {"session_id", "title", "updated_at"}
+
+
+def test_没聊过的库回空列表():
+    """一条会话都没有是正常状态，与「没有这个知识库」分得开。"""
+    client = client_with(FakeLlm())
+
+    listed = client.get("/api/chat/sessions", params={"game_id": GAME}).json()
+
+    assert listed["sessions"] == []
+
+
+def test_列出不存在的知识库时404():
+    client = client_with(FakeLlm())
+
+    response = client.get("/api/chat/sessions", params={"game_id": "another_game"})
+
+    assert response.status_code == 404
+
+
 # --- 流式 ---
 
 

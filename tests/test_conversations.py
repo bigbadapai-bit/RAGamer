@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from dataclasses import replace
 
 import pytest
 
@@ -21,6 +22,7 @@ from ragamer.answering import NOT_FOUND
 from ragamer.api import KB_COLLECTION
 from ragamer.conversations import (
     HISTORY_TURNS,
+    TITLE_CHARS,
     Chat,
     Conversation,
     ConversationNotFound,
@@ -263,6 +265,104 @@ def test_历史只带最近几轮():
     # 问第 4 问时前面已有四轮，带进去的是最后三轮（第 1、2、3 问）
     assert history[0] == ("user", "第1问")
     assert history[-1] == ("assistant", "第3答。")
+
+
+# --- 会话列表 ---
+
+
+class TickingClock:
+    """一次比一次晚的假时钟。
+
+    **列表排序要能断言，就不能看机器的脸色**：两次落库挨得够近时，真实时钟给出的
+    时刻有可能一模一样，那时谁在前就由不得用例了。
+    """
+
+    def __init__(self) -> None:
+        self._times = iter(f"2026-09-13T00:00:{second:02d}+00:00" for second in range(60))
+
+    def __call__(self) -> str:
+        return next(self._times)
+
+
+def listing_chat(llm, *chunks) -> Chat:
+    """带上假时钟的对话侧。"""
+    return replace(setup_chat(llm, *chunks), clock=TickingClock())
+
+
+def test_会话列表按最后活跃倒序且只给这个库的():
+    """左栏那一份：**最近说过的排最前**，别人的库一条都不进来。"""
+    llm = FakeLlm(
+        said("二郎神是谁"),
+        "二郎神是隐藏 BOSS[1]。",
+        said("二郎神掉什么"),
+        "掉的是三尖两刃刀[1]。",
+        said("二郎神怎么打"),
+        "先定身再贴身输出[1]。",
+    )
+    chat = listing_chat(llm, DOC)
+    first = chat.start(game_id=GAME)
+    second = chat.start(game_id=GAME)
+    elsewhere = chat.start(game_id="another_game")
+
+    asked(chat, first, "二郎神是谁")
+    asked(chat, second, "二郎神掉什么")
+    asked(chat, first, "二郎神怎么打")  # 又绕回第一个会话说了一句
+
+    listed = chat.list_for_game(GAME)
+
+    assert [item.session_id for item in listed] == [first.session_id, second.session_id]
+    assert elsewhere.session_id not in {item.session_id for item in listed}
+
+
+def test_列表只给标题与时间():
+    """一条会话的正文可能很长——几十条一起读回来只为显示一行字，是这一层最不该做的事。"""
+    llm = FakeLlm(said("二郎神掉什么"), "掉的是三尖两刃刀[1]。")
+    chat = listing_chat(llm, DOC)
+    conversation = chat.start(game_id=GAME)
+
+    asked(chat, conversation, "二郎神掉什么")
+
+    listed = chat.list_for_game(GAME)
+    assert len(listed) == 1
+    assert listed[0].title == "二郎神掉什么"
+    assert listed[0].updated_at > conversation.updated_at  # 落库时刷新过
+
+
+def test_标题取首轮问句且之后不再跟着改():
+    """标题是这一串问答的招牌。跟着最新一句改的话，侧栏里的东西会自己动。"""
+    llm = FakeLlm(
+        said("二郎神是谁"),
+        "二郎神是隐藏 BOSS[1]。",
+        said("二郎神掉什么"),
+        "掉的是三尖两刃刀[1]。",
+    )
+    chat = listing_chat(llm, DOC)
+    conversation = chat.start(game_id=GAME)
+
+    asked(chat, conversation, "二郎神是谁")
+    asked(chat, conversation, "那它掉什么")
+
+    assert chat.open(conversation.session_id).title == "二郎神是谁"
+
+
+def test_标题长了截断并补省略号():
+    question = "二郎神这个 BOSS 到底应该怎么打才能不掉血地过掉第二阶段"
+    llm = FakeLlm(said(question), "先定身再贴身输出[1]。")
+    chat = listing_chat(llm, DOC)
+    conversation = chat.start(game_id=GAME)
+
+    asked(chat, conversation, question)
+
+    title = chat.list_for_game(GAME)[0].title
+    assert title == question[:TITLE_CHARS] + "…"
+    assert len(title) == TITLE_CHARS + 1
+
+
+def test_没聊过的库返回空元组():
+    """「这个库还没聊过」是正常状态，不是错误。"""
+    chat = listing_chat(FakeLlm())
+
+    assert chat.list_for_game(GAME) == ()
 
 
 def test_检索不到时那句明确回复也进历史():

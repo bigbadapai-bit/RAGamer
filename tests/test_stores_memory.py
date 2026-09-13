@@ -268,6 +268,56 @@ def test_文档的_id_由参数给而不是载荷(memory_container):
     assert docs.list_ids("knowledge_bases") == ["black_myth"]
 
 
+def test_按字段取一批文档(memory_container):
+    """等值匹配、投影、排序、截断，与真实那边同一套语义——列表那类查询走的就是它。
+
+    一次把四个旋钮都用上：结果里**没有 `turns`**（投影挡住了正文），
+    顺序是倒序，条数是上限，别个库的没进来。
+    """
+    docs = memory_container.docs
+    docs.put(
+        "conversations",
+        "s1",
+        {"game_id": "black_myth", "title": "先问的", "updated_at": "2026-09-13T01:00:00+00:00"},
+    )
+    docs.put(
+        "conversations",
+        "s2",
+        {"game_id": "black_myth", "title": "后问的", "updated_at": "2026-09-13T02:00:00+00:00"},
+    )
+    docs.put(
+        "conversations",
+        "s3",
+        {"game_id": "another_game", "title": "别个库的", "updated_at": "2026-09-13T03:00:00+00:00"},
+    )
+
+    found = docs.find(
+        "conversations",
+        {"game_id": "black_myth"},
+        fields=("title", "updated_at"),
+        order_by="updated_at",
+        descending=True,
+        limit=1,
+    )
+
+    assert found == [{"_id": "s2", "title": "后问的", "updated_at": "2026-09-13T02:00:00+00:00"}]
+
+
+def test_按字段取不到时返回空列表(memory_container):
+    """「一条都没有」是列表的正常状态，不是错误。"""
+    assert memory_container.docs.find("conversations", {"game_id": "还没有这个库"}) == []
+    assert memory_container.docs.find("还没有这个集合") == []
+
+
+def test_不投影时整份返回(memory_container):
+    docs = memory_container.docs
+    docs.put("conversations", "s1", {"game_id": "black_myth", "turns": [{"role": "user"}]})
+
+    assert docs.find("conversations") == [
+        {"_id": "s1", "game_id": "black_myth", "turns": [{"role": "user"}]}
+    ]
+
+
 def test_对象存储按前缀列出与清理(memory_container):
     objects = memory_container.objects
     objects.ensure_bucket()

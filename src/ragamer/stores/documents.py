@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from pymongo import MongoClient
@@ -65,6 +65,25 @@ class MongoDocStore:
 
     def list_ids(self, collection: str) -> list[str]:
         return sorted(str(document["_id"]) for document in self._collection(collection).find({}))
+
+    def find(
+        self,
+        collection: str,
+        where: Mapping[str, Any] | None = None,
+        *,
+        fields: Sequence[str] = (),
+        order_by: str | None = None,
+        descending: bool = False,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        # 投影留空即整份返回。`_id` 不用显式要：Mongo 默认就带，而调用方正靠它认人
+        projection = {field: 1 for field in fields} if fields else None
+        cursor = self._collection(collection).find(dict(where or {}), projection)
+        if order_by is not None:
+            cursor = cursor.sort(order_by, -1 if descending else 1)
+        if limit is not None:
+            cursor = cursor.limit(limit)
+        return [dict(document) for document in cursor]
 
     def _connect(self) -> MongoClient:
         if self._client is None:
