@@ -39,13 +39,15 @@ from ragamer.conversations import (
     Game,
     Reply,
     Sources,
+    Status,
 )
 from ragamer.importing import STAGE_LABELS, Importer, ImportResult, ProgressEvent
 from ragamer.llm import LlmError
 from ragamer.logging import get_logger
 from ragamer.sources import SourceDocument
-from ragamer.stores.base import UNVERSIONED, collection_name
+from ragamer.stores.base import UNVERSIONED, StoreError, collection_name
 from ragamer.tagging import TagVocabulary
+from ragamer.vectors.base import ModelOutputError
 
 logger = get_logger(__name__)
 
@@ -139,9 +141,9 @@ def create_app(container: Container) -> FastAPI:
         而这一轮问答又必须写进去——取的是前者。页面若改用 `fetch` 读流就不必受这条约束，
         :data:`SSE_RETRY` 那行也就可以不看。
 
-        失败分两段，**以「流开没开」为界**：会话不存在、问题为空、检索炸了都发生在
-        `chat.ask` 返回之前（理解、检索、精排都是急切跑的），所以还能给出正常的 HTTP
-        状态码——404 / 400 / 500。开了流之后才失败的（模型在生成中途挂掉）只剩 `error`
+        失败分两段，**以「流开没开」为界**：会话不存在（404）与问题为空（400）都在开流
+        之前判掉，读知识库、读游戏候选也在这里——这几步不碰模型，快且失败原因明确。
+        理解、检索、生成都在流里跑（见 `ragamer.conversations`），它们失败时只剩 `error`
         事件这一条路：响应头那时已经发出去了，状态码改不了。
 
         这一层**不等正文**：返回的是个还没开始跑的生成器，读正文由 ASGI 那边拉。
@@ -180,28 +182,48 @@ class SessionRequest(BaseModel):
 def _events(replies: Iterator[Reply]) -> Iterator[str]:
     """一轮问答 → SSE 字节流。
 
-    四种事件：`citations`（最先，一次）、`delta`（若干）、`done`（正常收尾）、
-    `error`（生成失败）。
+    五种事件，**前四种按发生的先后**：
 
-    **失败也必须发成一个事件**：响应头在第一个事件之前就出去了，状态码此刻改不了，
-    「模型挂了」只能以 `error` 收尾。收不到 `done` 就是这一轮没有正常结束——会话里
-    相应地什么都没写（见 `ragamer.conversations`）。
+    | 事件 | 几条 | 什么时候 |
+    |---|---|---|
+    | `status` | 若干 | 理解、检索、生成三步各自开始之前 |
+    | `citations` | 一条 | 检索完、拿到来源 |
+    | `delta` | 若干 | 正文一片一片来 |
+    | `done` | 一条 | 正常收尾 |
+    | `error` | 至多一条 | 中途失败，代替 `done` |
+
+    `status` 是给「不用干等」用的：提问到第一个字之间隔着两次实打实的等待（一次模型
+    往返加一次检索），没有它，界面在那一段里没有任何东西可显示。
+
+    **失败也必须发成一个事件**：响应头在第一个事件之前就出去了，状态码此刻改不了。
+    对浏览器原生的 `EventSource` 来说这一条反而是好事——非 2xx 时它不给你任何细节，
+    只有流里的 `error` 带得回原因。收不到 `done` 就是这一轮没有正常结束，会话里相应地
+    什么都没写（见 `ragamer.conversations`）。
 
     **兜住「断开不留痕」的不是这里，是落库的时机**：会话只在正文全部收完之后才写，
     所以流在半路停住时它一个字都没写。消费方把生成器丢掉时，这里收到的是
-    `GeneratorExit`——它不是 `Exception`，下面那个 `except` 接不住它，于是它一路把
+    `GeneratorExit`——它不是 `Exception`，下面那两个 `except` 接不住它，于是它一路把
     上游那个生成器也关掉，模型那边的请求跟着结束。
+
+    两类失败分得开：**生成挂掉**是模型这一次不行，按 WARNING；**检索或落库挂掉**
+    （`StoreError` / `ModelOutputError`）是系统性的，按 ERROR——排查时看的不是同一个地方。
     """
     yield SSE_RETRY
     try:
         for reply in replies:
-            if isinstance(reply, Sources):
+            if isinstance(reply, Status):
+                yield _event("status", {"text": reply.text})
+            elif isinstance(reply, Sources):
                 payload = {"citations": [_citation_payload(item) for item in reply.citations]}
                 yield _event("citations", payload)
             else:
                 yield _event("delta", {"text": reply.text})
     except LlmError as exc:
         logger.warning("生成中途失败，这一轮不写进会话：%s", exc)
+        yield _event("error", {"message": str(exc)})
+        return
+    except (ModelOutputError, StoreError) as exc:
+        logger.error("检索或落库失败，这一轮没有答案也不写进会话：%s", exc)
         yield _event("error", {"message": str(exc)})
         return
     yield _event("done", {})

@@ -136,11 +136,32 @@ def test_答案逐字流式输出():
 
     assert response.headers["content-type"].startswith("text/event-stream")
     parsed = parse_sse(response.text)
-    assert [name for name, _ in parsed][0] == "citations"
-    assert parsed[-1][0] == "done"
     deltas = [payload["text"] for name, payload in parsed if name == "delta"]
     assert len(deltas) > 1
     assert "".join(deltas) == REPLY
+    assert parsed[-1][0] == "done"
+
+
+def test_每一步之前先报一条进度():
+    """提问到第一个字之间隔着两次等待（一次模型往返加一次检索），界面得有的可显示。
+
+    顺序就是这一轮真正干的事：理解 → 检索 → 来源 → 生成 → 正文。
+    """
+    client = client_with(FakeLlm(said(QUESTION), REPLY), DOC)
+    session_id = start(client)
+
+    parsed = parse_sse(ask(client, session_id, QUESTION))
+
+    assert [payload["text"] for name, payload in parsed if name == "status"] == [
+        "正在理解问题",
+        "正在检索资料",
+        "正在生成答案",
+    ]
+    events = [name for name, _ in parsed]
+    assert events[:3] == ["status", "status", "citations"]
+    assert events[3] == "status"
+    assert set(events[4:-1]) == {"delta"}
+    assert events[-1] == "done"
 
 
 def test_引用比正文先到():
@@ -150,18 +171,25 @@ def test_引用比正文先到():
 
     parsed = parse_sse(ask(client, session_id, QUESTION))
 
-    assert parsed[0][0] == "citations"
-    assert [(item["index"], item["label"]) for item in parsed[0][1]["citations"]] == [(1, "二郎神")]
+    events = [name for name, _ in parsed]
+    assert events.index("citations") < events.index("delta")
+    citations = parsed[events.index("citations")][1]["citations"]
+    assert [(item["index"], item["label"]) for item in citations] == [(1, "二郎神")]
 
 
 def test_生成中途失败时发错误事件且不写进历史():
-    """开流之后失败只能是一条事件；那一轮也不该在会话里留下半句答案。"""
+    """开流之后失败只能是一条事件，而且**不是一个 `done`**——客户端靠这个分得开。
+
+    那一轮也不该在会话里留下半句答案。
+    """
     client = client_with(HalfwayLlm(said(QUESTION)), DOC)
     session_id = start(client)
 
     parsed = parse_sse(ask(client, session_id, QUESTION))
 
-    assert [name for name, _ in parsed] == ["citations", "delta", "error"]
+    events = [name for name, _ in parsed]
+    assert events[-1] == "error"
+    assert "done" not in events
     assert client.get(f"/api/chat/sessions/{session_id}").json()["turns"] == []
 
 

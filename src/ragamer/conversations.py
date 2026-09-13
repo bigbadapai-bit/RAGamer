@@ -28,6 +28,9 @@
 临时点名。**这个库是落点不是牢笼**：问题里点名了另一个真实存在的库时，这一轮就去那儿查
 （`ragamer.query.understand` 判得出来时优先用它）——那一步本来就在判问的是哪款游戏，
 判出来却不用，等于把它接了个空。会话绑的那个不变，下一轮没点名就还回到它上面。
+
+一轮要走完理解、检索、生成三步才吐得出第一个字，所以这三步各先报一条进度
+（:class:`Status`）——「不用干等」是这张票要求的一部分。
 """
 
 from __future__ import annotations
@@ -37,7 +40,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 from typing import Any, Literal
 
-from ragamer.answering import Answerer, AnswerStream, Citation, require_question
+from ragamer.answering import Answerer, Citation, require_question
 from ragamer.llm import LlmClient, Message
 from ragamer.logging import get_logger
 from ragamer.query import understand
@@ -65,7 +68,8 @@ class Turn:
     """会话里的一条消息。
 
     `citations` 只对模型那一侧非空：用户的话没有来源。它是**正文里 [n] 指的那批**，
-    与当次 `AnswerStream.citations` 是同一份——刷新之后要靠它把编号对回原文。
+    与当次 `ragamer.answering.AnswerStream.citations` 是同一份——刷新之后要靠它把编号
+    对回原文。
     """
 
     role: TurnRole
@@ -115,14 +119,30 @@ class Sources:
 
 
 @dataclass(frozen=True)
+class Status:
+    """一条进度提示：这一轮现在走到哪了。
+
+    **存在的理由是「不用干等」**。提问到第一个字之间隔着两次实打实的等待——理解那一步
+    一次模型往返，检索那一步向量化加召回加精排——而正文要等它们都过去才开始流。没有这条
+    事件，界面在这一段里没有任何东西可显示，用户看到的就是一个没反应的页面。
+
+    文案就是给人看的一句话（`正在理解问题`），界面照原样显示即可，不要在页面里再拼一遍。
+    """
+
+    text: str
+
+
+@dataclass(frozen=True)
 class Delta:
     """正文的一小片。拼起来就是完整答案，也是最终写进会话的那一份。"""
 
     text: str
 
 
-#: 一次提问流出来的东西：先一个 :class:`Sources`，然后若干个 :class:`Delta`。
-Reply = Sources | Delta
+#: 一次提问流出来的东西，**按发生的先后**：若干 :class:`Status`、一个 :class:`Sources`、
+#: 若干 :class:`Delta`。三类之间不是随手排的——状态出现在它描述的那一段**之前**，
+#: 来源出现在检索之后、正文之前。
+Reply = Status | Sources | Delta
 
 
 @dataclass(frozen=True)
@@ -172,12 +192,14 @@ class Chat:
         current_version: str = "",
         games: Sequence[Game] = (),
     ) -> Iterator[Reply]:
-        """问一句，逐字拿回答案：先一个 :class:`Sources`，再若干个 :class:`Delta`。
+        """问一句，逐字拿回答案：若干条 :class:`Status`，一个 :class:`Sources`，
+        然后若干个 :class:`Delta`。
 
-        **改写与检索在调用时就跑完**（所以问题为空、检索炸了都在这里当场报出来，
-        还没开始吐字），返回的那个迭代器只管生成与落库。分成两段是为了让「开流之前」
-        与「开流之后」分得干净：前一段的失败调用方还能给出正常的状态码（HTTP 面就是
-        500），后一段的失败只能当作流里的一件事。
+        **只有「问得对不对」在调用时判**——问题为空、会话不存在都当场抛出来，调用方
+        还能给出正常的状态码。**理解与检索本身推迟到迭代时做**，这样它们各自能先报一条
+        进度（「正在理解问题」「正在检索资料」），调用方不必对着一个没有反应的连接干等。
+        代价是这两步的失败只能当作流里的一件事；对浏览器原生的 `EventSource` 反而更好——
+        非 2xx 时它什么都不告诉你，只有流里的 `error` 带得回原因。
 
         **「这一轮算不算问完」由消费方决定**：正常收完才写进会话；中途把迭代器丢掉
         （客户端断开、页面关掉）就什么都不写——见模块说明的第三条。
@@ -199,21 +221,47 @@ class Chat:
             id；没有候选、或者判不出来，都回落会话选定的知识库。
         :raises ConversationNotFound: 没有这个会话。
         :raises ValueError: 问题为空。空问题会让检索查出任意一批切片。
-        :raises ragamer.llm.LlmError: 生成失败。已经吐出去的正文收不回来，
-            调用方应当把这一轮整个丢掉——这一层保证它不会被写进会话。
         """
         require_question(question)  # 拦在理解那一步之前：空问题没得可理解，别白调一次模型
         conversation = self.open(session_id)
+        return self._replies(
+            conversation,
+            question,
+            version=version or conversation.version,
+            current_version=current_version,
+            games=games,
+        )
+
+    def _replies(
+        self,
+        conversation: Conversation,
+        question: str,
+        *,
+        version: str,
+        current_version: str,
+        games: Sequence[Game],
+    ) -> Iterator[Reply]:
+        """把这一轮从头做到尾，**每一步之前先报一条进度**，最后收完正文才落库。
+
+        进度那三条与这一轮真正干的事一一对应，顺序也一致：理解问题 → 检索资料 →
+        生成答案。夹在中间的是来源——它比正文早得多，一拿到就先交出去，界面可以
+        先列出来再等字。
+
+        迭代器被丢掉时（客户端断开）最后那一行写不进会话——这正是要的效果：
+        已经吐出去的那半句与它那批引用一起消失，历史里不留痕迹。
+        """
+        yield Status("正在理解问题")
         understanding = understand(
             question,
             llm=self.llm,
             games=[name for name, _ in games],
             history=_history(conversation.turns),
         )
+        yield Status("正在检索资料")
         stream = self.answerer.stream(
             understanding.rewritten_query,
             game_id=_game_id(understanding.game, games) or conversation.game_id,
-            version=version or conversation.version,
+            version=version,
             current_version=current_version,
         )
         logger.info(
@@ -223,20 +271,8 @@ class Chat:
             understanding.rewritten_query,
             len(stream.citations),
         )
-        return self._replies(conversation, question, stream)
-
-    def _replies(
-        self,
-        conversation: Conversation,
-        question: str,
-        stream: AnswerStream,
-    ) -> Iterator[Reply]:
-        """把一次生成转出去，**收完正文才落库**。
-
-        迭代器被丢掉时（客户端断开）这里会收到 `GeneratorExit`，最后那一行写不进会话——
-        这正是要的效果：已经吐出去的那半句与它那批引用一起消失，历史里不留痕迹。
-        """
         yield Sources(stream.citations)
+        yield Status("正在生成答案")
         produced: list[str] = []
         for piece in stream.deltas:
             produced.append(piece)

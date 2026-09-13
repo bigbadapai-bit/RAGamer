@@ -13,6 +13,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+
 import pytest
 
 from ragamer.answering import NOT_FOUND
@@ -23,6 +25,7 @@ from ragamer.conversations import (
     Conversation,
     ConversationNotFound,
     Delta,
+    Reply,
     Sources,
 )
 from ragamer.llm import FakeLlm, LlmTimeout
@@ -73,6 +76,14 @@ def recording_chat(llm) -> tuple[Chat, RecordingChunkStore]:
 def asked(chat: Chat, conversation: Conversation, question: str, **kwargs) -> list:
     """问一句并**把整条流收完**——收完才会落库，这正是多数用例要的前置状态。"""
     return list(chat.ask(conversation.session_id, question, **kwargs))
+
+
+def next_delta(replies: Iterator[Reply]) -> Delta:
+    """一直取到正文的第一片——进度与来源都排在它前面。"""
+    for reply in replies:
+        if isinstance(reply, Delta):
+            return reply
+    raise AssertionError("这一轮一个字的正文都没吐出来")
 
 
 # --- 接着上一句 ---
@@ -199,8 +210,7 @@ def test_客户端中途断开时不留半个答案():
     conversation = chat.start(game_id=GAME)
 
     replies = chat.ask(conversation.session_id, "那它掉什么")
-    assert isinstance(next(replies), Sources)
-    assert isinstance(next(replies), Delta)  # 已经吐了一片出去
+    next_delta(replies)  # 已经吐了一片正文出去
     replies.close()  # 客户端在这时候断了
 
     assert chat.open(conversation.session_id).turns == ()
