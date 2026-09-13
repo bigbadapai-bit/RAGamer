@@ -94,7 +94,8 @@ class Chunk:
     #: 也就不存在「超长被截断」这回事。取值与 `chunks` schema 的 `content_meta` 一致。
     content_meta: str = ""
     #: `text` 正文 · `table` 结构化块（Markdown 表格、Infobox 与模板块）· `image` 图片。
-    #: `image` 由补图那一层产出，切分器不移。
+    #: v1 的切分器只产出前两种：补图那一层是把图内文字**写回正文**（`ragamer.enriching`），
+    #: 不另外产出图片切片——图片引用连同它的文字落在同一片正文里，答案里还能展示原图。
     chunk_type: Literal["text", "table", "image"] = "text"
 
 

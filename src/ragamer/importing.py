@@ -28,7 +28,7 @@ from ragamer.chunking import ChunkRules, chunk_document
 from ragamer.llm import LlmClient
 from ragamer.logging import get_logger
 from ragamer.sources import (
-    ImageEnricher,
+    Enricher,
     MarkdownParser,
     NormalizedDoc,
     SourceDocument,
@@ -124,7 +124,8 @@ class ImportResult:
     #: 入库的切片数。
     chunk_count: int
     #: 没有可向量化正文、因而没有入库的切片数。今天的切分器不会产出正文为空的切片
-    #: （`_split` 已经滤掉空段），真实来源是补图那一层——OCR 与摘要都失败的图片切片。
+    #: （`_split` 已经滤掉空段），补图那一层也不会——一张图补不上时那一行只留图片引用，
+    #: 不是留一片空白。所以这个数今天是 0，留着是因为它是界面要说清的一个口径。
     skipped: int
     tags: CoveredTags
     #: 失败发生在哪一步；成功时是 `None`。
@@ -200,7 +201,7 @@ class Importer:
     #: 不传时 md／txt 照跑；真来了附件还没有它，那一步会当场报错而不是把图丢掉。
     objects: ObjectStore | None = None
     #: 补图。没接上时这一步不做、也不上报——报了就是假进度。
-    enricher: ImageEnricher | None = None
+    enricher: Enricher | None = None
     #: 切分参数。不传用 `ChunkRules` 的默认值。
     rules: ChunkRules | None = None
     #: 进度回调。默认落日志；显式传 `None` 表示这一段完全不出声。

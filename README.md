@@ -65,7 +65,8 @@ CI 在每次 push 与 PR 上跑 lint、格式检查与测试，见 [`.github/wor
   所以上限显式来自配置（`RAGAMER_EMBED_MAX_LENGTH` / `RAGAMER_RERANK_MAX_LENGTH`，默认 8192）。
 - **模型只加载一次**：权重在第一次真的要用到时才加载，之后整个进程复用同一个实例。
 
-真实模型（torch + transformers）放在可选的 `models` 组里——核心链路与默认测试都不需要它：
+真实模型（torch + transformers）放在可选的 `models` 组里——核心链路与默认测试都不需要它
+（`ocr` 组同理，见下面的「补图」）：
 
 ```bash
 uv sync --extra models           # 装真实模型
@@ -107,9 +108,35 @@ uv run pytest -m integration     # 跑真模型的集成测试（首次会下载
 - **图内文字别指望它**：MinerU 不把图片区域里的文字 OCR 成正文，这是它的产品决策
   （见 [§1.2](docs/ARCHITECTURE.md)）。2026-09-13 用 22 张真实截图实测过：
   **必须依赖二次 OCR 的比例是 100%**（56/56 个图片条目，两个后端完全一致），
-  二次 OCR 回填因此是必需项而不是兜底，在下一张票里接。
+  二次 OCR 回填因此是必需项而不是兜底。
   实验怎么跑的、结论与限制见 [`docs/experiments/mineru-ocr.md`](docs/experiments/mineru-ocr.md)，
   重跑用 `uv run python tools/mineru_ocr_experiment.py <截图目录> --out …`。
+
+### 补图（图片区域里的文字，与图摘要）
+
+MinerU 判成「图片区域」的地方一个字都不给，独立上传的攻略截图更是没有周边正文——
+图内文字就是全部信息。补图那一层（`ragamer.enriching`）做三件事：展开解析产物里的
+HTML 折叠块、对每个图片条目做二次 OCR 并回填到正文、给空着的替代文本写一段摘要。
+范围照上面那场实验：**每个 `type == "image"` 的条目都做，不挑大小图**。
+
+- **二次 OCR 用本地引擎**（`ragamer.ocr`，RapidOCR + PP-OCR 中文模型）：再走 MinerU
+  没意义（不识别图片区域正是问题本身），云端接口在这个量级上又慢又贵。
+  引擎在可选的 `ocr` 组里，**导入 PDF 与图片得先装上**——缺了它图片里的文字一张也拿不到：
+
+  ```bash
+  uv sync --extra ocr          # 本地二次 OCR，模型随包带
+  ```
+
+- **视觉摘要另配一个多模态模型**（`RAGAMER_VISION_*`），三个键要么都给、要么都不给。
+  整组不配就只做二次 OCR：图里没有文字的那几张（立绘、示意图）少掉可检索的文本，其余照旧。
+- **一张图补不上不让整份资料失败**：取不到原图、识别不出来、摘要调用失败各留一条日志；
+  但**依赖没装**是整件事的事，会让那份资料带着原因失败，而不是一张一张静默丢掉。
+- 实测（T10 那同一批 22 张截图，CPU）：**22 张全部识别出文字**，18–628 字/张、中位数
+  259；其中 MinerU 抽出 **0 字**的那张整页论坛帖截图，二次 OCR 拿回 521 字。
+  单张 4.4–11.7 秒，一份几十张图的资料按分钟计。
+  怎么跑的、与 MinerU 逐张对照的结果、以及这一轮没看的东西见
+  [`docs/experiments/second-pass-ocr.md`](docs/experiments/second-pass-ocr.md)，
+  重跑用 `uv run python tools/second_pass_ocr.py <截图目录> --out …`。
 
 ## 界面
 
@@ -155,9 +182,9 @@ uv run pytest -m integration     # 跑真模型的集成测试（首次会下载
 
 ```
 src/ragamer/          应用代码（config 配置装载、logging 日志、llm 语言模型适配器、sources 归一化、
-                      mineru PDF 与图片的云端解析、chunking 切分器、tagging 打标、
-                      importing 导入编排器、knowledge 知识库元数据、api JSON 端点、web 页面、
-                      app 应用装配与起服务、container 组合根、__main__ 启动自检）
+                      mineru PDF 与图片的云端解析、enriching 补图、ocr 二次 OCR 引擎、lazy 懒加载、
+                      chunking 切分器、tagging 打标、importing 导入编排器、knowledge 知识库元数据、
+                      api JSON 端点、web 页面、app 应用装配与起服务、container 组合根、__main__ 启动自检）
 src/ragamer/stores/   存储适配器：base 协议与共享类型、chunks Milvus、documents Mongo、objects MinIO、memory 内存假件
 src/ragamer/vectors/  向量化与精排：base 协议与共享类型、bge 真实模型、fake 确定性假件
 src/ragamer/web/      页面与模板（templates/ 跟着包走，装成 wheel 也在）

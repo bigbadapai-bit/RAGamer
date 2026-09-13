@@ -18,6 +18,7 @@ from ragamer.config import Settings
 from ragamer.llm import LlmClient, OpenAiLlm
 from ragamer.logging import get_logger
 from ragamer.mineru import MineruParser
+from ragamer.ocr import OcrEngine, RapidOcrEngine
 from ragamer.sources import MarkdownParser, ParserRouter, SourceParser
 from ragamer.stores.base import (
     ChunkStore,
@@ -47,6 +48,12 @@ class Container:
     reranker: Reranker
     #: 语言模型。打标兜底、查询路由、多查询改写、生成都走它。
     llm: LlmClient
+    #: 视觉模型。**没配就是 `None`**：补图只做二次 OCR，图里没有文字的那几张
+    #: 会少掉可检索的文本，其余照旧（见 `ragamer.config.VisionSettings`）。
+    vision: LlmClient | None
+    #: 二次 OCR 引擎。PDF 与图片那条路上，图片区域里的文字只能靠它取回来
+    #: （MinerU 一个字都不给，见 docs/ARCHITECTURE.md §1.2）。
+    ocr: OcrEngine
     #: 解析适配器，按扩展名把一份资料交给唯一的那个（`ragamer.sources.ParserRouter`）。
     parser: SourceParser
 
@@ -94,6 +101,10 @@ def build_container(settings: Settings) -> Container:
         embedder=BgeM3Embedder(settings.embed, settings.models),
         reranker=BgeReranker(settings.rerank, settings.models),
         llm=OpenAiLlm(settings.llm),
+        # 没配视觉模型时不构造：空对象会让「有没有这一步」看起来永远成立
+        vision=OpenAiLlm(settings.vision) if settings.vision.enabled else None,
+        # 引擎的加载推后到第一次真的要用（见 `ragamer.ocr`），自检不等它
+        ocr=RapidOcrEngine(),
         parser=ParserRouter(
             (
                 MarkdownParser(),

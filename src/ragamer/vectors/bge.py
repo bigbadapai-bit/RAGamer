@@ -20,11 +20,11 @@ FlagEmbedding 拉进 torch 与 transformers，所以它放在可选的 `models` 
 
 from __future__ import annotations
 
-import threading
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, Protocol
 
 from ragamer.config import EmbedSettings, ModelSettings, RerankSettings
+from ragamer.lazy import LazyModel
 from ragamer.logging import get_logger
 from ragamer.vectors.base import (
     Embedding,
@@ -59,27 +59,6 @@ M3Loader = Callable[[EmbedSettings, ModelSettings], _M3Model]
 RerankerLoader = Callable[[RerankSettings, ModelSettings], _RerankerModel]
 
 
-class _LazyModel[ModelT]:
-    """一个只加载一次的模型句柄：第一次用到时才构造，之后复用同一个实例。
-
-    加锁是冲着并发首次调用去的——界面后端会把同步端点丢进线程池——两个线程同时
-    看见"还没加载"，各自加载一遍，白白多占一份显存。锁只护加载，不护推理。
-    """
-
-    def __init__(self, describe: str, loader: Callable[[], ModelT]) -> None:
-        self._describe = describe
-        self._loader = loader
-        self._lock = threading.Lock()
-        self._model: ModelT | None = None
-
-    def get(self) -> ModelT:
-        with self._lock:
-            if self._model is None:
-                logger.info("加载%s", self._describe)
-                self._model = self._loader()
-            return self._model
-
-
 class BgeM3Embedder:
     """BGE-M3：同一次调用产出稠密与稀疏两路向量。
 
@@ -96,7 +75,7 @@ class BgeM3Embedder:
     ) -> None:
         self._config = config
         load = loader if loader is not None else load_bge_m3
-        self._lazy = _LazyModel(
+        self._lazy = LazyModel(
             _describe("向量化模型", config.model, shared), lambda: load(config, shared)
         )
 
@@ -134,7 +113,7 @@ class BgeReranker:
     ) -> None:
         self._config = config
         load = loader if loader is not None else load_bge_reranker
-        self._lazy = _LazyModel(
+        self._lazy = LazyModel(
             _describe("精排模型", config.model, shared), lambda: load(config, shared)
         )
 
