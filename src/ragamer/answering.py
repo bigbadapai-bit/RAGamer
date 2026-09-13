@@ -119,7 +119,7 @@ class _Source:
 
 def require_question(question: str) -> None:
     """问题不能是空的。读取侧的入口都从这里过一遍（`Answerer.answer`、`Answerer.stream`、
-    `ragamer.clarifying.Clarifier.start`、`ragamer.conversations.Chat.ask`）——空问题会让
+    `ragamer.clarifying.Clarifier.decide`、`ragamer.conversations.Chat.ask`）——空问题会让
     检索查出任意一批切片，答案也就是编的，而这几种失败都不会报错。
 
     提到一个函数里是因为几个入口各自守一遍时，那句话会被抄成几份——文案一旦分岔，

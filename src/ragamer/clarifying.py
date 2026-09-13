@@ -36,8 +36,8 @@ from dataclasses import dataclass, replace
 from typing import Any
 from uuid import uuid4
 
-from ragamer.answering import Answer, Answerer, require_question
-from ragamer.knowledge import KnowledgeBase, find_knowledge_base, list_knowledge_bases
+from ragamer.answering import require_question
+from ragamer.knowledge import list_knowledge_bases
 from ragamer.llm import LlmClient, Message
 from ragamer.logging import get_logger
 from ragamer.query import Understanding, understand
@@ -129,7 +129,7 @@ class Resolved:
 class Clarification:
     """一次反问：问哪个维度、候选有哪些，以及回到哪一步继续。
 
-    `pending_id` 是暂停点的凭据——用户选完带着它与选中的标签回来（`Clarifier.resume`）。
+    `pending_id` 是暂停点的凭据——用户选完带着它与选中的标签回来（`Clarifier.resolve`）。
     """
 
     pending_id: str
@@ -152,7 +152,7 @@ class Pending:
     rewritten_query: str
     dimension: str
     #: 这一轮的取值是照哪个库取的：问版本时是已经定下来的游戏，问游戏时是调用方给的那个。
-    #: 用户点的若不是这个库，记录里那条版本判断就不作数（见 `Clarifier.resume`）。
+    #: 用户点的若不是这个库，记录里那条版本判断就不作数（见 `Clarifier.resolve`）。
     game_id: str
     #: 已经定下来的版本。只有确定度过线的那种才带得走；问版本时它是要问的东西，留空。
     version: str
@@ -205,7 +205,6 @@ class Clarifier:
     chunks: ChunkStore
     docs: DocStore
     llm: LlmClient
-    answerer: Answerer
 
     def decide(
         self,
@@ -217,10 +216,10 @@ class Clarifier:
     ) -> Resolved | Clarification:
         """读一个问题，**只判不定答案**：判得出给 :class:`Resolved`，判不准给一次反问。
 
-        这是「决定」与「生成」之间那道缝。`Clarifier.start` 判完直接调
-        `ragamer.answering`；对话那一侧（`ragamer.conversations`）判完要逐字流式地生成，
-        并把这一轮连同引用与图片落进会话——两边共用这一段的判断，各写一遍就会分岔，
-        而分岔的那一次表现为「同一个问题在页面上被反问、在接口上直接作答」。
+        这是「决定」与「生成」之间那道缝：这一层只判，生成归 `ragamer.answering`。
+        `ragamer.conversations.Chat` 拿着判定的落脚点去逐字流式地生成、并把这一轮连同
+        引用与图片落进会话。**判定只有这一处**——各写一遍迟早分岔，而分岔的那一次
+        表现为「同一个问题在页面上被反问、在接口上直接作答」。
 
         :param game_id: 这次提问所在的游戏知识库（页面或会话里选定的那一个）。
             空串表示没有上下文可依——那就只能从库里读候选来问。
@@ -280,32 +279,6 @@ class Clarifier:
             game_id, version = pending.game_id, choice.value
         logger.info("从暂停点 %s 继续：%s 取 %r", pending_id, pending.dimension, choice.value)
         return Resolved(pending.rewritten_query, game_id, version)
-
-    def start(
-        self, question: str, *, game_id: str = "", version: str = ""
-    ) -> Answer | Clarification:
-        """读一个问题：判得出就直接作答，判不准就停下来问。
-
-        判完就作答的那条路（不逐字、不落会话）。对话页走的是 `decide` 加流式生成，
-        两条路共用上面那一份判断，差别只在正文怎么出来。
-
-        :raises NoKnowledgeBase: 一个库都没有。
-        :raises ValueError: 问题为空。
-        :raises ragamer.llm.LlmError: 理解或生成失败。
-        """
-        outcome = self.decide(question, game_id=game_id, version=version)
-        if isinstance(outcome, Clarification):
-            return outcome
-        return self._answer(outcome)
-
-    def resume(self, pending_id: str, label: str) -> Answer:
-        """从暂停点继续，直接给一份答案。见 :meth:`resolve`。
-
-        :raises UnknownPending: 没有这个暂停点。
-        :raises NotACandidate: 选的不在这次反问给出的候选里。
-        :raises ragamer.llm.LlmError: 生成失败。
-        """
-        return self._answer(self.resolve(pending_id, label))
 
     def _game(
         self, understanding: Understanding, choices: Sequence[Choice], game_id: str
@@ -380,16 +353,6 @@ class Clarifier:
             dimension=dimension,
             prompt=_PROMPTS[dimension],
             choices=pending.choices,
-        )
-
-    def _answer(self, resolved: Resolved) -> Answer:
-        """交给 `Answerer`。现行版本现读一次——它是「当前该用哪个版本」的唯一真相来源。"""
-        base: KnowledgeBase | None = find_knowledge_base(self.docs, resolved.game_id)
-        return self.answerer.answer(
-            resolved.rewritten_query,
-            game_id=resolved.game_id,
-            version=resolved.version,
-            current_version=base.version if base else "",
         )
 
     def _load_pending(self, pending_id: str) -> Pending:

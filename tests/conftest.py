@@ -136,7 +136,6 @@ def make_chat(container: Container) -> Chat:
             chunks=container.chunks,
             docs=container.docs,
             llm=container.llm,
-            answerer=answers,
         ),
     )
 

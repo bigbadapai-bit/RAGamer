@@ -466,7 +466,6 @@ def build_chat(container: Container) -> ChatStack:
                 chunks=container.chunks,
                 docs=container.docs,
                 llm=container.llm,
-                answerer=answers,
             ),
         ),
         cache=cache,
