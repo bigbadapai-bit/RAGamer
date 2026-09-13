@@ -7,11 +7,14 @@
 
 三个取舍：
 
-- **一次跑一批**。同时提交的几批在队列里排队，各自显示「排队中」。补图与向量化是
-  CPU 密集的活，并发跑只会互相拖慢，而且两个批次同时写同一份文档时，本批之内的
-  认领表拦不住跨批次的覆盖（见 `ragamer.importing` 的文档标识那条）。
+- **页面那几批一次跑一批**。同时提交的几批在队列里排队，各自显示「排队中」——补图与
+  向量化是 CPU 密集的活，并发跑只会互相拖慢。**这条只管页面这条路**：JSON 端点那条是
+  同步调用方自己等结果，它跑在自己的线程池里，与页面上的批次可能同时进行。跨批次同时
+  写同一份文档也没人拦（认领表只在一次提交之内，见 `ragamer.importing` 的文档标识那条），
+  单机自用可以接受，多用户部署要先解决这个。
 - **状态在内存里**。服务重启就没了——但导入本身也活不过重启，落库只会留下一份
-  写了一半的进度，不如干脆不留。跑完的任务留着供翻看，超过 `history` 条从旧的开始丢。
+  写了一半的进度，不如干脆不留。跑完的任务留最近 `history` 条供翻看（**上传的字节
+  跑完就丢**，留着的只有结果），再早的连同它的任务号一起消失。
 - **快照不可变**。工作线程持锁改状态，读的人拿到的是复制出来的一份，
   页面渲染期间状态怎么变都不会改到它手上这一份。
 """
@@ -25,7 +28,14 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from queue import SimpleQueue
 
-from ragamer.importing import Importer, ImportResult, ImportStage, ProgressEvent, SourceKind
+from ragamer.importing import (
+    Importer,
+    ImportResult,
+    ImportStage,
+    ProgressCallback,
+    ProgressEvent,
+    SourceKind,
+)
 from ragamer.logging import get_logger
 from ragamer.sources import SourceDocument
 from ragamer.tagging import TagVocabulary
@@ -123,12 +133,23 @@ class _Job:
                     source, kind, stages, _ = self._items[index]
                     self._items[index] = (source, kind, stages, result)
             self._finished = True
+            self._drop_payload()
 
     def fail(self, error: str) -> None:
         """整批没跑起来。这一条也要算「跑完了」，否则界面会一直转圈。"""
         with self._lock:
             self._error = error
             self._finished = True
+            self._drop_payload()
+
+    def _drop_payload(self) -> None:
+        """跑完就把上传的字节丢掉。**只有调用方持锁时才调**。
+
+        结果已经在每一条的 `result` 里了，字节没人再看；留着一批几十上百 MB 的资料
+        在内存里等被清掉，是白占——界面要重试时本来也得让人重新选文件。
+        """
+        self.sources = ()
+        self.urls = ()
 
     @property
     def finished(self) -> bool:
@@ -172,7 +193,11 @@ class ImportJobs:
         version: str,
         vocabulary: TagVocabulary | None = None,
     ) -> str:
-        """收下一批，立刻返回任务号。**读上传字节已经在调用方做完了**（那是请求的一部分）。"""
+        """收下一批，立刻返回任务号。**读上传字节已经在调用方做完了**（那是请求的一部分）。
+
+        条目顺序**必须与 `Importer.batch` 的编号一致**（文件在前、网址在后，各自按提交
+        顺序）：进度事件里的 `file_number` 是从 1 起的位置，按它回填到第几条。
+        """
         items = [(source.filename, SourceKind.FILE) for source in sources]
         items += [(url, SourceKind.URL) for url in urls]
         job = _Job(
@@ -187,7 +212,9 @@ class ImportJobs:
         with self._lock:
             self._jobs[job.id] = job
             self._forget_old()
-        self._start_worker()
+            # 起线程也放在锁里：check-then-set 漏在外面的话，两个并发的提交会各起一个，
+            # 「一次跑一批」当场就没了
+            self._start_worker()
         self._queued.put(job)
         logger.info("导入任务 %s 收了 %d 条（知识库 %s）", job.id, len(items), game_id)
         return job.id
@@ -229,8 +256,7 @@ class ImportJobs:
                     self._forget_old()
 
     def _run(self, job: _Job) -> None:
-        # 只给这一批挂进度回调：Importer 是 frozen 的，replace 出来一份改回调
-        importer = replace(self.importer, on_progress=job.note)
+        importer = replace(self.importer, on_progress=self._progress(job))
         results = importer.batch(
             job.sources,
             urls=job.urls,
@@ -240,6 +266,22 @@ class ImportJobs:
         )
         job.finish(results)
         logger.info("导入任务 %s 跑完：%s", job.id, _summary(results))
+
+    def _progress(self, job: _Job) -> ProgressCallback:
+        """这一批的进度回调：**组合根配的那个照跑**（默认是落日志），再往快照里记一份。
+
+        直接把 `on_progress` 换成快照那条是不行的：一批几分钟的导入在日志里就只剩
+        「收了」与「跑完」两行，中途出问题回头什么都看不到——而日志是这条路出问题时
+        唯一留下的现场。
+        """
+        wired = self.importer.on_progress
+
+        def report(event: ProgressEvent) -> None:
+            if wired is not None:
+                wired(event)
+            job.note(event)
+
+        return report
 
 
 def _summary(results: Sequence[ImportResult]) -> str:

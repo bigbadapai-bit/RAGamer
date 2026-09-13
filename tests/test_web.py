@@ -374,6 +374,11 @@ def test_任务号认不出来时说一句人话(client):
 
     assert page.status_code == 200
     assert "这个导入任务不在了" in page.text
+    assert page.text.count("这个导入任务不在了") == 1  # 整页与片段说同一句，不各说各的
+
+    fragment = client.get("/import/result?job=没有这个号", headers={"HX-Request": "true"})
+
+    assert fragment.text.count("这个导入任务不在了") == 1
 
 
 def test_整批没跑起来时页面给原因而不是一直转圈():
@@ -390,6 +395,9 @@ def test_整批没跑起来时页面给原因而不是一直转圈():
     assert "这一批没能跑起来" in done.text
     assert "抓取器" in done.text
     assert RUNNING_MARK not in done.text
+    # 每一条也不该还挂着「排队中」——那一批永远不会轮到它
+    assert "排队中" not in done.text
+    assert "没能开始" in done.text
 
 
 # --- 验收：一次提交多条来源，每条各有各的状态 ---

@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from collections.abc import Sequence
@@ -254,6 +255,40 @@ def test_一批炸了工作线程还活着():
 
     assert wait(jobs, broken).finished
     assert [item.result.ok for item in wait(jobs, good).items] == [True]
+
+
+def test_进度照旧落日志(caplog):
+    """快照是给页面看的，日志是这条路出问题时唯一留下的现场——两份都要有。
+
+    只把 on_progress 换成快照那条的话，一批几分钟的导入在日志里就只剩「收了」与「跑完」，
+    中途哪一条卡在哪一步回头看什么都没有。这里刻意不覆盖 `on_progress`，用的就是
+    Importer 自己的默认实现（落日志）。
+    """
+    from ragamer.importing import Importer
+
+    jobs = ImportJobs(Importer(chunks=InMemoryChunkStore(), embedder=FakeEmbedder(), rules=RULES))
+
+    with caplog.at_level(logging.INFO):
+        job_id = jobs.submit([doc("甲.md")], game_id=GAME, version="")
+        wait(jobs, job_id)
+
+    assert "导入 甲.md：[1/1] 归一化" in caplog.text
+
+
+def test_跑完就把上传的字节丢掉():
+    """一批几十上百 MB 的资料留在内存里等被清掉是白占——结果已经在每一条里了。
+
+    字节有意不进快照（页面上用不到），所以要验只能直接看任务对象。这个测试盯的就是
+    那份内部记账，不是外部行为。
+    """
+    jobs = make_jobs()
+
+    job_id = jobs.submit([doc("甲.md")], game_id=GAME, version="")
+    wait(jobs, job_id)
+
+    assert jobs.snapshot(job_id).items[0].result is not None
+    assert jobs._jobs[job_id].sources == ()
+    assert jobs._jobs[job_id].urls == ()
 
 
 @pytest.mark.parametrize("version", [UNVERSIONED, "2.0"])

@@ -77,8 +77,8 @@ CHUNK_TYPE_NAMES: Mapping[str, str] = {"text": "正文", "table": "表格", "ima
 #: 「没有内容」时占位用的短横。留白的单元格容易被看漏。
 EMPTY = "—"
 
-#: 任务号认不出来时说的话。服务重启过、或者那条早被丢掉了，两种都算。
-_GONE = "这个导入任务不在了（服务重启过？）。再提交一次吧。"
+#: 任务号认不出来时说的话。服务重启过、或者那条早被丢掉了（只留最近几条），两种都算。
+_GONE = "这个导入任务不在了：服务重启过，或者它已经跑完很久、被新任务挤掉了。再提交一次吧。"
 
 
 def create_router(container: Container) -> APIRouter:
@@ -267,8 +267,10 @@ def create_router(container: Container) -> APIRouter:
             request,
             "partials/import_result.html",
             {
-                "result": _job_view(snapshot, accept=_accept(container)),
-                "message": "" if snapshot is not None else _GONE,
+                "result": None
+                if snapshot is None
+                else _job_view(snapshot, accept=_accept(container)),
+                "notice": "" if snapshot is not None else _GONE,
                 "empty": EMPTY,
             },
         )
@@ -306,7 +308,7 @@ def create_router(container: Container) -> APIRouter:
                 return templates.TemplateResponse(
                     request,
                     "partials/import_result.html",
-                    {"result": None, "message": message, "empty": EMPTY},
+                    {"result": None, "notice": message, "empty": EMPTY},
                 )
             return _import_page(
                 request,
@@ -352,7 +354,7 @@ def create_router(container: Container) -> APIRouter:
                 "partials/import_result.html",
                 {
                     "result": _job_view(jobs.snapshot(job_id), accept=_accept(container)),
-                    "message": "",
+                    "notice": "",
                     "empty": EMPTY,
                 },
             )
@@ -609,7 +611,7 @@ def _import_page(
     if job and snapshot is None:
         # 服务重启过、或者这条早被丢掉了：说清楚，别让人对着一个空结果区猜
         message = message or _GONE
-    result = _job_view(snapshot, accept=_accept(container)) if snapshot is not None else None
+    result = None if snapshot is None else _job_view(snapshot, accept=_accept(container))
     return _page(
         request,
         "import.html",
@@ -706,25 +708,23 @@ def _status_of(exc: Exception) -> int:
     return int(getattr(exc, "status", 400))
 
 
-def _job_view(snapshot: JobSnapshot | None, *, accept: str) -> dict[str, Any]:
-    """一个导入任务在界面上的样子。跑着的、跑完的、没这个号的，都用同一份形状。
+def _job_view(snapshot: JobSnapshot, *, accept: str) -> dict[str, Any]:
+    """一个导入任务在界面上的样子。跑着的、跑完的、整批没跑起来的，都用同一份形状。
 
     跑着的每一秒被重新渲染一次（htmx 轮询这个片段），所以这里**不许有副作用**，
-    也不要在模板里做判断——数字与句子都在这里算好。
+    也不要在模板里做判断——数字与句子都在这里算好。任务号认不出来时**不叫它**：
+    由调用方统一说「这个任务不在了」那一句。
     """
-    if snapshot is None:
-        return {"missing": True}
     results = list(snapshot.results)
     ok = [result for result in results if result.ok]
     failed = [result for result in results if not result.ok]
     return {
-        "missing": False,
         "job_id": snapshot.job_id,
         "game_id": snapshot.game_id,
         "accept": accept,
         "running": snapshot.running,
         "error": snapshot.error,
-        "headline": _headline(snapshot),
+        "headline": _headline(snapshot, ok=len(ok), failed=len(failed)),
         # 这一批实际落下的东西：进了多少切片、覆盖到哪些标签（验收要的那两句）。
         # 跑着的时候不报——那是半截账，读了会当成总数。
         "summary": _labels_text(ok) if snapshot.finished else "",
@@ -734,16 +734,14 @@ def _job_view(snapshot: JobSnapshot | None, *, accept: str) -> dict[str, Any]:
     }
 
 
-def _headline(snapshot: JobSnapshot) -> str:
+def _headline(snapshot: JobSnapshot, *, ok: int, failed: int) -> str:
     """结果区顶上那一行。跑着的时候说的是「已经跑完几条」，不是最终账单。"""
-    total = snapshot.total
     if snapshot.error:
-        counts = f"共 {total} 条：这一批没能跑起来"
+        counts = f"共 {snapshot.total} 条：这一批没能跑起来"
     elif snapshot.running:
-        counts = f"共 {total} 条，已跑完 {len(snapshot.results)} 条 · 还在跑"
+        counts = f"共 {snapshot.total} 条，已跑完 {len(snapshot.results)} 条 · 还在跑"
     else:
-        ok = sum(1 for result in snapshot.results if result.ok)
-        counts = f"共 {total} 条，成功 {ok} 条，失败 {len(snapshot.results) - ok} 条"
+        counts = f"共 {snapshot.total} 条，成功 {ok} 条，失败 {failed} 条"
     # 空串就是未标注版本。界面上直接显示空串的话，那一行读起来像没渲染出来
     return f"{counts}。标注版本：{snapshot.version or '未标注版本'}。"
 
@@ -752,40 +750,54 @@ def _job_row(item: JobItem, snapshot: JobSnapshot) -> dict[str, Any]:
     """一条资料此刻的样子。**它走到哪一步就是它在界面上的进度**。"""
     result = item.result
     if result is None:
-        return {
-            "source": item.source,
-            "status": "running" if item.stage else "queued",
-            "status_label": f"正在{STAGE_LABELS[item.stage]}" if item.stage else "排队中",
-            "steps": [STAGE_LABELS[stage] for stage in item.stages],
-            "doc_title": "",
-            "chunk_count": 0,
-            "skipped": 0,
-            "subject_name": "",
-            "subject_types": [],
-            "content_natures": [],
-            "stage_label": "",
-            "error": "",
-            "collides_with": "",
-            "preview_url": "",
-        }
-    return {
-        "source": result.source,
-        "status": "ok" if result.ok else "failed",
-        "status_label": "成功" if result.ok else "失败",
+        # 整批没跑起来时，每一条都不该还挂着「排队中」——那一批永远不会轮到它
+        if snapshot.error:
+            status, label = "unstarted", "没能开始"
+        elif item.stage is not None:
+            status, label = "running", f"正在{STAGE_LABELS[item.stage]}"
+        else:
+            status, label = "queued", "排队中"
+        return _empty_row(item, status=status, status_label=label)
+    return _empty_row(
+        item,
+        status="ok" if result.ok else "failed",
+        status_label="成功" if result.ok else "失败",
         # 只列走过的阶段：卡在归一化的那条不该显示它走过切分
-        "steps": [STAGE_LABELS[event.stage] for event in result.progress],
-        "doc_title": result.doc_title,
-        "chunk_count": result.chunk_count,
-        "skipped": result.skipped,
-        "subject_name": result.tags.subject_name,
-        "subject_types": _names(SUBJECT_TYPE_NAMES, result.tags.subject_type),
-        "content_natures": _names(CONTENT_NATURE_NAMES, result.tags.content_nature),
-        "stage_label": EMPTY if result.stage is None else STAGE_LABELS[result.stage],
-        "error": result.error or "",
+        steps=[STAGE_LABELS[event.stage] for event in result.progress],
+        doc_title=result.doc_title,
+        chunk_count=result.chunk_count,
+        skipped=result.skipped,
+        subject_name=result.tags.subject_name,
+        subject_types=_names(SUBJECT_TYPE_NAMES, result.tags.subject_type),
+        content_natures=_names(CONTENT_NATURE_NAMES, result.tags.content_nature),
+        stage_label=EMPTY if result.stage is None else STAGE_LABELS[result.stage],
+        error=result.error or "",
         # 撞了标题的那条重试不得：单独重试它，写下去就是把它撞的那一份删掉
-        "collides_with": result.collides_with,
-        "preview_url": _preview_url(snapshot.game_id, result.doc_title, snapshot.version),
+        collides_with=result.collides_with,
+        preview_url=_preview_url(snapshot.game_id, result.doc_title, snapshot.version),
+    )
+
+
+def _empty_row(item: JobItem, *, status: str, status_label: str, **filled: Any) -> dict[str, Any]:
+    """一条行的底子：还没有结果的那些字段都留空。"""
+    row: dict[str, Any] = {
+        "source": item.source,
+        "status": status,
+        "status_label": status_label,
+        "steps": [STAGE_LABELS[stage] for stage in item.stages],
+        "doc_title": "",
+        "chunk_count": 0,
+        "skipped": 0,
+        "subject_name": "",
+        "subject_types": [],
+        "content_natures": [],
+        "stage_label": "",
+        "error": "",
+        "collides_with": "",
+        "preview_url": "",
     }
+    row.update(filled)
+    return row
 
 
 def _labels_text(results: Sequence[ImportResult]) -> str:

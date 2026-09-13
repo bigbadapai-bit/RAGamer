@@ -381,7 +381,8 @@ cache:{game}:{version}:{sha1(rewritten_query)}
 一次的开销在本地工具里可以忽略，而 SSE 要么上 htmx 扩展、要么破例写原生 JS。
 **没有脚本时**换成 `head` 里一条 `<noscript><meta http-equiv="refresh" content="2">`：整页
 自己刷，效果一样，页面照常可用。**绝不要两套一起上**——加了 noscript 判断才不至于每两秒把
-整页重载一遍、把局部刷新打断。
+整页重载一遍、把局部刷新打断。⚠️ `noscript` 认的是「脚本被关掉」，不是「htmx 没加载出来」：
+外网连不上、htmx 从 CDN 取不回来时两套都不动，所以跑着的那一块旁边必须留一条手动刷新的链接。
 
 **澄清交互的数据流**（正是 htmx 的强项）：
 
