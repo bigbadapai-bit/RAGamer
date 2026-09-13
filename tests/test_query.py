@@ -28,10 +28,12 @@ GAME = "black_myth"
 GAMES = ["黑神话·悟空", "燕云十六声"]
 VERSIONS = ["1.0", "2.0"]
 
-#: 模型一次要吐的那三个字段。
+#: 模型一次要吐的那几个字段。确定度与取值成对：取值是候选里的哪一个，确定度是它有多稳。
 JOINT_OUTPUT = {
     "game": "黑神话·悟空",
+    "game_confidence": 0.9,
     "version": "2.0",
+    "version_confidence": 0.8,
     "rewritten_query": "二郎神怎么打",
 }
 
@@ -41,7 +43,7 @@ def _reply(**overrides: object) -> dict[str, object]:
 
 
 def test_一次调用同时拿回游戏版本与规范问法():
-    """三个结果出自同一次调用。脚本只排了一条——真调第二次会当场炸（FakeLlm）。"""
+    """几个结果出自同一次调用。脚本只排了一条——真调第二次会当场炸（FakeLlm）。"""
     llm = FakeLlm(_reply())
 
     result = understand(
@@ -52,8 +54,49 @@ def test_一次调用同时拿回游戏版本与规范问法():
         history=[Message("user", "二郎神是谁")],
     )
 
-    assert result == Understanding("黑神话·悟空", "2.0", "二郎神怎么打")
+    assert result == Understanding("黑神话·悟空", "2.0", "二郎神怎么打", 0.9, 0.8)
     assert len(llm.calls) == 1
+
+
+def test_确定度随取值一起带回来():
+    """两档分开处理（§3.4 坑 #13）全靠这个数：**取值的确定度**是澄清反问唯一可判的依据。
+
+    取值是对的、确定度是低的，这正是「接近但不肯定」——丢掉确定度就只剩非黑即白，
+    要么一律不问、要么一律再问一遍。
+    """
+    llm = FakeLlm(_reply(game_confidence=0.55, version_confidence=0.7))
+
+    result = understand("二郎神怎么打", llm=llm, games=GAMES, versions=VERSIONS)
+
+    assert (result.game, result.game_confidence) == ("黑神话·悟空", 0.55)
+    assert (result.version, result.version_confidence) == ("2.0", 0.7)
+
+
+def test_取值被丢掉时确定度一并归零():
+    """模型判出的游戏不在候选里：取值丢掉，确定度也不能留着。
+
+    留着的后果是「一个确定度高到不用反问的取值，却是空的」——调用方照着确定度分流，
+    会走进「确定」那一支，然后拿着空游戏去检索。
+    """
+    llm = FakeLlm(_reply(game="塞尔达传说", game_confidence=0.99))
+
+    result = understand("那个 BOSS 怎么打", llm=llm, games=GAMES, versions=VERSIONS)
+
+    assert result.game == ""
+    assert result.game_confidence == 0.0
+
+
+def test_确定度超出_0_到_1_时按模型返回不合规处理():
+    """确定度的量纲是 0~1，两个阈值（0.65 / 0.50）按它标定。
+
+    给个 1.5 或 -0.2 就当成不合规退回去重问：**夹到边界上会静默改变那次分级**——
+    1.5 夹成 1 看着无害，-0.2 夹成 0 却是把一次「模型其实很确定」判成了「判不出来」。
+    """
+    llm = FakeLlm(_reply(game_confidence=1.5))
+
+    result = understand("二郎神怎么打", llm=llm, games=GAMES, versions=VERSIONS)
+
+    assert result == Understanding("", "", "二郎神怎么打")
 
 
 def test_指代被改写成带主体的规范问法():
