@@ -468,6 +468,54 @@ def test_两路都取到的切片只精排一次():
     assert [item.chunk.chunk_id for item in found.hits] == [1]
 
 
+def test_多路融合后的最终引用顺序():
+    """多路输入下交出去的那一批：合成一份引用，**顺序仍由精排说了算**。
+
+    三路一起跑。主检索路与多查询改写路问的是同一个问题、带着同一套过滤条件，取回的是
+    同一批候选（只有问法不同），元数据路取回的是另一批（它把性质换成路由给的那个）。
+    这一条因此同时钉住三件事：
+
+    - **去重**：2 号在两条路里都出现，精排只该看到它一次——重复的那份会在上下文里变成
+      两段一模一样的内容；
+    - **互补**：1 号只有元数据路取得到，少了那一路它就进不了引用；
+    - **顺序**：融合分高的那条（两路都取到的 2 号）并不是交出去的第一条。融合分出去
+      之前就被精排整个换掉了，最终顺序只认精排分。
+    """
+    store = chunk_store(
+        GAME,
+        make_chunk(1, content_nature=("stats",)),
+        make_chunk(2, content_nature=("intro",)),
+    )
+    where = ChunkFilter(content_natures=(ContentNature.INTRO,))
+    # 精排分与融合分**反着排**：融合说 2 号在前，精排说 1 号在前。落差要落在断崖以内
+    # （≤ 0.3 绝对、≤ 0.5 相对），否则后面那条会被切掉——断崖的边界在别处验
+    reranker = ScriptedReranker({"正文1": 0.8, "正文2": 0.6})
+
+    def recalled(*paths: RecallPath) -> tuple[list[int], list[str]]:
+        found = retrieve(
+            "二郎神血量多少",
+            game_id=GAME,
+            chunks=store,
+            embedder=FakeEmbedder(),
+            reranker=reranker,
+            where=where,
+            route=Route(paths, content_natures=(ContentNature.STATS,)),
+            llm=FakeLlm({"queries": ["二郎神还有多少血"]}),
+        )
+        return [item.chunk.chunk_id for item in found.hits], reranker.calls[-1][1]
+
+    # 单跑：两条路各取得到一条，谁也替不了谁
+    assert recalled(RecallPath.MAIN)[0] == [2]
+    assert recalled(RecallPath.METADATA)[0] == [1]
+
+    order, reranked = recalled(RecallPath.MAIN, RecallPath.MULTI_QUERY, RecallPath.METADATA)
+
+    # 2 号被两条路取到，进精排的却只有一条
+    assert sorted(reranked) == ["正文1", "正文2"]
+    # 顺序是精排给的，不是融合分的
+    assert order == [1, 2]
+
+
 def test_没配依赖的路跳过并留痕(caplog):
     """静默跳过会让「这条路这次跑不了」与「路由表配错了」在日志里长得一模一样，
     而两者的处理方式相反（去补配置 / 现在去改路由表）。"""
@@ -946,12 +994,40 @@ def test_多路都取到的切片排在只被一路取到的前面():
 
 
 def test_融合的分数就是_k_加名次的倒数和():
-    """`k = 60` 钉在这里（§3.3）。它调的是「头部名次值多少」，改它要先有评测集。"""
+    """逐点是 `1 / (k + 名次)`，`k` 默认 60（§3.3）。它调的是「头部名次值多少」，
+    改它要先有评测集。"""
     fused = rrf([[hit(1, 0.9), hit(2, 0.8)], [hit(2, 0.7)]])
 
     scores = {item.chunk.chunk_id: item.score for item in fused}
     assert scores[1] == pytest.approx(1 / (RRF_K + 1))
     assert scores[2] == pytest.approx(1 / (RRF_K + 2) + 1 / (RRF_K + 1))
+
+
+def test_融合常数默认是六十且可以改写():
+    """常数不写死在公式里：默认 60，换一个值就把名次的权重整个换掉。
+
+    它得是个能改的旋钮——评测阶段要扫的就是它（§11：没有评测集时不该动它，
+    有了评测集就得动得了）。
+    """
+    assert RRF_K == 60
+    assert rrf([[hit(1, 0.9)]])[0].score == pytest.approx(1 / (RRF_K + 1))
+    assert rrf([[hit(1, 0.9)]], k=1)[0].score == pytest.approx(1 / 2)
+
+
+def test_融合常数越小头部名次的优势越大():
+    """同一条名次差，`k` 越小分差越大（坑 #11）。这条钉的是那个参数的**作用**，
+    不只是它能被传进去。"""
+    big = scores_of(rrf([[hit(1, 0.9), hit(2, 0.8)]], k=100))
+    small = scores_of(rrf([[hit(1, 0.9), hit(2, 0.8)]], k=1))
+
+    assert small[0] - small[1] > big[0] - big[1]
+
+
+def test_融合常数给成负数当场报错():
+    """负的 k 会让 `k + 名次` 落到零或负数上：除以零，或者算出一个负的融合分把名次
+    倒过来。与其在检索中途炸一个看不懂的除零，不如在入口处说清楚是哪个参数不对。"""
+    with pytest.raises(ValueError, match="不能是负数"):
+        rrf([[hit(1, 0.9)]], k=-1)
 
 
 def test_融合之后同分按切片序号定序():
@@ -961,12 +1037,41 @@ def test_融合之后同分按切片序号定序():
     assert [item.chunk.chunk_id for item in fused] == [1, 2]
 
 
-def test_融合同一路里出现两次也只算一条():
-    """切片序号是同一个，多出来的那一条会把它的融合分抬高。"""
+def test_同一片在两路里各投一票融合分相加():
+    """同一片出现在两路里只出一条，但两路的名次都算数——一票当两票，正是融合在做的
+    那件事。只留一条是另一件事：两条会在上下文里变成两份重复内容。"""
     fused = rrf([[hit(1, 0.9)], [hit(1, 0.8)]])
 
     assert len(fused) == 1
     assert fused[0].score == pytest.approx(1 / (RRF_K + 1) + 1 / (RRF_K + 1))
+
+
+def test_多路都取到的切片保留第一次出现的那份():
+    """同一个切片序号在两路里带着不同的主体信息回来时，留**第一次**见到的那份（坑 #10）。
+
+    两路带回来的本该是同一份切片数据，留哪份都一样——但两路带回来的不是同一份时
+    （索引与数据对不上、两路过滤条件不同），留哪份就有区别了，而这件事不报错。
+    取第一次见到的，是因为「哪一路先见到它」在调试时是个有用的信号。
+    """
+    first = hit(1, 0.9)
+    later = hit(1, 0.8, subject_name="灌江口二郎", ancestor_path="二郎神 › 其他")
+
+    fused = rrf([[first], [later]])
+
+    assert len(fused) == 1
+    assert fused[0].chunk.subject_name == first.chunk.subject_name
+    assert fused[0].chunk.ancestor_path == first.chunk.ancestor_path
+
+
+def test_只有一路时融合不扰动原有顺序():
+    """一路进来的顺序就是它自己的名次顺序，融合原样交出去。
+
+    融合是给多路用的；只有一路时它若按别的东西重排一遍（这里两条的原始分同为 0.5），
+    「单路」与「多路」两条链路的候选顺序就对不上了，而截断位置跟着走。
+    """
+    one = [hit(3, 0.9), hit(1, 0.5), hit(2, 0.5)]
+
+    assert [item.chunk.chunk_id for item in rrf([one])] == [3, 1, 2]
 
 
 def test_没有候选时融合出空():
