@@ -105,7 +105,7 @@ flowchart LR
 |---|---|---|
 | `chunk_id` | INT64 | 主键。**由导入侧分配**，不用服务端自增 —— 重导一份文档要能覆盖同一批 id |
 | `content` | VARCHAR | 正文。图片的 VLM 摘要与二次 OCR 文字都在这里。**参与向量化** |
-| `content_meta` | VARCHAR | 不参与向量化的附加文本（表格长列、Infobox 原始字段）。随结果返回但不打分 |
+| `content_meta` | VARCHAR | 不参与向量化的附加文本（表格里的长文本列；Infobox 原始字段见 2.5 的说明）。随结果返回但不打分 |
 | `ancestor_path` | VARCHAR | **祖先标题路径**，如 `二郎神 › 打法 › 第二阶段` |
 | `chunk_index` | INT64 | 切片在源文档中的顺序，从 0 起 |
 | `subject_name` | VARCHAR | **主体名**，文档级 |
@@ -171,9 +171,11 @@ GUI 里用户可手动选版本，每条答案带版本徽章。
 |---|---|
 | Markdown 表格 | 整表一块，或按行组切且**每块重复表头** |
 | 长文本列 | **降级进 `content_meta`，不进 `content`** |
-| Infobox | 原子化，不切 |
+| Infobox / 模板块 | 原子化，不切。整块留在 `content`，与表格同标 `chunk_type=table` |
 
 🔴 **长文本列不进正文**这条不是优化而是必须：RAGFlow 的 Table 模板没有任何 token 上限，超长行会在 embedding 阶段被 `truncate(c, mdl.max_length - 10)` **静默截断** —— 内容永久丢失且无任何报错。把"说明"这类长列设成 `content_meta`（见 2.2）可以规避：它随结果返回，但不参与向量化，也就没有截断这回事。
+
+⚠️ **Infobox 暂不进 `content_meta`**（与 2.2 括号里的那半句有出入，以这里为准）：模板块整块留在正文才检索得回来，整块挪进 `content_meta` 会让这一片正文变空。代价是**超长 Infobox 仍可能被嵌入截断** —— 模板块不受 `max_chars` 约束，切开就不是 Infobox 了。等真实语料里出现超长 Infobox，按它的样子定降级规则，别先拍一个阈值。
 
 **父子块**：检索命中细粒度子块，交给生成的是**该主体在该文档的聚合父块**。用户问"二郎神怎么打"时，LLM 拿到整页 —— 包括"掉落"，所以追问"掉什么"不需要重新检索。
 

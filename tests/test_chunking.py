@@ -45,14 +45,17 @@ def _plain_lines(count: int) -> str:
 
 
 def _sizes_are_sane(chunks, rules: ChunkRules = RULES) -> bool:
-    """每一片都在下限与上限之间。
+    """每一片正文都在下限与上限之间。
 
     下限是硬的；上限是软的——装不下时宁可让某一片略微超长，也不留下读不成句的
     碎片（见 `chunking._merge`），所以断言放宽到 `max_chars + min_chars`。
+
+    表格切片不在此列：它自带表头，只剩一行也是读得懂的（见 `test_chunking_tables.py`）。
     """
     return all(
         rules.min_chars <= len(chunk.content) <= rules.max_chars + rules.min_chars
         for chunk in chunks
+        if chunk.chunk_type == "text"
     )
 
 
