@@ -140,6 +140,25 @@ def test_取一份文档的全部切片按顺序且不混版本(memory_container
     assert [chunk.chunk_index for chunk in chunks] == [0, 1]
 
 
+def test_回查不传版本时两个版本都取回(memory_container):
+    """问题与知识库都给不出版本时 `version_filter` 有意收窄成不过滤，聚合跟随同一口径；
+    回查因此也要能表达「不按版本筛」，否则那一种情形下父块会凭空少掉一半切片。"""
+    store = memory_container.chunks
+    store.ensure_collection("black_myth")
+    store.upsert(
+        "black_myth",
+        [
+            make_chunk(1, doc_title="二郎神", chunk_index=0, version="1.0"),
+            make_chunk(2, doc_title="二郎神", chunk_index=1, version="2.0"),
+            make_chunk(3, doc_title="二郎神", chunk_index=2, version=UNVERSIONED),
+        ],
+    )
+
+    chunks = store.fetch_document("black_myth", "二郎神", version=None)
+
+    assert [chunk.chunk_id for chunk in chunks] == [1, 2, 3]
+
+
 def test_按文档删只删这个版本的切片(memory_container):
     """重导 1.0 版不该连带删掉未标注版本——那是「新版本与旧版本并存」要留的（ADR-0004）。"""
     store = memory_container.chunks

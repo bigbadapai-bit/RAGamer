@@ -74,7 +74,7 @@ class InMemoryChunkStore:
         hits.sort(key=lambda hit: (-hit.score, hit.chunk.chunk_id))
         return hits[:limit]
 
-    def fetch_document(self, game_id: str, doc_title: str, *, version: str) -> list[Chunk]:
+    def fetch_document(self, game_id: str, doc_title: str, *, version: str | None) -> list[Chunk]:
         where = ChunkFilter(doc_title=doc_title, version=version)
         chunks = [
             chunk

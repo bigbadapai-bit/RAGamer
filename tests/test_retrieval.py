@@ -11,49 +11,36 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 
 import pytest
 
 from ragamer.retrieval import (
     CANDIDATE_LIMIT,
     MAX_CHUNKS,
+    MAX_PARENT_CHARS,
+    aggregate_parents,
     cliff_cut,
     retrieve,
 )
-from ragamer.stores.base import ChunkFilter, ChunkHit
+from ragamer.stores.base import UNVERSIONED, ChunkFilter, ChunkHit
 from ragamer.stores.memory import InMemoryChunkStore
 from ragamer.vectors.base import Embedding, ModelOutputError
 from ragamer.vectors.fake import FakeEmbedder
 
-from .conftest import chunk_store, make_chunk
+from .conftest import RecordingChunkStore, ScriptedReranker, chunk_store, make_chunk
 
 GAME = "black_myth"
 
 
-def hit(chunk_id: int, score: float) -> ChunkHit:
-    return ChunkHit(chunk=make_chunk(chunk_id), score=score)
+def hit(chunk_id: int, score: float, **overrides: object) -> ChunkHit:
+    """一条命中。`overrides` 透传给 `make_chunk`——聚合要按命中切片的 `doc_title`
+    回查，命中那条与库里那条对不上号时，用例验的就不是真实链路了。"""
+    return ChunkHit(chunk=make_chunk(chunk_id, **overrides), score=score)
 
 
 def scores_of(hits: Sequence[ChunkHit]) -> list[float]:
     return [item.score for item in hits]
-
-
-class ScriptedReranker:
-    """按预置分数打分：候选正文 → 分数。
-
-    截断要的是**摆好的落差**，而 `FakeReranker` 按词重合度打分、给不出指定的分差，
-    所以这里直接排分数。分数按正文对号入座、不按位置——存储回来的顺序由它自己定，
-    按位置给分等于把用例的意图押在存储的实现细节上。少配了一条会当场 KeyError。
-    """
-
-    def __init__(self, scores: Mapping[str, float]) -> None:
-        self.scores = dict(scores)
-        self.calls: list[tuple[str, list[str]]] = []
-
-    def rerank(self, query: str, docs: Sequence[str]) -> list[float]:
-        self.calls.append((query, list(docs)))
-        return [self.scores[doc] for doc in docs]
 
 
 class ShortReranker:
@@ -71,28 +58,6 @@ class SilentEmbedder:
 
     def embed(self, texts: Sequence[str]) -> Embedding:
         return Embedding(dense=(), sparse=())
-
-
-class RecordingChunkStore(InMemoryChunkStore):
-    """记下每次检索收到的参数，其余行为与内存假件一致。"""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.searches: list[dict[str, object]] = []
-
-    def search(
-        self,
-        game_id: str,
-        *,
-        dense: Sequence[float],
-        sparse: Mapping[int, float] | None = None,
-        where: ChunkFilter | None = None,
-        limit: int = 10,
-    ) -> list[ChunkHit]:
-        self.searches.append(
-            {"game_id": game_id, "dense": dense, "sparse": sparse, "where": where, "limit": limit}
-        )
-        return super().search(game_id, dense=dense, sparse=sparse, where=where, limit=limit)
 
 
 # --- 断崖截断 ---
@@ -292,3 +257,150 @@ def test_向量化一条都没产出就报错():
             embedder=SilentEmbedder(),
             reranker=ScriptedReranker({"正文1": 0.9}),
         )
+
+
+# --- 聚合父块 ---
+
+
+def test_父块含该文档的全部切片且按源文档顺序():
+    """命中一条细粒度切片，交给生成的是整页：同文档的兄弟切片按 `chunk_index` 升序拼齐。"""
+    store = chunk_store(
+        GAME,
+        make_chunk(1, content="打法", chunk_index=0),
+        make_chunk(2, content="掉落", chunk_index=1),
+        make_chunk(3, content="获取方式", chunk_index=2),
+    )
+
+    blocks = aggregate_parents([hit(2, 0.9)], game_id=GAME, chunks=store)
+
+    assert [block.doc_title for block in blocks] == ["二郎神"]
+    assert [chunk.content for chunk in blocks[0].chunks] == ["打法", "掉落", "获取方式"]
+    # 文档不长，整个父块就是这一篇；收敛只发生在超长文档上
+    assert blocks[0].ancestor_path == ""
+
+
+def test_不同文档各出一个父块按命中的先后():
+    """父块的顺序就是命中的顺序（精排分降序），引用顺序跟着它走。"""
+    store = chunk_store(GAME, make_chunk(1), make_chunk(2, doc_title="世界观"))
+
+    blocks = aggregate_parents(
+        [hit(2, 0.9, doc_title="世界观"), hit(1, 0.8)], game_id=GAME, chunks=store
+    )
+
+    assert [block.doc_title for block in blocks] == ["世界观", "二郎神"]
+
+
+def test_同一个文档只回查一次():
+    """同一文档命中多条时，回查不该按命中条数各来一遍。"""
+    recording = RecordingChunkStore()
+    recording.upsert(GAME, [make_chunk(1), make_chunk(2)])
+
+    aggregate_parents([hit(1, 0.9), hit(2, 0.8)], game_id=GAME, chunks=recording)
+
+    assert recording.fetched == ["二郎神"]
+
+
+def test_回查带同一个版本过滤():
+    """预置同一文档的两个版本切片，拼出来的父块不混版本（ADR-0004）。"""
+    store = chunk_store(
+        GAME,
+        make_chunk(1, content="1.0 的正文", version="1.0", chunk_index=0),
+        make_chunk(2, content="2.0 的正文", version="2.0", chunk_index=1),
+    )
+
+    blocks = aggregate_parents(
+        [hit(1, 0.9)], game_id=GAME, chunks=store, where=ChunkFilter(version="1.0")
+    )
+
+    assert [chunk.content for chunk in blocks[0].chunks] == ["1.0 的正文"]
+
+
+def test_未标注版本的兄弟切片一并拼进来():
+    """回查的过滤条件与检索同一条：「该版本**或**未标注版本」（ADR-0004）。"""
+    store = chunk_store(
+        GAME,
+        make_chunk(1, content="标了版本", version="1.0", chunk_index=0),
+        make_chunk(2, content="没标版本", version=UNVERSIONED, chunk_index=1),
+    )
+
+    blocks = aggregate_parents(
+        [hit(1, 0.9)], game_id=GAME, chunks=store, where=ChunkFilter(version="1.0")
+    )
+
+    assert [chunk.content for chunk in blocks[0].chunks] == ["标了版本", "没标版本"]
+
+
+def test_问题与知识库都给不出版本时聚合也不过滤():
+    """`version_filter` 在两处都判不出版本时有意收窄成不过滤，聚合跟随同一个口径——
+    另立一套的话，同一个问题会在检索与聚合两步各按一个版本口径判一次。"""
+    store = chunk_store(
+        GAME,
+        make_chunk(1, content="1.0 的正文", version="1.0", chunk_index=0),
+        make_chunk(2, content="2.0 的正文", version="2.0", chunk_index=1),
+    )
+
+    blocks = aggregate_parents([hit(1, 0.9)], game_id=GAME, chunks=store)
+
+    assert len(blocks[0].chunks) == 2
+
+
+def test_超长文档收敛到命中切片所在的小节():
+    """整页超过上限就不再整页喂，只留命中切片所在的那一节（§2.5 第三条约束）。"""
+    filler = "长" * MAX_PARENT_CHARS
+    store = chunk_store(
+        GAME,
+        make_chunk(1, content=filler, ancestor_path="二郎神 › 背景", chunk_index=0),
+        make_chunk(2, content=filler, ancestor_path="二郎神 › 打法", chunk_index=1),
+    )
+
+    blocks = aggregate_parents([hit(2, 0.9)], game_id=GAME, chunks=store)
+
+    assert blocks[0].ancestor_path == "二郎神 › 打法"
+    assert [chunk.chunk_index for chunk in blocks[0].chunks] == [1]
+
+
+def test_正好到上限的文档不算超长():
+    """判定是「大于」：整页正好等于上限仍算一页，不因为卡在边界上就切走半篇。"""
+    half = "长" * (MAX_PARENT_CHARS // 2)
+    store = chunk_store(
+        GAME,
+        make_chunk(1, content=half, ancestor_path="二郎神 › 背景", chunk_index=0),
+        make_chunk(2, content=half, ancestor_path="二郎神 › 打法", chunk_index=1),
+    )
+
+    blocks = aggregate_parents([hit(2, 0.9)], game_id=GAME, chunks=store)
+
+    assert len(blocks[0].chunks) == 2
+
+
+def test_重导之后父块跟着变不需要同步步骤():
+    """父块是查出来的：覆盖同一批 `chunk_id` 之后它就变了，中间没有「同步父块」这一步。"""
+    store = chunk_store(GAME, make_chunk(1, content="旧正文"))
+
+    store.upsert(GAME, [make_chunk(1, content="新正文")])
+    blocks = aggregate_parents([hit(1, 0.9)], game_id=GAME, chunks=store)
+
+    assert [chunk.content for chunk in blocks[0].chunks] == ["新正文"]
+
+
+def test_删库之后父块不留孤儿():
+    """父块不占独立存储：删库删掉的就是它赖以存在的那些切片，没有第二份要清理。"""
+    store = chunk_store(GAME, make_chunk(1))
+    aggregate_parents([hit(1, 0.9)], game_id=GAME, chunks=store)
+
+    store.drop(GAME)
+
+    assert aggregate_parents([hit(1, 0.9)], game_id=GAME, chunks=store) == ()
+
+
+def test_回查不到兄弟切片时不出一个空父块(caplog):
+    """命中切片按 `doc_title` 回查一定查得到——它就是照这个条件检出来的。
+    查不到说明索引与数据对不上；空父块交给生成等于一条空资料，宁可不出这个块。"""
+    with caplog.at_level(logging.WARNING):
+        blocks = aggregate_parents([hit(1, 0.9)], game_id=GAME, chunks=InMemoryChunkStore())
+
+    assert blocks == ()
+    warnings = [
+        record.getMessage() for record in caplog.records if record.levelno == logging.WARNING
+    ]
+    assert any("对不上" in message for message in warnings)

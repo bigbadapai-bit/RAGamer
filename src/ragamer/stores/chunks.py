@@ -355,7 +355,7 @@ class MilvusChunkStore:
         )[0]
         return [_hit(row) for row in rows]
 
-    def fetch_document(self, game_id: str, doc_title: str, *, version: str) -> list[Chunk]:
+    def fetch_document(self, game_id: str, doc_title: str, *, version: str | None) -> list[Chunk]:
         rows = self._client().query(
             collection_name=collection_name(game_id),
             filter=filter_expression(ChunkFilter(doc_title=doc_title, version=version)),

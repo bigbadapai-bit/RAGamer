@@ -227,12 +227,16 @@ class ChunkStore(Store, Protocol):
         """
         ...
 
-    def fetch_document(self, game_id: str, doc_title: str, *, version: str) -> list[Chunk]:
-        """取一份文档在某个版本下的全部切片，按 `chunk_index` 升序。
+    def fetch_document(self, game_id: str, doc_title: str, *, version: str | None) -> list[Chunk]:
+        """取一份文档的全部切片，按 `chunk_index` 升序。
 
         聚合父块靠它：命中并截断之后按 `doc_title` 回查兄弟切片，父块因此永远与子块同源。
-        `version` 是必给的：过滤条件恒为「该版本或未标注版本」，不这样，
-        同一个父块里会拼进不同版本的切片——而且不会报错。
+        `version` 是必给的，但允许 `None`——两个取值对应检索侧的两套口径：
+
+        - 传值：过滤条件恒为「该版本**或**未标注版本」。少了后半句，同一个父块里会拼进
+          不同版本的切片，而且不会报错（ADR-0004）。
+        - 传 `None`：不过滤。跟随 `ragamer.query.version_filter` 在问题与知识库都给不出
+          版本时的收窄——聚合与检索必须是同一套口径，聚合另立一套就等于把版本判错两次。
         """
         ...
 

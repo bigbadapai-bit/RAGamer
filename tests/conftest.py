@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 
 import pytest
@@ -10,7 +10,7 @@ import pytest
 from ragamer.config import get_settings
 from ragamer.container import Container
 from ragamer.llm import FakeLlm
-from ragamer.stores.base import Chunk, StoreUnavailableError
+from ragamer.stores.base import Chunk, ChunkFilter, ChunkHit, StoreUnavailableError
 from ragamer.stores.memory import InMemoryChunkStore, InMemoryDocStore, InMemoryObjectStore
 from ragamer.vectors.fake import FakeEmbedder, FakeReranker
 
@@ -128,3 +128,51 @@ def chunk_store(game_id: str, *chunks: Chunk) -> InMemoryChunkStore:
     store = InMemoryChunkStore()
     store.upsert(game_id, list(chunks))
     return store
+
+
+class RecordingChunkStore(InMemoryChunkStore):
+    """记下每次检索与按文档回查收到的参数，其余行为与内存假件一致。
+
+    两条链路各要一个凭据：检索那侧看的是「过滤条件透传了没有」，聚合那侧看的是
+    「哪些文档被回查了」——后者是「聚合发生在截断之后」唯一能从外面看见的证据。
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.searches: list[dict[str, object]] = []
+        self.fetched: list[str] = []
+
+    def search(
+        self,
+        game_id: str,
+        *,
+        dense: Sequence[float],
+        sparse: Mapping[int, float] | None = None,
+        where: ChunkFilter | None = None,
+        limit: int = 10,
+    ) -> list[ChunkHit]:
+        self.searches.append(
+            {"game_id": game_id, "dense": dense, "sparse": sparse, "where": where, "limit": limit}
+        )
+        return super().search(game_id, dense=dense, sparse=sparse, where=where, limit=limit)
+
+    def fetch_document(self, game_id: str, doc_title: str, *, version: str | None) -> list[Chunk]:
+        self.fetched.append(doc_title)
+        return super().fetch_document(game_id, doc_title, version=version)
+
+
+class ScriptedReranker:
+    """按预置分数打分：候选正文 → 分数。
+
+    截断要的是**摆好的落差**，而 `FakeReranker` 按词重合度打分、给不出指定的分差，
+    所以这里直接排分数。分数按正文对号入座、不按位置——存储回来的顺序由它自己定，
+    按位置给分等于把用例的意图押在存储的实现细节上。少配了一条会当场 KeyError。
+    """
+
+    def __init__(self, scores: Mapping[str, float]) -> None:
+        self.scores = dict(scores)
+        self.calls: list[tuple[str, list[str]]] = []
+
+    def rerank(self, query: str, docs: Sequence[str]) -> list[float]:
+        self.calls.append((query, list(docs)))
+        return [self.scores[doc] for doc in docs]

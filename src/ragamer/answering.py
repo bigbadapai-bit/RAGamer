@@ -1,13 +1,17 @@
 """生成：把检索到的资料交给模型，产出一段**能核对**的答案。
 
 读取侧到这一步为止：问题进，答案与引用出来。中间是主检索路（`ragamer.retrieval`）
-——取候选、精排、断崖截断。
+——取候选、精排、断崖截断、按文档聚合父块。
 
-三件事在这里定死：
+四件事在这里定死：
 
-- **答案必须带引用来源**：交给模型的每一条切片都编了号，编号连同「文档标题 + 祖先标题
+- **一条资料是一个父块，不是一个切片**。命中并截断之后按文档回查兄弟切片
+  （`aggregate_parents`），于是问"二郎神怎么打"时模型拿到的是整页——包括"掉落"，
+  追问"掉什么"不必重新检索。进父块的是被截断那批切片**所属的文档**，
+  不是它们自己那几句：引用因此指向文档（超长文档里则指向那一小节），不是某一句话。
+- **答案必须带引用来源**：交给模型的每一个父块都编了号，编号连同「文档标题 + 祖先标题
   路径」一起进提示词，也一起随答案交回。没有引用的答案是一段无从核对的话——
-  用户没法知道它是切片里写的还是模型编的。编号对不对得上由「引用与切片同批同序」
+  用户没法知道它是切片里写的还是模型编的。编号对不对得上由「引用与内容同批同序」
   保证：两者绑在同一个 :class:`_Source` 里，不是两个各排一遍的序列。
 - **检索不到就直说**。候选一条都没有时**不调模型**：没有内容可依据，让它自由发挥
   只会得到一段编造的游戏攻略，而且看起来和真答案一样。回复是这里的常量。
@@ -34,7 +38,7 @@ from ragamer.chunking import PATH_SEPARATOR
 from ragamer.llm import LlmClient, LlmRequest, Message
 from ragamer.logging import get_logger
 from ragamer.query import version_filter
-from ragamer.retrieval import retrieve
+from ragamer.retrieval import ParentBlock, aggregate_parents, retrieve
 from ragamer.stores.base import Chunk, ChunkStore
 from ragamer.vectors.base import Embedder, Reranker
 
@@ -95,14 +99,14 @@ class Citation:
 
 @dataclass(frozen=True)
 class _Source:
-    """编号好的一条切片：引用 + 它的内容。
+    """编号好的一个父块：引用 + 它的内容。
 
     两者绑在一个类型里而不是两个平行序列：编号与内容本来就是同一件事的两面，
     分开放就得靠调用方保证两边同长同序，对不上时是静默的（编号指向另一条内容）。
     """
 
     citation: Citation
-    chunk: Chunk
+    block: ParentBlock
 
 
 @dataclass(frozen=True)
@@ -117,8 +121,16 @@ class Answer:
     citations: tuple[Citation, ...]
 
 
-def _prompt_text(chunk: Chunk) -> str:
-    """一条切片交给模型时的全文：正文 + 不参与向量化的附加文本。
+def _prompt_text(block: ParentBlock) -> str:
+    """一个父块交给模型时的全文：块内每条切片按源文档顺序拼起来。
+
+    顺序就是 `chunk_index` 升序（`fetch_document` 已排好），所以拼出来的读法与源文档一致。
+    """
+    return "\n".join(_chunk_text(chunk) for chunk in block.chunks)
+
+
+def _chunk_text(chunk: Chunk) -> str:
+    """块内的一条切片：正文 + 不参与向量化的附加文本。
 
     `content_meta` **必须带上**：表格里那些长文本列整列降级在那里（§2.5），
     只给正文等于把整列说明丢掉——它本来就是「随结果返回但不打分」的那部分（§2.2）。
@@ -150,6 +162,7 @@ class Answerer:
     ) -> Answer:
         """读一个问题，给出答案与它的来源。**只走主检索路**。
 
+        截断之后按文档聚合父块，交给生成的是整页而不是命中那几句（§2.5）。
         没有检索到内容时返回 `NOT_FOUND` 与空引用，不调模型。
 
         :param game_id: 进哪个游戏知识库检索。
@@ -173,11 +186,21 @@ class Answerer:
         if not found:
             logger.info("提问 %r 没检索到内容，回明确回复，不调模型", question)
             return Answer(NOT_FOUND, ())
+        # 聚合在截断之后：先由断崖定下哪些文档进得来，再按文档把兄弟切片一次查齐
+        blocks = aggregate_parents(found, game_id=game_id, chunks=self.chunks, where=where)
+        if not blocks:
+            # 命中了却一条都回查不出来：索引与数据对不上。没有内容可依据时不调模型
+            logger.warning(
+                "提问 %r 命中 %d 条切片却聚合不出父块，按检索不到处理", question, len(found)
+            )
+            return Answer(NOT_FOUND, ())
         sources = tuple(
-            _Source(Citation(index, hit.chunk.doc_title, hit.chunk.ancestor_path), hit.chunk)
-            for index, hit in enumerate(found, start=1)
+            _Source(Citation(index, block.doc_title, block.ancestor_path), block)
+            for index, block in enumerate(blocks, start=1)
         )
-        logger.info("提问 %r 检索到 %d 条，交给生成", question, len(sources))
+        logger.info(
+            "提问 %r 命中 %d 条切片、聚成 %d 个父块，交给生成", question, len(found), len(sources)
+        )
         text = self.llm.complete(_request(question, sources))
         _warn_on_unknown_citations(text, len(sources))
         return Answer(text, tuple(source.citation for source in sources))
@@ -200,11 +223,11 @@ def _sources(sources: Sequence[_Source]) -> str:
     编号取自 `source.citation.index`，与随答案交回去的那批是同一个值——不是在这里
     重新数一遍。
     """
-    blocks = [
-        f"[{source.citation.index}] {source.citation.label}\n{_prompt_text(source.chunk)}"
+    parts = [
+        f"[{source.citation.index}] {source.citation.label}\n{_prompt_text(source.block)}"
         for source in sources
     ]
-    return _INSTRUCTION + "\n\n".join(blocks)
+    return _INSTRUCTION + "\n\n".join(parts)
 
 
 def _warn_on_unknown_citations(text: str, given: int) -> None:
