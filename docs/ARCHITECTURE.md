@@ -103,10 +103,16 @@ flowchart LR
 - **条目自带 `text` / `content` 时不再识别一遍**，直接用它的。
 - **视觉摘要**是另一件事、另一个模型（`RAGAMER_VISION_*` 那组，只收多模态模型），
   写进**空着的**替代文本；已有 alt 的不覆盖也不调用。整组不配就只做二次 OCR。
-- **实测**（2026-09-13，T10 那 22 张素材，CPU）：22 张全部识别出文字（18–628 字/张）。
-  最要紧的一处是 `12-30-06`——MinerU 从它身上抽出 **0 字**，二次 OCR 拿回 521 字，
-  正是「整页一张大图」那一档。单张 4.5–12 秒，一份几十张图的资料要按分钟计。
+- **实测**（2026-09-13，T10 那同一批 22 张截图，CPU）：22 张全部识别出文字
+  （18–628 字/张，中位数 259）。最要紧的一处是 `12-30-06`——MinerU 从它身上抽出
+  **0 字**，二次 OCR 拿回 521 字，正是「整页一张大图」那一档。单张 4.4–11.7 秒，
+  一份几十张图的资料要按分钟计。出字量与逐张对照见
+  [`experiments/second-pass-ocr.md`](./experiments/second-pass-ocr.md)，
+  重跑用 `uv run python tools/second_pass_ocr.py <截图目录> --out …`。
 - **不设阈值配置**：实验定下的是范围，没有定下任何识别阈值，所以照引擎的默认值走。
+- **不做识别前处理**（放大、裁剪、二值化）：同一轮实验里，MinerU 本来就抽得干净的那几张
+  纯文字截图，二次 OCR 给的字数基本相同——文字识别本身没问题，问题只在「整页被判成
+  一张图」，换个引擎就够。
 
 ### 1.4 结构探测与降级
 
@@ -147,7 +153,7 @@ flowchart LR
 | `game_id` | VARCHAR | **逃生舱**：为将来合并为共享 collection 预留 |
 | `version` | VARCHAR | 版本。**空串表示未标注版本** |
 | `doc_title` | VARCHAR | 来源文档标题 |
-| `chunk_type` | VARCHAR | `text` / `table` / `image` |
+| `chunk_type` | VARCHAR | `text` / `table` / `image`。**v1 只产出前两种**：补图是把图内文字写回正文（§1.3），不另外产出图片切片，`image` 这一档留作预留 |
 | `content_hash` | VARCHAR | 变更检测，为增量导入预留 |
 | `dense_vector` | FLOAT_VECTOR(1024) | BGE-M3 稠密 |
 | `sparse_vector` | SPARSE_FLOAT_VECTOR | BGE-M3 稀疏 |

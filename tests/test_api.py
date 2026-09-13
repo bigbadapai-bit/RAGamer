@@ -200,6 +200,9 @@ def test_导入过程中上报了进度(client):
     payload = import_articles(client, upload("二郎神.md"))
     progress = payload["results"][0]["progress"]
 
+    # 组合根接上补图之后，每个文件都会走过这一步——md 上是空跑一趟（它没有条目级结构，
+    # 补图原样返回）。阶段表按接线报，不按「这一步对这份资料有没有事做」报：那个判断
+    # 在补图那一层里，编排器不替它猜
     assert [event["stage"] for event in progress] == [
         "normalize",
         "enrich",
