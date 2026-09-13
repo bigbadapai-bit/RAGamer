@@ -1,0 +1,40 @@
+{#
+  导入结果。整页渲染时被 import.html 包在 #import-result 里；htmx 提交时单独回这一个片段，
+  换掉那个 div 的内容。两处渲染的是同一份数据，所以两条路看到的东西一模一样。
+#}
+{% if result %}
+<section class="rounded border border-slate-200 bg-white p-5">
+  <h2 class="mb-1 text-lg font-medium">导入结果</h2>
+  <p class="mb-4 text-sm text-slate-500">
+    共 {{ result.rows | length }} 份，成功 {{ result.imported }} 份{% if result.failed %}，失败 {{ result.failed }} 份{% endif %}。
+  </p>
+
+  <ul class="space-y-3">
+    {% for row in result.rows %}
+    <li class="border-t border-slate-200 pt-3 first:border-0 first:pt-0">
+      <div class="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
+        <span class="text-sm font-medium">{{ row.filename }}</span>
+        {% if row.ok %}
+        <span class="text-sm text-slate-500">
+          《{{ row.doc_title }}》· 入库 {{ row.chunk_count }} 条{% if row.skipped %}，跳过 {{ row.skipped }} 条{% endif %}
+        </span>
+        {% else %}
+        <span class="text-sm text-red-700">卡在「{{ row.stage_label }}」：{{ row.error }}</span>
+        {% endif %}
+      </div>
+
+      {% if row.ok %}
+      <p class="mt-1 text-xs text-slate-500">
+        主体名 {{ row.subject_name or empty }}
+        {%- if row.subject_types %} · 主体类型 {{ row.subject_types | join("、") }}{% endif %}
+        {%- if row.content_natures %} · 内容性质 {{ row.content_natures | join("、") }}{% endif %}
+      </p>
+      <p class="mt-2 text-sm">
+        <a class="underline" href="{{ row.preview_url }}">看切分结果</a>
+      </p>
+      {% endif %}
+    </li>
+    {% endfor %}
+  </ul>
+</section>
+{% endif %}

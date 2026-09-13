@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+{% block content %}
+
+{% if bases %}
+<section class="mb-8 rounded border border-slate-200 bg-white p-5">
+  <h2 class="mb-4 text-lg font-medium">传一份资料</h2>
+  {#
+    action／method 与 hx-post 同时写着，这不是冗余：htmx 在时它接管提交、只换下面那一块；
+    htmx 不在（脚本没加载出来）时浏览器走原生提交，回的是同一个结果的整页。
+  #}
+  <form method="post" action="/import" enctype="multipart/form-data"
+        hx-post="/import" hx-encoding="multipart/form-data"
+        hx-target="#import-result" hx-swap="innerHTML" hx-indicator="#import-busy"
+        class="space-y-5">
+    <div class="grid gap-4 sm:grid-cols-2">
+      <label class="block text-sm">
+        <span class="mb-1 block font-medium">知识库</span>
+        <select name="game_id" class="w-full rounded border border-slate-300 px-3 py-2 text-sm">
+          {% for base in bases %}
+          <option value="{{ base.game_id }}" {% if base.game_id == selected %}selected{% endif %}>
+            {{ base.name }}（{{ base.game_id }}）
+          </option>
+          {% endfor %}
+        </select>
+      </label>
+      <label class="block text-sm">
+        <span class="mb-1 block font-medium">版本</span>
+        <input name="version" value="{{ version }}" autocomplete="off"
+               class="w-full rounded border border-slate-300 px-3 py-2 text-sm">
+        <span class="mt-1 block text-xs text-slate-500">
+          留空即未标注版本。新版本与旧版本并存，不覆盖（ADR-0004）。
+        </span>
+      </label>
+    </div>
+
+    <label class="block text-sm">
+      <span class="mb-1 block font-medium">资料</span>
+      <input type="file" name="files" multiple accept=".md,.markdown,.txt"
+             class="block w-full text-sm">
+      <span class="mt-1 block text-xs text-slate-500">
+        现在只认 Markdown 与纯文本，可多选。一批里某个文件失败不牵连其余。
+      </span>
+    </label>
+
+    <div class="flex items-center gap-4">
+      <button type="submit" class="rounded bg-slate-900 px-4 py-2 text-sm font-medium text-white">
+        开始导入
+      </button>
+      <span id="import-busy" class="htmx-indicator text-sm text-slate-500">正在导入……</span>
+    </div>
+  </form>
+</section>
+
+<div id="import-result">
+  {% include "partials/import_result.html" %}
+</div>
+{% else %}
+<p class="text-sm text-slate-500">还没有知识库。<a class="underline" href="/kb">先建一个</a>。</p>
+{% endif %}
+
+{% endblock %}

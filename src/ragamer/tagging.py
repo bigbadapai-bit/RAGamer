@@ -87,6 +87,27 @@ CONTENT_NATURE_LABELS: Mapping[ContentNature, str] = {
     ContentNature.REVIEW: "好不好／哪个强",
 }
 
+#: 界面上的叫法，取自 CONTEXT.md 的词条名。与上面那两组 `*_LABELS` **不是一回事**：
+#: 那两组说的是「这一类覆盖哪些说法」，进提示词；这一组只是「这一类叫什么」，进界面。
+#: 界面上照抄那两组会把一整句覆盖说明塞进表格里。
+SUBJECT_TYPE_NAMES: Mapping[SubjectType, str] = {
+    SubjectType.CHARACTER: "角色",
+    SubjectType.ITEM: "物品",
+    SubjectType.PLACE: "地点",
+    SubjectType.QUEST: "任务",
+    SubjectType.SKILL: "技能",
+    SubjectType.BACKGROUND: "背景设定",
+    SubjectType.SYSTEM: "机制系统",
+}
+
+CONTENT_NATURE_NAMES: Mapping[ContentNature, str] = {
+    ContentNature.INTRO: "介绍",
+    ContentNature.WHERE: "位置与获取",
+    ContentNature.STATS: "数值",
+    ContentNature.GUIDE: "打法流程",
+    ContentNature.REVIEW: "评价推荐",
+}
+
 #: 内容性质的判定词表：标题里含哪个词就算哪一类，含几个算几个。
 #: 词之间用空格分开。表里的次序就是结果里各类的先后——越具体的越靠前，
 #: 「属性说明」这类两头都沾的标题，数值排在介绍前头。

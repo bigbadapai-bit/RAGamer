@@ -12,6 +12,7 @@
 uv sync                  # 建虚拟环境、装依赖
 cp .env.example .env     # 然后按注释把值填成自己的
 uv run ragamer           # 启动自检：配置合格、Milvus/Mongo/MinIO 都连得上才通过
+uv run ragamer-web       # 起界面：浏览器打开 http://127.0.0.1:8000
 ```
 
 退出码 `0` 通过、`2` 配置有问题、`3` 存储连不上——远端不可达时在
@@ -21,6 +22,8 @@ uv run ragamer           # 启动自检：配置合格、Milvus/Mongo/MinIO 都�
 
 | 命令 | 作用 |
 | --- | --- |
+| `uv run ragamer` | 启动自检：配置合格、Milvus/Mongo/MinIO 都连得上才通过 |
+| `uv run ragamer-web` | 起界面与后端（先跑一遍同样的自检，通了才起；默认 `127.0.0.1:8000`） |
 | `uv run pytest` | 跑测试（集成测试默认不跑，加 `-m integration` 才跑） |
 | `uv run ruff check .` | 跑 lint |
 | `uv run ruff format .` | 格式化 |
@@ -84,14 +87,37 @@ uv run pytest -m integration     # 跑真模型的集成测试（首次会下载
 - 打标用的词表来自知识库元数据（MongoDB 的 `knowledge_bases` 集合，id 即游戏 id）。
   库不存在时 404，不静默按默认词表建内容。
 
+## 界面
+
+**FastAPI + Jinja2 + htmx，零构建步骤**——没有 npm、没有打包产物（[ADR-0005](docs/adr/0005-htmx-frontend.md)）。
+页面在 `ragamer.web`，模板跟着包走；`ragamer.app` 把 JSON 端点与页面装成同一个应用。
+
+| 路径 | 页面 |
+| --- | --- |
+| `/kb` | 知识库管理：建库（游戏 id + 显示名 + 勾选启用的主体类型）、列出已有的库 |
+| `/import` | 导入：选库、传 md／txt、标注版本，逐文件的导入结果就地列出来 |
+| `/kb/{game_id}/preview` | **切分预览（只读）**：正文、祖先标题路径、主体类型、内容性质、来源文档 |
+| `/chat`、`/eval` | 占位，后面几张票接上 |
+
+- **禁用 JavaScript 也能用**。每条写入路径都是普通的 HTML 表单；htmx 在时把结果那一块换掉，
+  不在时浏览器自己提交、回整页——服务端按 `HX-Request` 决定回整页还是回片段，两条路走的是
+  同一段处理逻辑。
+- **切分预览页没有任何编辑入口**，它把库里存下来的东西读回来渲染。取切片走的是检索那条路
+  （`fetch_document`），所以看到的就是检索时会看见的：该版本的内容与**未标注版本**的内容一并
+  列出（[ADR-0004](docs/adr/0004-versioned-content-coexists.md)），后者挂个徽章说明来历。
+- 页面上的 Tailwind 与 htmx 走 CDN。代价是首次加载要连得上外网；连不上时页面照常能用，
+  只是没有样式、也不会局部刷新。
+
 ## 目录
 
 ```
 src/ragamer/          应用代码（config 配置装载、logging 日志、llm 语言模型适配器、sources 归一化、
-                      chunking 切分器、tagging 打标、importing 导入编排器、api HTTP 端点、
-                      container 组合根、__main__ 启动自检）
+                      chunking 切分器、tagging 打标、importing 导入编排器、knowledge 知识库元数据、
+                      api JSON 端点、web 页面、app 应用装配与起服务、container 组合根、
+                      __main__ 启动自检）
 src/ragamer/stores/   存储适配器：base 协议与共享类型、chunks Milvus、documents Mongo、objects MinIO、memory 内存假件
 src/ragamer/vectors/  向量化与精排：base 协议与共享类型、bge 真实模型、fake 确定性假件
+src/ragamer/web/      页面与模板（templates/ 跟着包走，装成 wheel 也在）
 tests/                测试：行为测试 + 结构约束 + 集成测试
 docs/                 架构文档、ADR、给 agent 的说明
 ```
