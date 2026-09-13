@@ -6,6 +6,7 @@ SSE 解析代码路径，只是不经过网络。假件则单独验它自己那�
 
 from __future__ import annotations
 
+import base64
 import json
 
 import httpx
@@ -15,6 +16,7 @@ from pydantic import BaseModel
 from ragamer.config import LlmSettings, Settings
 from ragamer.llm import (
     FakeLlm,
+    ImagePart,
     LlmClient,
     LlmError,
     LlmInvalidOutput,
@@ -504,7 +506,77 @@ def test_没有消息的调用在发出前就被拦下():
         LlmRequest(messages=[])
 
 
-# ── 假件 ──
+# ── 带图消息（补图那一票的视觉摘要走它）──
+
+
+def test_带图的消息发出多模态内容(llm_config):
+    """图按 data URI 内联。走 URL 要先有个公网可取的地址，而解析产物里的原图
+    在对象存储里，没有这么个地址。"""
+    payloads: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payloads.append(json.loads(request.content))
+        return httpx.Response(200, json=_reply("一张攻略截图"))
+
+    client = _llm(handler, llm_config)
+    result = client.complete(
+        LlmRequest(
+            messages=[
+                Message("system", "说清图里是什么"),
+                Message(
+                    "user",
+                    "这张图是什么",
+                    images=(ImagePart(data=b"\x89PNG-bytes", content_type="image/png"),),
+                ),
+            ]
+        )
+    )
+
+    assert result == "一张攻略截图"
+    content = payloads[0]["messages"][1]["content"]
+    assert content[0] == {"type": "text", "text": "这张图是什么"}
+    assert content[1]["image_url"]["url"] == (
+        "data:image/png;base64," + base64.b64encode(b"\x89PNG-bytes").decode("ascii")
+    )
+
+
+def test_不带图的消息仍然是字符串形式(llm_config):
+    """**不退化成「只含一段文字」的数组**：不是每个 OpenAI 兼容服务端都认后者，
+    而纯文本这条路本来一直好好的，不该被补图那一票波及。"""
+    payloads: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payloads.append(json.loads(request.content))
+        return httpx.Response(200, json=_reply("嗨"))
+
+    _llm(handler, llm_config).complete(_request())
+
+    assert all(isinstance(message["content"], str) for message in payloads[0]["messages"])
+
+
+def test_结构化调用也带得上图(llm_config):
+    """摘要与联合输出走同一个客户端，两边的带图路径不该只有一条通。"""
+    payloads: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payloads.append(json.loads(request.content))
+        body = '{"subject_name":"二郎神","rewritten_query":"二郎神 打法","routes":["main"]}'
+        return httpx.Response(200, json=_reply(body))
+
+    _llm(handler, llm_config).complete_structured(
+        LlmRequest(
+            messages=[
+                Message(
+                    "user",
+                    "看看这张图",
+                    images=(ImagePart(data=b"jpeg-bytes", content_type="image/jpeg"),),
+                )
+            ]
+        ),
+        联合输出,
+    )
+
+    assert isinstance(payloads[0]["messages"][-1]["content"], list)
 
 
 def test_首条不是系统提示时结构化调用不丢消息(llm_config):
@@ -524,6 +596,9 @@ def test_首条不是系统提示时结构化调用不丢消息(llm_config):
     prompt = _messages_of(payloads[0])
     assert "二郎神怎么打" in prompt
     assert "JSON Schema" in prompt
+
+
+# ── 假件 ──
 
 
 def test_假件与真实客户端是同一个接口(llm_config):

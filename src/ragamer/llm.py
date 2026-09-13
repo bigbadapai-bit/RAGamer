@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
@@ -115,11 +116,27 @@ class RetryPolicy:
 
 
 @dataclass(frozen=True)
+class ImagePart:
+    """随消息发出去的一张图。
+
+    `content_type` 是拼 data URI 用的（`data:image/png;base64,…`），模型按它解释字节——
+    类型写错在有些服务端上不是报错，而是把图当成坏的直接忽略。认字节的活由调用方做
+    （`ragamer.enriching`）：这一层只认 OpenAI 兼容接口的形状，不认识图片格式。
+    """
+
+    data: bytes
+    content_type: str
+
+
+@dataclass(frozen=True)
 class Message:
-    """一条对话消息。"""
+    """一条对话消息。带图时 `images` 非空，正文与图一起发出去。"""
 
     role: Role
     content: str
+    #: 跟这条消息一起发出去的图。空元组即纯文本消息——纯文本仍是字符串形式的
+    #: `content`，不是只含一段文字的多模态数组：不是每个 OpenAI 兼容服务端都认后者。
+    images: tuple[ImagePart, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -226,7 +243,7 @@ class OpenAiLlm:
         payload: dict[str, Any] = {
             "model": self._config.model,
             "messages": [
-                {"role": message.role, "content": message.content} for message in messages
+                {"role": message.role, "content": _content(message)} for message in messages
             ],
             "temperature": request.temperature,
         }
@@ -370,6 +387,30 @@ class FakeLlm:
         return reply if isinstance(reply, str) else json.dumps(reply, ensure_ascii=False)
 
 
+def _content(message: Message) -> str | list[dict[str, Any]]:
+    """一条消息的 `content`：不带图就是字符串，带图是多模态数组。
+
+    不带图时不退化成「只含一段文字」的数组——两边的形状本来就不同，
+    多绕一层只会让纯文本那边也跟着受服务端实现差异的影响（补图那一票加的）。
+    """
+    if not message.images:
+        return message.content
+    return [
+        {"type": "text", "text": message.content},
+        *(
+            {"type": "image_url", "image_url": {"url": _data_uri(image)}}
+            for image in message.images
+        ),
+    ]
+
+
+def _data_uri(image: ImagePart) -> str:
+    """图按 base64 内联进请求体。走 URL 意味着先得有个公网可取的地址，
+    而解析产物里的原图在对象存储里，没有这么个地址。"""
+    encoded = base64.b64encode(image.data).decode("ascii")
+    return f"data:{image.content_type};base64,{encoded}"
+
+
 @dataclass(frozen=True)
 class _Delta:
     """流里的一片产出，以及它携带的结束原因。"""
@@ -422,7 +463,8 @@ def _with_schema(
     """把「要输出什么结构」并进系统提示；重试时再带上上一次的毛病。
 
     首条不是系统提示时**在它前面插一条**，不是把它顶掉——一次调用可以只有一条 user
-    消息，顶掉之后模型收到的是光秃秃的 schema 说明，问题本身没了，而且不报错。
+    消息（补图那一票的带图调用就是），顶掉之后模型收到的是光秃秃的 schema 说明，
+    问题本身没了，而且不报错。
     """
     instruction = _schema_instruction(schema)
     if repair is not None:
