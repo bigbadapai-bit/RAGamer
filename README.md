@@ -72,7 +72,8 @@ uv run pytest -m integration     # 跑真模型的集成测试（首次会下载
 ## 目录
 
 ```
-src/ragamer/          应用代码（config 配置装载、logging 日志、container 组合根、__main__ 启动自检）
+src/ragamer/          应用代码（config 配置装载、logging 日志、llm 语言模型适配器、chunking 切分器、
+                      tagging 打标、container 组合根、__main__ 启动自检）
 src/ragamer/stores/   存储适配器：base 协议与共享类型、chunks Milvus、documents Mongo、objects MinIO、memory 内存假件
 src/ragamer/vectors/  向量化与精排：base 协议与共享类型、bge 真实模型、fake 确定性假件
 tests/                测试：行为测试 + 结构约束 + 集成测试

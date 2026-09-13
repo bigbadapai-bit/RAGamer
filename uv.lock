@@ -2213,6 +2213,7 @@ name = "ragamer"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "httpx" },
     { name = "minio" },
     { name = "pydantic-settings" },
     { name = "pymilvus" },
@@ -2235,6 +2236,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "flagembedding", marker = "extra == 'models'", specifier = ">=1.4" },
+    { name = "httpx", specifier = ">=0.28" },
     { name = "minio", specifier = ">=7.2" },
     { name = "pydantic-settings", specifier = ">=2.15" },
     { name = "pymilvus", specifier = ">=3.0" },

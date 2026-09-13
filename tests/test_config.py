@@ -53,6 +53,10 @@ def test_每个配置键都能从环境变量读入(settings_env):
     assert settings.llm.base_url == "https://llm.test/v1"
     assert settings.llm.api_key.get_secret_value() == "test-llm-api-key"
     assert settings.llm.model == "test-model"
+    assert settings.llm.timeout == 12.5
+    assert settings.llm.max_attempts == 5
+    assert settings.llm.backoff_base == 0.25
+    assert settings.llm.backoff_max == 4.0
     assert settings.models.device == "cuda:1"
     assert settings.models.fp16 is True
     assert settings.embed.model == "test-embed-model"
@@ -69,6 +73,10 @@ def test_未给出可选项时取默认值(settings_env, monkeypatch):
         "RAGAMER_STORE_TIMEOUT_SECONDS",
         "RAGAMER_MILVUS_DB",
         "RAGAMER_MINIO_BUCKET",
+        "RAGAMER_LLM_TIMEOUT",
+        "RAGAMER_LLM_MAX_ATTEMPTS",
+        "RAGAMER_LLM_BACKOFF_BASE",
+        "RAGAMER_LLM_BACKOFF_MAX",
         "RAGAMER_MODELS_DEVICE",
         "RAGAMER_MODELS_FP16",
         "RAGAMER_EMBED_BATCH_SIZE",
@@ -83,6 +91,10 @@ def test_未给出可选项时取默认值(settings_env, monkeypatch):
     assert settings.store_timeout_seconds == 5.0
     assert settings.milvus.db == "ragamer"
     assert settings.minio.bucket == "ragamer-images"
+    assert settings.llm.timeout == 60.0
+    assert settings.llm.max_attempts == 3
+    assert settings.llm.backoff_base == 0.5
+    assert settings.llm.backoff_max == 8.0
     # 默认落在 CPU 与单精度上：这台机器上不一定有 GPU，CPU 上也用不了半精度
     assert settings.models.device == "cpu"
     assert settings.models.fp16 is False
@@ -112,6 +124,18 @@ def test_存储超时非法时报错并指出键名(settings_env, monkeypatch, v
         load_settings(env_file=None)
 
     assert "RAGAMER_STORE_TIMEOUT_SECONDS" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("override", ["RAGAMER_LLM_MAX_ATTEMPTS=99", "RAGAMER_LLM_TIMEOUT=0"])
+def test_重试次数与超时超出可接受范围时报错并指出键名(settings_env, monkeypatch, override):
+    """重试必须有界：配置里给个天文数字不该被原样接受。"""
+    key, _, value = override.partition("=")
+    monkeypatch.setenv(key, value)
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_settings(env_file=None)
+
+    assert key in str(excinfo.value)
 
 
 def test_milvus_的库名不能叫_default(settings_env, monkeypatch):

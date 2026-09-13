@@ -10,6 +10,9 @@ dependencies = [
     "pymilvus>=3.0",
     "pymongo>=4.9",
     "minio>=7.2",
+    # 语言模型适配器的 HTTP 客户端；自己发 OpenAI 兼容请求，不引 SDK，
+    # 以便用 MockTransport 打真实代码路径（含 SSE 解析）而不碰网络
+    "httpx>=0.28",
     # 配置装载的唯一入口；用到 dotenv_filtering，故下限取 2.15
     "pydantic-settings>=2.15",
     # 直接读 .env 做「未知键 / 取值被 ${…} 改写」这两项检查，pydantic-settings 不汇报
