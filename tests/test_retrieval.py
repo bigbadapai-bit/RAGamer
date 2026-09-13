@@ -359,6 +359,42 @@ def test_超长文档收敛到命中切片所在的小节():
     assert [chunk.chunk_index for chunk in blocks[0].chunks] == [1]
 
 
+def test_收敛之后仍然超长时只留命中那一条(caplog):
+    """整篇只有一节、没有更细的粒度可收敛时也不能把整页塞进去——上下文预算是硬约束，
+    宁可不带上下文。这种情况要留痕：它多半说明切分没切出结构，是数据侧该修的事。"""
+    filler = "长" * MAX_PARENT_CHARS
+    store = chunk_store(
+        GAME,
+        make_chunk(1, content=f"{filler}甲", ancestor_path="二郎神", chunk_index=0),
+        make_chunk(2, content=f"{filler}乙", ancestor_path="二郎神", chunk_index=1),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        blocks = aggregate_parents(
+            [hit(2, 0.9, ancestor_path="二郎神")], game_id=GAME, chunks=store
+        )
+
+    assert [chunk.chunk_id for chunk in blocks[0].chunks] == [2]
+    warnings = [
+        record.getMessage() for record in caplog.records if record.levelno == logging.WARNING
+    ]
+    assert any("没有更细的粒度" in message for message in warnings)
+
+
+def test_没有祖先标题路径的超长文档也只留命中那一条():
+    """扁平文档压根没有小节：路径为空串时同样退到只剩命中那一条，不是退回整篇。"""
+    filler = "长" * MAX_PARENT_CHARS
+    store = chunk_store(
+        GAME,
+        make_chunk(1, content=filler, ancestor_path="", chunk_index=0),
+        make_chunk(2, content=filler, ancestor_path="", chunk_index=1),
+    )
+
+    blocks = aggregate_parents([hit(2, 0.9, ancestor_path="")], game_id=GAME, chunks=store)
+
+    assert [chunk.chunk_id for chunk in blocks[0].chunks] == [2]
+
+
 def test_正好到上限的文档不算超长():
     """判定是「大于」：整页正好等于上限仍算一页，不因为卡在边界上就切走半篇。"""
     half = "长" * (MAX_PARENT_CHARS // 2)

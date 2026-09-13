@@ -28,6 +28,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+from ragamer.chunking import DEFAULT_MAX_CHARS
 from ragamer.logging import get_logger
 from ragamer.stores.base import Chunk, ChunkFilter, ChunkHit, ChunkStore
 from ragamer.vectors.base import Embedder, ModelOutputError, Reranker
@@ -56,10 +57,10 @@ CANDIDATE_LIMIT = MAX_CHUNKS * CANDIDATE_FACTOR
 #: 父块的长度上限（字符数）。整篇文档超过它就按命中切片所在的小节收敛（§2.5）。
 #:
 #: 量级由截断上界与单片上界乘出来：截断最多交 :data:`MAX_CHUNKS` 条，切分器单片正文
-#: 上限 800 字符（`ragamer.chunking.ChunkRules.max_chars`）。**数值本身仍是没有评测集时的
-#: 占位**（§11）——模板块不受单片上限约束，这条乘法只是"一页"的大致边界，
+#: 上限 :data:`ragamer.chunking.DEFAULT_MAX_CHARS`。**数值本身仍是没有评测集时的占位**
+#: （§11）——模板块不受单片上限约束，这条乘法只是"一页"的大致边界，
 #: 真章是超长文档不该整页喂进去。
-MAX_PARENT_CHARS = MAX_CHUNKS * 800
+MAX_PARENT_CHARS = MAX_CHUNKS * DEFAULT_MAX_CHARS
 
 
 def retrieve(
@@ -146,9 +147,10 @@ def cliff_cut(hits: Sequence[ChunkHit]) -> tuple[ChunkHit, ...]:
 class ParentBlock:
     """命中并截断之后，按文档聚合出来的父块（§2.5 的父子块）。
 
-    `ancestor_path` 是空串表示**整篇**——文档不长，整页交给生成；非空表示这份文档
-    超长、已收敛到命中的那个小节。两种情况都随 `chunks` 给出原始切片：父块不是另一份
-    内容，只是同一批切片的一个视图，所以它与子块永远同源。
+    `ancestor_path` 是空串表示**没有按小节收敛**：要么文档不长、整篇交给生成，要么
+    没有更细的结构可收敛（见 `_block_of`）。非空表示已收敛到命中的那个小节。
+    三种情况都随 `chunks` 给出原始切片：父块不是另一份内容，只是同一批切片的一个视图，
+    所以它与子块永远同源。
     """
 
     doc_title: str
@@ -180,6 +182,7 @@ def aggregate_parents(
       「该版本 **或** 未标注版本」；两个版本各留一份切片时，父块里不会混版本。
     - **超长文档收敛到小节**。整页超过 :data:`MAX_PARENT_CHARS` 就只留与命中切片同一
       条 `ancestor_path` 的切片，不把整页喂进去。同一文档命中多处小节时各成一个父块。
+      收敛之后仍然超长的，说明这篇没有更细的粒度，退到只剩命中那一条（见 `_block_of`）。
     - **顺序**：父块按命中的先后（即精排分从高到低），块内按 `chunk_index` 升序。
 
     同文档只回查一次；同一个 (文档, 小节) 只出一个父块。命中切片按 `doc_title` 回查
@@ -204,23 +207,37 @@ def aggregate_parents(
                 title,
             )
             continue
-        section = hit.chunk.ancestor_path if _too_long(found) else ""
+        section, pieces = _block_of(found, hit.chunk)
         if (title, section) in seen:
             continue
         seen.add((title, section))
-        blocks.append(
-            ParentBlock(
-                doc_title=title,
-                ancestor_path=section,
-                chunks=tuple(
-                    chunk for chunk in found if not section or chunk.ancestor_path == section
-                ),
-            )
-        )
+        blocks.append(ParentBlock(doc_title=title, ancestor_path=section, chunks=pieces))
     return tuple(blocks)
 
 
-def _too_long(chunks: Sequence[Chunk]) -> bool:
+def _block_of(found: Sequence[Chunk], hit: Chunk) -> tuple[str, tuple[Chunk, ...]]:
+    """在整篇里圈出交给生成的那一段，返回 (小节路径, 那几条切片)。
+
+    不长就整篇，路径为空串。超长则收敛到命中切片所在的小节；**收敛之后仍然超长**，
+    说明这一篇没有更细的粒度可收敛——整篇只有一节，或者切片根本没有祖先标题路径——
+    这时只留命中那一条：上下文预算是硬约束，宁可不带上下文，也不能把整页塞进去。
+    这种情况留一条 warning，它多半说明切分没切出结构，是数据侧该修的事。
+    """
+    if not _page_too_long(found):
+        return "", tuple(found)
+    section = hit.ancestor_path
+    pieces = tuple(chunk for chunk in found if chunk.ancestor_path == section)
+    if not _page_too_long(pieces):
+        return section, pieces
+    logger.warning(
+        "文档 %r 超长，收敛到小节 %r 之后还是超长：这一节里没有更细的粒度，只留命中的那一条切片",
+        hit.doc_title,
+        section,
+    )
+    return section, (hit,)
+
+
+def _page_too_long(chunks: Sequence[Chunk]) -> bool:
     """整页交给生成是不是太长了。
 
     `content_meta` 也算进来：它随结果一起交给模型（§2.2），只按正文算会低估实际喂进去的量。
