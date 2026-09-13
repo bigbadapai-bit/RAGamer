@@ -12,7 +12,7 @@ htmx 只用在**有一块明显可以就地换掉的结果区**的地方——�
 三者都直接用写入侧已有的实现（`ragamer.knowledge` 与 `ragamer.importing`），页面自己不重做
 其中的判断：术语映射的增删也是调 `set_term`／`remove_term`，不在页面里拼那份映射。
 **删库同理**：页面只负责把「将要清掉什么」摆出来让人确认，清理本身走 `purge_knowledge_base`，
-那条路上的三处存储不经过界面。切分预览页是把库里存下来的东西读回来渲染，**没有任何编辑入口**。
+那条路上的四处存储不经过界面。切分预览页是把库里存下来的东西读回来渲染，**没有任何编辑入口**。
 
 改配置与删库这类动作一律走「提交 → 重定向 → 重新渲染」，不直接回 200：刷新一下就把上一次
 的删除或改动再提交一遍，是这类页面上最容易踩的一个坑。
@@ -261,11 +261,11 @@ def create_router(container: Container, stack: ChatStack) -> APIRouter:
             )
         try:
             inventory = purge_knowledge_base(
-                container.chunks,
-                container.docs,
-                container.objects,
-                container.cache,
-                game_id,
+                chunks=container.chunks,
+                docs=container.docs,
+                objects=container.objects,
+                cache=container.cache,
+                game_id=game_id,
                 sessions=CONVERSATIONS,
             )
         except PurgeError as exc:
@@ -975,7 +975,11 @@ def _delete_page(
         )
     try:
         inventory = purge_inventory(
-            container.chunks, container.docs, container.objects, game_id, sessions=CONVERSATIONS
+            chunks=container.chunks,
+            docs=container.docs,
+            objects=container.objects,
+            game_id=game_id,
+            sessions=CONVERSATIONS,
         )
     except Exception as exc:
         # 条数报不出来就不让人确认：闭着眼睛删不是确认。兜住全部异常的理由与
@@ -994,6 +998,8 @@ def _delete_page(
         # 带尾随斜杠，与实际清理用的是同一个前缀（见 `image_folder`）——页面上写着
         # `images/black_myth`，删的时候按它去匹配，就会连 `black_myth_2` 的图一起收走
         prefix=image_folder(game_id),
+        # 集合名从常量来，不在模板里写死：`CONVERSATIONS` 一改名，页面就开始撒谎
+        sessions=CONVERSATIONS,
         error=error,
         status_code=status_code,
     )

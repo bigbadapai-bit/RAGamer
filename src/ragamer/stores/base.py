@@ -313,11 +313,14 @@ class DocStore(Store, Protocol):
     def delete_where(self, collection: str, where: Mapping[str, Any]) -> int:
         """按**等值条件**批量删，返回删掉的条数。**删库清会话走它**。
 
-        与 `find` 同一套等值语义（`matches_where`）。有它是因为一条一条 `delete` 要先把
-        id 全查回来再逐条发请求，几十上百条会话就是几十上百次往返；而这里一次就够，
-        条数还由存储自己数——**确认页数的与真删掉的因此是同一批东西**。
+        与 `find` 同一套等值语义（`matches_where`）——**筛的是同一批东西**：两处各写一套
+        过滤，确认页上数出来的与这里真删掉的就会不是一回事。有它还因为一条一条 `delete`
+        要先把 id 全查回来再逐条发请求，几十上百条会话就是几十上百次往返；这里一次就够，
+        条数也由存储自己报回来。
 
         删不中任何一条时返回 0，不报错：**「本来就没有」与「删干净了」对调用方是同一件事**。
+
+        :raises ValueError: `where` 是空的——那等于清空整个集合，见 :func:`require_where`。
         """
         ...
 
@@ -410,6 +413,20 @@ class ObjectStore(Store, Protocol):
     def delete_prefix(self, prefix: str) -> int:
         """按前缀批量删，返回删掉的个数。删库时清原图走它。"""
         ...
+
+
+def require_where(where: Mapping[str, Any]) -> None:
+    """批量删的条件不能是空的。
+
+    `delete_many({})` 是「删掉这个集合里的全部」，而删除不可逆——空条件多半是上游把
+    `where` 拼丢了，不该由存储这一层替它兜。真要清空一个集合是另一件事
+    （`ChunkStore.drop` 那种），不从这条路走进来。
+
+    两个实现共用这一句文案，与 `require_vectors` 同一个打法：各守一遍，同一个毛病在
+    两处就说成两件事了。
+    """
+    if not where:
+        raise ValueError("批量删必须给条件：空条件会把整个集合清空，而这是不可逆的")
 
 
 def normalize_prefix(prefix: str) -> str:

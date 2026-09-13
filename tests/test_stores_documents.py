@@ -305,6 +305,15 @@ def test_翻页游标要跟排序键一起给(store):
         store.find("conversations", after=("x", "s1"))
 
 
+def test_空条件不许批量删(store, mongo):
+    """真 Mongo 的 `delete_many({})` 会清空整个集合——这一条要在发出去之前拦住。"""
+    with pytest.raises(ValueError, match="必须给条件"):
+        store.delete_where("conversations", {})
+
+    store.check()  # 先连上才拿得到假集合
+    assert _client(mongo)["ragamer-test"]["conversations"].calls == []
+
+
 def test_建索引按复合键的顺序落下去(store, mongo):
     """键的顺序就是查询的顺序：先按库过滤，再按最后活跃倒序。"""
     store.ensure_indexes("conversations", (("game_id", 1), ("updated_at", -1)))

@@ -24,6 +24,7 @@ from ragamer.stores.base import (
     matches_where,
     normalize_prefix,
     require_vectors,
+    require_where,
 )
 
 #: 假件的名字与地址：它们永远不会报"连不上"，这两个字段只为凑齐协议。
@@ -139,6 +140,7 @@ class InMemoryDocStore:
         self._collections.get(collection, {}).pop(doc_id, None)
 
     def delete_where(self, collection: str, where: Mapping[str, Any]) -> int:
+        require_where(where)
         rows = self._collections.get(collection, {})
         stale = [doc_id for doc_id, document in rows.items() if matches_where(document, where)]
         for doc_id in stale:

@@ -15,7 +15,7 @@ from pymongo.errors import PyMongoError
 
 from ragamer.config import MongoSettings
 from ragamer.redaction import redact_address
-from ragamer.stores.base import MONGO, unavailable
+from ragamer.stores.base import MONGO, require_where, unavailable
 
 #: 连接串内嵌账号密码是常事，报错信息里只出现抹过的地址。
 _FAILURES = (PyMongoError, OSError, ValueError)
@@ -108,6 +108,7 @@ class MongoDocStore:
         self._collection(collection).create_index(list(fields))
 
     def delete_where(self, collection: str, where: Mapping[str, Any]) -> int:
+        require_where(where)
         return int(self._collection(collection).delete_many(dict(where)).deleted_count)
 
     def _connect(self) -> MongoClient:

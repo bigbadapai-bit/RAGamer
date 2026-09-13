@@ -476,4 +476,14 @@ def test_按条件批量删(memory_container):
 def test_按条件删不中时返回零(memory_container):
     """「本来就没有」与「删干净了」对调用方是同一件事，不报错。"""
     assert memory_container.docs.delete_where("conversations", {"game_id": "没这个库"}) == 0
-    assert memory_container.docs.delete_where("还没有这个集合", {}) == 0
+    assert memory_container.docs.delete_where("还没有这个集合", {"game_id": "x"}) == 0
+
+
+def test_空条件不许批量删(memory_container):
+    """`delete_many({})` 等于清空整个集合，而删除不可逆——空条件多半是上游把 where 拼丢了。"""
+    memory_container.docs.put("conversations", "s1", {"game_id": "black_myth"})
+
+    with pytest.raises(ValueError, match="必须给条件"):
+        memory_container.docs.delete_where("conversations", {})
+
+    assert memory_container.docs.list_ids("conversations") == ["s1"]
