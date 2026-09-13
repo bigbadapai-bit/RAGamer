@@ -17,6 +17,8 @@
   路径」一起进提示词，也一起随答案交回。没有引用的答案是一段无从核对的话——
   用户没法知道它是切片里写的还是模型编的。编号对不对得上由「引用与内容同批同序」
   保证：两者绑在同一个 :class:`_Source` 里，不是两个各排一遍的序列。
+- **答案还要带图片地址**。图片留在正文里（§1.3），从交给模型的那批内容里取出来随答案
+  交回，用户才不必跳出去找原图。它跟着引用走，不是另一次检索。
 - **检索不到就直说**。候选一条都没有时**不调模型**：没有内容可依据，让它自由发挥
   只会得到一段编造的游戏攻略，而且看起来和真答案一样。回复是这里的常量。
 - **生成失败照抛**：没有答案就是没有答案。降级成一段「抱歉我答不上来」会把故障
@@ -43,6 +45,7 @@ from ragamer.llm import LlmClient, LlmRequest, Message
 from ragamer.logging import get_logger
 from ragamer.query import version_filter
 from ragamer.retrieval import ParentBlock, aggregate_parents, retrieve
+from ragamer.sources import image_refs
 from ragamer.stores.base import Chunk, ChunkStore
 from ragamer.vectors.base import Embedder, Reranker
 
@@ -119,18 +122,24 @@ class Answer:
 
     `citations` 为空即「没有检索到内容」，这时 `text` 是 `NOT_FOUND` 那段常量。
     调用方不必另外判断有没有答案——空引用就是那个信号。
+
+    `images` 是交给生成的那批内容里出现过的图片地址：答案里要能直接展示原图，
+    用户不必跳出去找（用户故事 52）。它是**跟着引用走**的，不是另一次检索的结果。
     """
 
     text: str
     citations: tuple[Citation, ...]
+    images: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
 class AnswerStream:
-    """一次提问的流式形态：**引用先定下来，正文逐字来**。
+    """一次提问的流式形态：**引用与图片先定下来，正文逐字来**。
 
     检索、精排、聚合父块在 :meth:`Answerer.stream` 返回之前就跑完了，所以 `citations`
-    到这一刻已经是最终的那一批——界面可以先把来源渲染出来，不必等正文吐完。
+    与 `images` 到这一刻已经是最终的那一批——界面可以先把来源与图片渲染出来，
+    不必等正文吐完。两者与正文放在同一层返回，而不是各成一路：分开成两个平行序列
+    就得靠调用方保证两边对得上，对不上时是静默的（引用指向另一段正文）。
 
     `deltas` 是**惰性**的：模型那一段要等调用方真的开始迭代才发出去。好处不只是省一次
     网络往返——调用方**随时可以把它丢掉**（客户端断开、页面关掉），丢掉之后这边不留
@@ -143,6 +152,8 @@ class AnswerStream:
     """
 
     citations: tuple[Citation, ...]
+    #: 交给生成的那批内容里出现过的图片地址，见 :class:`Answer`。
+    images: tuple[str, ...]
     deltas: Iterator[str]
 
 
@@ -177,6 +188,31 @@ def _chunk_text(chunk: Chunk) -> str:
     """
     meta = chunk.content_meta.strip()
     return f"{chunk.content}\n{meta}" if meta else chunk.content
+
+
+def _citations(sources: Sequence[_Source]) -> tuple[Citation, ...]:
+    """编号好的这批来源，顺序即交给模型的顺序。"""
+    return tuple(source.citation for source in sources)
+
+
+def _image_urls(sources: Sequence[_Source]) -> tuple[str, ...]:
+    """交给生成的这批内容里出现过的图片地址，按首次出现的顺序去重。
+
+    图片地址本来就留在正文里（§1.3：原图保留，供答案展示），所以这里是从**已经要
+    交给模型的那批内容**里取，不是另查一次——另查一次就会与引用对不上。
+    `content_meta` 也算：表格的长文本列整列降级在那里（§2.5），里面同样可以有图。
+
+    认什么样的图片引用由 `ragamer.sources.image_refs` 定，与补图那一层同一处正则。
+    """
+    return tuple(
+        dict.fromkeys(
+            url
+            for source in sources
+            for chunk in source.block.chunks
+            for text in (chunk.content, chunk.content_meta)
+            for url in image_refs(text)
+        )
+    )
 
 
 @dataclass(frozen=True)
@@ -220,7 +256,7 @@ class Answerer:
             return Answer(NOT_FOUND, ())
         text = self.llm.complete(_request(question, sources))
         _warn_on_unknown_citations(text, len(sources))
-        return Answer(text, _citations(sources))
+        return Answer(text, _citations(sources), _image_urls(sources))
 
     def stream(
         self,
@@ -232,8 +268,8 @@ class Answerer:
     ) -> AnswerStream:
         """与 :meth:`answer` 同一套检索与提示，只是正文逐字产出。
 
-        引用与正文分两步给：检索那一段**在返回之前**就跑完了（它决定引用，也决定要不要
-        调模型），模型那一段则等调用方开始时才发出去。没有检索到内容时同样不调模型，
+        引用与正文分两步给：检索那一段**在返回之前**就跑完了（它决定引用与图片，也决定
+        要不要调模型），模型那一段则等调用方开始时才发出去。没有检索到内容时同样不调模型，
         `NOT_FOUND` 那段常量作为流的第一片也是唯一一片交出去——界面上两种情况的呈现
         一样，只是这一种不会有引用。
 
@@ -252,8 +288,10 @@ class Answerer:
             question, game_id=game_id, version=version, current_version=current_version
         )
         if not sources:
-            return AnswerStream((), iter((NOT_FOUND,)))
-        return AnswerStream(_citations(sources), self._streamed(question, sources))
+            return AnswerStream((), (), iter((NOT_FOUND,)))
+        return AnswerStream(
+            _citations(sources), _image_urls(sources), self._streamed(question, sources)
+        )
 
     def _sources(
         self,
@@ -265,7 +303,7 @@ class Answerer:
     ) -> tuple[_Source, ...]:
         """检索、聚合父块、编号。**一条内容都没有时返回空元组**，不编造内容。
 
-        `answer` 与 `stream` 共用这一段：两条路给出去的引用必须是同一批、同一个顺序，
+        `answer` 与 `stream` 共用这一段：两条路给出去的引用与图片必须是同一批、同一个顺序，
         各写一遍迟早会分岔——而引用对不上内容这件事，从答案本身看不出来。
         """
         where = version_filter(version, current_version=current_version)
@@ -283,7 +321,6 @@ class Answerer:
         # 聚合在截断之后：先由断崖定下哪些文档进得来，再按文档把兄弟切片一次查齐
         blocks = aggregate_parents(found, game_id=game_id, chunks=self.chunks, where=where)
         if not blocks:
-            # 命中了却一条都回查不出来：索引与数据对不上。没有内容可依据时不调模型
             logger.warning(
                 "提问 %r 命中 %d 条切片却聚合不出父块，按检索不到处理", question, len(found)
             )

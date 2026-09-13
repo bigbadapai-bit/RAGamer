@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from ragamer.answering import Answerer
+from ragamer.caching.memory import InMemoryAnswerCache
 from ragamer.config import get_settings
 from ragamer.container import Container
 from ragamer.conversations import Chat
@@ -32,6 +33,8 @@ COMPLETE_ENV: dict[str, str] = {
     "RAGAMER_MINIO_SECRET_KEY": "test-secret-key",
     "RAGAMER_MINIO_BUCKET": "ragamer-test",
     "RAGAMER_MINIO_SECURE": "true",
+    "RAGAMER_REDIS_URL": "redis://redis.test:6379/0",
+    "RAGAMER_REDIS_PREFIX": "ragamer-test",
     "RAGAMER_LLM_BASE_URL": "https://llm.test/v1",
     "RAGAMER_LLM_API_KEY": "test-llm-api-key",
     "RAGAMER_LLM_MODEL": "test-model",
@@ -72,9 +75,16 @@ def settings_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[di
 
 
 def make_container(
-    chunks=None, docs=None, objects=None, embedder=None, reranker=None, llm=None, parser=None
+    chunks=None,
+    docs=None,
+    objects=None,
+    embedder=None,
+    reranker=None,
+    llm=None,
+    parser=None,
+    cache=None,
 ) -> Container:
-    """造一个容器：依赖默认都是假件，测试只覆盖自己关心的那几个。
+    """造一个容器：八个依赖默认都是假件，测试只覆盖自己关心的那几个。
 
     内存假件与真实实现实现的是同一组协议，所以"应用跑起来"的测试都可以从它起步。
     默认的语言模型一条脚本都没排：真被调用到就会当场炸，而不是静默返回空串。
@@ -89,6 +99,7 @@ def make_container(
         reranker=reranker if reranker is not None else FakeReranker(),
         llm=llm if llm is not None else FakeLlm(),
         parser=parser if parser is not None else ParserRouter((MarkdownParser(),)),
+        cache=cache if cache is not None else InMemoryAnswerCache(),
     )
 
 

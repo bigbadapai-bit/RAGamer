@@ -280,6 +280,51 @@ def test_问题没点名版本时用知识库标的现行版本():
     assert "初版的打法" not in llm.calls[0].messages[0].content
 
 
+# --- 图片 ---
+
+
+def test_答案带出内容里的图片地址():
+    """图片留在正文里（§1.3），随答案一起交回，用户不必跳出去找原图。
+    `content_meta` 里的也算：表格的长文本列整列降级在那里。"""
+    store = chunk_store(
+        GAME,
+        make_chunk(
+            1,
+            content="二郎神怎么打\n![打法](images/black_myth/boss.jpg)",
+            content_meta="| 图 | ![](images/black_myth/phase2.jpg) |",
+        ),
+    )
+    llm = FakeLlm(REPLY)
+
+    answer = answerer(store, llm).answer(QUESTION, game_id=GAME, version="1.0")
+
+    assert answer.images == (
+        "images/black_myth/boss.jpg",
+        "images/black_myth/phase2.jpg",
+    )
+
+
+def test_同一张图出现两次只交回一次():
+    store = chunk_store(
+        GAME,
+        make_chunk(1, content="二郎神怎么打\n![](images/black_myth/boss.jpg)", chunk_index=1),
+        make_chunk(2, content="![](images/black_myth/boss.jpg)", chunk_index=2),
+    )
+    llm = FakeLlm(REPLY)
+
+    answer = answerer(store, llm).answer(QUESTION, game_id=GAME, version="1.0")
+
+    assert answer.images == ("images/black_myth/boss.jpg",)
+
+
+def test_检索不到时没有图片与引用():
+    llm = FakeLlm()
+
+    answer = answerer(InMemoryChunkStore(), llm).answer(QUESTION, game_id=GAME, version="1.0")
+
+    assert answer.images == ()
+
+
 # --- 边界与失败 ---
 
 
@@ -333,15 +378,20 @@ def test_流式先给引用再逐字给正文():
     assert "".join(deltas) == REPLY
 
 
-def test_流式与一次给全用的是同一批引用():
-    """两条路各拼一遍引用迟早会分岔——而引用对不上内容这件事，从答案本身看不出来。"""
-    store = chunk_store(GAME, *BOSS_CHUNKS)
+def test_流式与一次给全用的是同一批引用与图片():
+    """两条路各拼一遍引用迟早会分岔——而引用对不上内容这件事，从答案本身看不出来。
+    图片同理：命中缓存与否会给出两种结果，说的就是这一条。"""
+    store = chunk_store(
+        GAME,
+        make_chunk(1, content="二郎神怎么打\n![](images/black_myth/boss.jpg)"),
+    )
 
     whole = answerer(store, FakeLlm(REPLY)).answer(QUESTION, game_id=GAME, version="1.0")
     piecewise = answerer(store, FakeLlm(REPLY)).stream(QUESTION, game_id=GAME, version="1.0")
     list(piecewise.deltas)
 
     assert piecewise.citations == whole.citations
+    assert piecewise.images == whole.images == ("images/black_myth/boss.jpg",)
 
 
 def test_流式时没检索到内容回同一段明确回复():

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import pytest
 
+from ragamer.caching import AnswerCache
 from ragamer.config import load_settings
 from ragamer.container import build_container
 from ragamer.llm import LlmClient
@@ -47,6 +48,7 @@ def test_组合根按配置构造全部外部依赖(settings_env):
     assert isinstance(container.embedder, Embedder)
     assert isinstance(container.reranker, Reranker)
     assert isinstance(container.llm, LlmClient)
+    assert isinstance(container.cache, AnswerCache)
     # 出错信息里出现的地址已经抹掉凭据
     assert container.chunks.address == "http://milvus.test:19530"
     assert container.objects.address == "minio.test:9000"

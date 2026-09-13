@@ -101,19 +101,28 @@ def normalize_query(text: str) -> str:
     return " ".join(text.split())
 
 
+def effective_version(version: str, *, current_version: str) -> str:
+    """这次实际按哪个版本检索：问题里点名的那个，其次是知识库的现行版本。
+
+    `knowledge_bases` 是「当前该用哪个版本」的唯一真相来源，检索不自己维护一份。
+    两个参数的空串都表示「没判出来」，返回空串。
+
+    缓存键要用它（`ragamer.caching`）：键里的版本必须是**实际生效**的那一个。放问题
+    点名的那个，问题没点名时同一个问题在知识库换了现行版本之后仍会命中旧版本的答案；
+    放知识库标的那个，用户点名问历史版本时会与问现行版本撞成同一条。
+    """
+    return version or current_version
+
+
 def version_filter(version: str, *, current_version: str) -> ChunkFilter:
     """检索用的版本过滤条件：「**所选版本或未标注版本**」（ADR-0004）。
-
-    版本按序取第一个判得出来的：问题里点名的那个，其次是知识库的现行版本
-    ——`knowledge_bases` 是「当前该用哪个版本」的唯一真相来源，检索不自己维护一份。
-    两个参数的空串都表示「没判出来」。
 
     **这里对 ADR-0004 的「版本过滤必须默认开启」有一处有意收窄**：两处都判不出来时
     不做过滤。过滤成「只留未标注版本」会把标了版本的资料整批漏掉，而漏是静默的；
     不过滤的代价只是近重复之间互相稀释分数，看得见。这条在日志里留痕，
     不静默——知识库没标现行版本是该被修掉的配置问题。
     """
-    chosen = version or current_version
+    chosen = effective_version(version, current_version=current_version)
     if not chosen:
         logger.warning("问题与知识库都给不出版本，本次检索不按版本过滤")
     return ChunkFilter(version=chosen or None)

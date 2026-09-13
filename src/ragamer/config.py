@@ -81,6 +81,21 @@ class MinioSettings(BaseModel):
     secure: bool = False
 
 
+class RedisSettings(BaseModel):
+    """Redis。答案缓存与提问计数共用它（docs/ARCHITECTURE.md §4）。
+
+    **它是唯一一个不通也不影响作答的外部依赖**：缓存读不了、写不进去都只是这次没缓存，
+    提问照常走完整链路。所以它不在启动自检里——自检失败会拦住进程起来，
+    而少了缓存并不该拦住任何事。
+    """
+
+    #: 连接串，形如 redis://[:密码@]主机:6379/0。可能内嵌密码，按密钥对待
+    url: NonEmptySecret
+    #: 键前缀。与原项目共用一套 Redis 时靠它错开——按前缀批量失效**是真的在删键**，
+    #: 撞上了就是删掉别人的数据
+    prefix: NonEmptyStr = "ragamer"
+
+
 class LlmSettings(BaseModel):
     """语言模型。打标兜底、查询路由、多查询改写、生成都走它。"""
 
@@ -182,6 +197,7 @@ class Settings(BaseSettings):
     milvus: MilvusSettings
     mongo: MongoSettings
     minio: MinioSettings
+    redis: RedisSettings
     llm: LlmSettings
     mineru: MineruSettings
     # 三个模型配置组都有完整默认值：不配也能跑，配了才落进 .env

@@ -27,6 +27,9 @@ dependencies = [
     "uvicorn>=0.30",
     # minio 的传输层就是 urllib3；要自定义 PoolManager 才能设连接超时并关掉重试
     "urllib3>=2.0",
+    # 答案缓存的客户端。业务层只认 ragamer.caching 里的协议，不直接依赖这个库；
+    # 下限取 5.2：热门问题那条 ZSET 查询用的是带排序参数的 zrange
+    "redis>=5.2",
 ]
 
 [project.scripts]

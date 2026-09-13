@@ -82,6 +82,8 @@ def create_app(container: Container) -> FastAPI:
         llm=container.llm,
         parser=container.parser,
         objects=container.objects,
+        # 导入完成时按游戏前缀清缓存（架构文档 §4）：语料变了，基于旧语料的答案不该再命中
+        cache=container.cache,
     )
     chat = Chat(
         docs=container.docs,
@@ -259,21 +261,6 @@ def _event(name: str, payload: Mapping[str, Any]) -> str:
     `curl` 看到的还是中文。
     """
     return f"event: {name}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
-
-
-def _log_progress(event: ProgressEvent) -> None:
-    """导入是同步的一整段，日志是它在跑的时候唯一看得见的进度窗口。
-
-    响应里的 `progress` 是跑完之后才拿得到的账单；一批几十份资料时，
-    那之前能看到的只有这几行。
-    """
-    logger.info(
-        "导入 %s：[%d/%d] %s",
-        event.filename,
-        event.file_number,
-        event.file_total,
-        STAGE_LABELS[event.stage],
-    )
 
 
 def _check_game_id(game_id: str) -> None:

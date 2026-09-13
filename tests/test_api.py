@@ -12,7 +12,9 @@ import logging
 import pytest
 from fastapi.testclient import TestClient
 
+from ragamer.answering import Citation
 from ragamer.api import create_app
+from ragamer.caching import CachedAnswer, cache_key
 from ragamer.knowledge import KB_COLLECTION
 from ragamer.sources import MarkdownParser, ParserRouter
 from ragamer.stores.base import UNVERSIONED, image_prefix
@@ -294,6 +296,22 @@ def test_一批里截图失败不牵连_markdown():
     assert failed["filename"] == "攻略.png"
     assert failed["stage"] == "normalize"  # 卡在归一化那一步
     assert saved(container)  # 另一份照常入库
+
+
+# --- 导入后清缓存 ---
+
+
+def test_导入完成后清掉这个游戏的缓存(client, container):
+    """缓存接在导入编排器上：语料变了，基于旧语料的答案不该再命中（架构文档 §4）。"""
+    stale = CachedAnswer("先定身再贴身输出[1]。", (Citation(1, "二郎神", ""),))
+    container.cache.set(cache_key(GAME, "1.0", "二郎神怎么打"), stale)
+    container.cache.set(cache_key("wuthering_waves", "1.0", "今汐怎么养"), stale)
+
+    import_articles(client, upload("二郎神.md"))
+
+    assert container.cache.get(cache_key(GAME, "1.0", "二郎神怎么打")) is None
+    # 另一款游戏的缓存不牵连：前缀带的那一段把两款游戏隔开了
+    assert container.cache.get(cache_key("wuthering_waves", "1.0", "今汐怎么养")) is not None
 
 
 # --- 库与游戏 ---
