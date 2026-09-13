@@ -375,6 +375,14 @@ cache:{game}:{version}:{sha1(rewritten_query)}
 
 **一份务实的妥协**：htmx 的 SSE 扩展做流式逐字输出略别扭 —— **对话页那一小块允许退回原生 `EventSource`（约 30 行 JS）**，其余全用 htmx。不要为了纯粹性硬上。
 
+**导入页的进度是轮询，不是流**（[ragamer/jobs.py](../src/ragamer/jobs.py)）：一批导入丢进后台
+线程，页面拿一个任务号，结果区带 `hx-get` + `every 1s` 换自己，跑完那一份不带这个属性、
+轮询自然停。选轮询不选 SSE，是因为这里的粒度是「每条走到第几步」而不是逐字，轮询一秒钟
+一次的开销在本地工具里可以忽略，而 SSE 要么上 htmx 扩展、要么破例写原生 JS。
+**没有脚本时**换成 `head` 里一条 `<noscript><meta http-equiv="refresh" content="2">`：整页
+自己刷，效果一样，页面照常可用。**绝不要两套一起上**——加了 noscript 判断才不至于每两秒把
+整页重载一遍、把局部刷新打断。
+
 **澄清交互的数据流**（正是 htmx 的强项）：
 
 ```
@@ -400,6 +408,7 @@ cache:{game}:{version}:{sha1(rewritten_query)}
 | 6 | MinerU 上传要 `session.trust_env=False` | 大文件走代理会超时 |
 | 7 | MinerU 轮询：**超时 600s / 间隔 3s / 5xx 重试 / `failed` 抛错** | 原项目标定过的值 |
 | 8 | Milvus 服务端 `user.yaml` 开鉴权 | 不要裸奔 |
+| 9 | **阻塞的活在 `async def` 路由里跑会卡住整个应用** | uvicorn 单 worker 只有一个事件循环：一次分钟级的导入会让所有页面与端点排队等它（本仓实测过：2 秒的导入让并发的页面请求也等了 2.1 秒）。导入要么丢线程池（JSON 端点那条），要么整个挪到后台任务（导入页那条，见 §5 与 `ragamer/jobs.py`） |
 
 ### 算法与语义
 

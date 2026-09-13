@@ -79,6 +79,7 @@ def test_守则扫到了源码():
         "crawl.py",
         "wikitext.py",
         "importing.py",
+        "jobs.py",
         "enriching.py",
         "ocr.py",
         "lazy.py",

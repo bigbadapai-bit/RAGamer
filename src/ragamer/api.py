@@ -9,6 +9,9 @@
 失败阶段。两条走的是同一个导入器、同一条链路，响应形状也逐字相同。读取侧（提问）与
 几个页面在后面的票里接。
 
+**JSON 这条是同步的**：调用方拿到的是最终结果，中途看不见进度。页面那条不同——它提交完
+就返回，进度靠轮询一个任务快照（见 `ragamer.jobs`）。两条都在线程池里跑，谁都不占事件循环。
+
 知识库元数据从 MongoDB 读（`knowledge_bases` 集合，id 就是游戏 id）：打标要用的词表
 ——启用了哪些主体类型、这个游戏的术语映射——就在它里面（docs/ARCHITECTURE.md §2.3），
 形状与判断在 `ragamer.knowledge`，界面那条写入路径用的是同一份。
@@ -24,6 +27,7 @@ from dataclasses import asdict
 from typing import Annotated, Any
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
 from ragamer.container import Container, build_importer
@@ -59,14 +63,21 @@ def create_app(container: Container) -> FastAPI:
             str, Form(description="这次导入标注的版本，留空即未标注版本")
         ] = UNVERSIONED,
     ) -> dict[str, Any]:
-        """批量导入。某个文件失败时其余照常入库，失败信息带文件名与失败阶段。"""
+        """批量导入。某个文件失败时其余照常入库，失败信息带文件名与失败阶段。
+
+        **这一段同步给出最终结果**（调用方要的就是这个），但它跑在**线程池**里：
+        导入是分钟级的一段（MinerU、二次 OCR、出网抓取），压在事件循环里跑会把整个
+        应用卡住——别的端点、别的页面全都得排队等它。
+        """
         _check_game_id(game_id)
         vocabulary = _vocabulary(container, game_id)
         sources = [
             SourceDocument(filename=file.filename or "", data=await file.read()) for file in files
         ]
 
-        results = importer.batch(sources, game_id=game_id, version=version, vocabulary=vocabulary)
+        results = await run_in_threadpool(
+            importer.batch, sources, game_id=game_id, version=version, vocabulary=vocabulary
+        )
         return _response(game_id, version, results)
 
     @app.post("/api/kb/{game_id}/import/urls")
@@ -74,13 +85,17 @@ def create_app(container: Container) -> FastAPI:
         """抓一批网页再入库。某个地址失败时其余照常入库，失败信息带地址与失败阶段。
 
         抓回来的资料与上传的文件走同一条链路，响应形状也相同——界面上两条输入各是各的
-        提交按钮，读结果的地方却可以共用一处。
+        提交按钮，读结果的地方却可以共用一处。同上，这一段也在线程池里跑。
         """
         _check_game_id(game_id)
         vocabulary = _vocabulary(container, game_id)
 
-        results = importer.batch_urls(
-            request.urls, game_id=game_id, version=request.version, vocabulary=vocabulary
+        results = await run_in_threadpool(
+            importer.batch_urls,
+            request.urls,
+            game_id=game_id,
+            version=request.version,
+            vocabulary=vocabulary,
         )
         return _response(game_id, request.version, results)
 

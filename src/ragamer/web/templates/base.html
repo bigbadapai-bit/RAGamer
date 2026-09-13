@@ -11,6 +11,8 @@
   #}
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://unpkg.com/htmx.org@2.0.4/dist/htmx.min.js"></script>
+  {# 页面自己往 head 里加东西的地方（导入页跑着的时候要放一条 noscript 刷新） #}
+  {% block head %}{% endblock %}
 </head>
 <body class="min-h-screen bg-slate-50 text-slate-900">
   <header class="border-b border-slate-200 bg-white">

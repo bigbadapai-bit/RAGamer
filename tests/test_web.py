@@ -11,6 +11,9 @@
 from __future__ import annotations
 
 import re
+import threading
+import time
+from dataclasses import replace
 from urllib.parse import parse_qs, urlparse
 
 import pytest
@@ -25,6 +28,7 @@ from ragamer.knowledge import (
 )
 from ragamer.stores.base import UNVERSIONED, image_key, image_prefix
 from ragamer.tagging import SubjectType
+from ragamer.vectors.fake import FakeEmbedder
 
 from .conftest import BrokenChunkStore, FakeCrawler, make_container
 
@@ -92,10 +96,9 @@ MISSING_URL = "https://wiki.test/wiki/没有这页"
 PAGE = "# 金角大王\n\n银角大王的哥哥，拿着紫金红葫芦与羊脂玉净瓶。\n"
 
 
-@pytest.fixture
-def container():
-    # 抓取器排了这一页：网址那条入口在界面上与文件是同一次提交的两半
-    container = make_container(crawler=FakeCrawler(**{PAGE_URL: PAGE}))
+def make_kb_container(**kwargs):
+    """带上这个知识库的容器。要卡住哪一步、要缺哪个依赖，由调用方指定。"""
+    container = make_container(**kwargs)
     create_knowledge_base(
         container.docs,
         KnowledgeBase.new(GAME, "黑神话·悟空", (SubjectType.CHARACTER, SubjectType.ITEM)),
@@ -104,13 +107,95 @@ def container():
     return container
 
 
+class Gate:
+    """卡在向量化那一步，等测试放行。
+
+    按时间睡是不行的：「跑着的时候页面长什么样」要能稳定观察到，不能赌机器快慢。
+    """
+
+    def __init__(self) -> None:
+        self.entered = threading.Event()
+        self.opened = threading.Event()
+
+    def embed(self, texts):
+        self.entered.set()
+        assert self.opened.wait(timeout=JOB_TIMEOUT), "测试没放行，这一步卡住了"
+        return FakeEmbedder().embed(texts)
+
+
+@pytest.fixture
+def container():
+    # 抓取器排了这一页：网址那条入口在界面上与文件是同一次提交的两半
+    return make_kb_container(crawler=FakeCrawler(**{PAGE_URL: PAGE}))
+
+
 @pytest.fixture
 def client(container) -> TestClient:
     return TestClient(create_app(container))
 
 
+@pytest.fixture
+def gate() -> Gate:
+    return Gate()
+
+
+@pytest.fixture
+def gated(gate) -> TestClient:
+    """导入会卡在向量化那一步的界面。放行用 `gate.opened.set()`。"""
+    return TestClient(create_app(make_kb_container(embedder=gate)))
+
+
 def upload(name: str, text: str = ARTICLE) -> tuple[str, tuple[str, bytes, str]]:
     return ("files", (name, text.encode("utf-8"), "text/markdown"))
+
+
+#: 等一批导入跑完最多这么久。够宽松，卡住时是「测试失败」而不是「测试永远不返回」。
+JOB_TIMEOUT = 20.0
+
+#: 结果区在跑的时候带这个属性，跑完就不带了。等的那两个循环都认它。
+RUNNING_MARK = 'hx-trigger="every 1s"'
+
+
+def job_id_of(response) -> str:
+    """这次提交开出来的任务号。htmx 那条在响应头里，重定向那条在 Location 里。"""
+    where = response.headers.get("HX-Push-Url") or response.headers["location"]
+    return parse_qs(urlparse(where).query)["job"][0]
+
+
+def wait_for_done(client, job_id: str, *, page: bool):
+    """等这一批跑完，把最后那一次响应交回来。
+
+    没脚本那条路就是这么刷的（head 里的 noscript meta refresh 每两秒刷一次整页）；
+    htmx 那条刷的是结果片段。两条路都只是「再问一次」，所以这里也照做。
+    """
+    url = f"/import?job={job_id}" if page else f"/import/result?job={job_id}"
+    deadline = time.monotonic() + JOB_TIMEOUT
+    while time.monotonic() < deadline:
+        response = client.get(url, headers=None if page else {"HX-Request": "true"})
+        if RUNNING_MARK not in response.text:
+            return response
+        time.sleep(0.02)
+    raise AssertionError(f"任务 {job_id} 等到超时也没跑完")
+
+
+def submit(
+    client, *files, urls: str = "", game_id: str = GAME, version: str = "", htmx: bool = True
+):
+    """提交一批，**不等**——异步这条路上「提交」与「跑完」本来就是两件事。
+
+    `follow_redirects=False`：没脚本那条路回的是 303（浏览器接着去 GET 任务页），
+    跟着跳会让测试看不到那个重定向本身。
+    """
+    data = {"game_id": game_id, "version": version}
+    if urls:
+        data["urls"] = urls
+    return client.post(
+        IMPORT_URL,
+        files=list(files) or ([] if urls else [upload("二郎神.md")]),
+        data=data,
+        headers={"HX-Request": "true"} if htmx else None,
+        follow_redirects=False,
+    )
 
 
 def do_import(
@@ -121,17 +206,13 @@ def do_import(
     version: str = "",
     htmx: bool = False,
 ):
-    data = {"game_id": game_id, "version": version}
-    if urls:
-        data["urls"] = urls
-    response = client.post(
-        IMPORT_URL,
-        files=list(files) or ([] if urls else [upload("二郎神.md")]),
-        data=data,
-        headers={"HX-Request": "true"} if htmx else None,
-    )
+    """提交一批并等到跑完，返回最后那一次响应（htmx 回片段，原生回整页）。"""
+    response = submit(client, *files, urls=urls, game_id=game_id, version=version, htmx=htmx)
+    if not htmx:
+        assert response.status_code == 303, response.text
+        return wait_for_done(client, job_id_of(response), page=True)
     assert response.status_code == 200, response.text
-    return response
+    return wait_for_done(client, job_id_of(response), page=False)
 
 
 def row(page: str, source: str) -> str:
@@ -246,6 +327,71 @@ def test_没选资料时给一句话而不是报错(client):
     assert "先选一份资料或填一个网址再提交" in response.text
 
 
+# --- 验收：提交即可返回，进度自己往下走 ---
+
+
+def test_提交之后立刻返回_不用等这一批跑完(gated, gate):
+    """导入是分钟级的一段：压在请求里跑的话页面什么都看不见，而且会把整个应用卡住。"""
+    response = submit(gated, upload("甲.md"), upload("白龙马.md", DRAGON))
+
+    assert response.status_code == 200
+    assert RUNNING_MARK in response.text  # 结果区还会自己来问
+    assert "看切分结果" not in response.text  # 还没跑完，不给最终账单
+    assert gate.entered.wait(timeout=JOB_TIMEOUT), "这一批没跑到向量化"
+
+    live = gated.get(f"/import/result?job={job_id_of(response)}", headers={"HX-Request": "true"})
+    assert "正在向量化" in live.text
+    assert "归一化 › 补图 › 切分 › 打标 › 向量化" in live.text
+    assert "排队中" in live.text  # 第二条还没轮到
+
+    gate.opened.set()
+    done = wait_for_done(gated, job_id_of(response), page=False)
+    assert "看切分结果" in done.text
+    assert RUNNING_MARK not in done.text  # 跑完就不再问了
+
+
+def test_不带脚本时提交完跳到任务页_整页自己刷(gated, gate):
+    """没脚本那条路：提交 → 303 → 任务页，页面上放一条 noscript 的 meta refresh。"""
+    response = submit(gated, htmx=False)
+
+    assert response.status_code == 303
+    where = response.headers["location"]
+    assert where.startswith("/import?")
+
+    page = gated.get(where)
+    assert RUNNING_MARK in page.text
+    assert '<noscript><meta http-equiv="refresh"' in page.text
+    assert gate.entered.wait(timeout=JOB_TIMEOUT)
+
+    gate.opened.set()
+    done = wait_for_done(gated, job_id_of(response), page=True)
+    assert '<noscript><meta http-equiv="refresh"' not in done.text  # 跑完就不刷了
+
+
+def test_任务号认不出来时说一句人话(client):
+    """服务重启过、任务被丢掉：不能给一个空结果区让人猜。"""
+    page = client.get("/import?job=没有这个号")
+
+    assert page.status_code == 200
+    assert "这个导入任务不在了" in page.text
+
+
+def test_整批没跑起来时页面给原因而不是一直转圈():
+    """接线漏了（给了网址却没接抓取器）也是「这一批结束了」，只是没有逐条结果。
+
+    容器是 frozen 的，用 `replace` 把它拆掉一样——组合根里本来总会接上抓取器，
+    这里造的是「接错了」那一面。
+    """
+    client = TestClient(create_app(replace(make_kb_container(), crawler=None)))
+
+    response = submit(client, urls=PAGE_URL)
+    done = wait_for_done(client, job_id_of(response), page=False)
+
+    assert "这一批没能跑起来" in done.text
+    assert "抓取器" in done.text
+    assert RUNNING_MARK not in done.text
+
+
 # --- 验收：一次提交多条来源，每条各有各的状态 ---
 
 
@@ -329,12 +475,10 @@ def test_只重试失败的那些(client, container):
     assert 'name="files"' not in retry  # 失败的都是网址，不必让人再传文件
 
     # 重试表单提交的就是那一批失败项：这一次只剩它一条
-    again = client.post(
-        IMPORT_URL,
-        data={"game_id": GAME, "version": "", "urls": MISSING_URL},
-        headers={"HX-Request": "true"},
+    again = submit(client, urls=MISSING_URL)
+    assert (
+        "共 1 条，成功 0 条，失败 1 条" in wait_for_done(client, job_id_of(again), page=False).text
     )
-    assert "共 1 条，成功 0 条，失败 1 条" in again.text
 
 
 def test_失败的是文件时重试表单说清要重新选中(client, container):
@@ -356,13 +500,8 @@ def test_失败的是文件时重试表单说清要重新选中(client, containe
     # 文件名不该被当成网址带进重试（那会去抓一个不存在的站）
     assert 'name="urls"' not in retry
     # 重试走的是同一个端点：这张表单照原样交回去，选中的文件进的就是同一条链路
-    again = client.post(
-        IMPORT_URL,
-        files=[upload("甲.md")],
-        data={"game_id": GAME, "version": ""},
-        headers={"HX-Request": "true"},
-    )
-    assert "共 1 条，成功 1 条" in again.text
+    again = submit(client, upload("甲.md"))
+    assert "共 1 条，成功 1 条" in wait_for_done(client, job_id_of(again), page=False).text
 
 
 def test_导入完成后报出切片数与覆盖到的标签(client, container):
