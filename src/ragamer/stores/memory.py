@@ -150,27 +150,53 @@ class InMemoryDocStore:
         order_by: str | None = None,
         descending: bool = False,
         limit: int | None = None,
+        after: tuple[Any, str] | None = None,
     ) -> list[dict[str, Any]]:
-        """等值匹配 + 排序 + 截断，与真实那边同一套语义。
+        """等值匹配 + 排序 + 翻页 + 截断，与真实那边同一套语义。
 
-        匹配走 `base.matches_where`，与真实适配器同一份规则（见模块说明）。排序前先按
-        id 定序，所以**同分的排法在这里是确定的**——真实那边不保证，测试依赖的是这里
-        这份确定性。缺 `order_by` 那个字段的按空串算，与真实那边的排法不一致，
-        `find` 的契约里写了这一条。
+        匹配走 `base.matches_where`，与真实适配器同一份规则（见模块说明）。
+        **排序键与翻页游标都落在 `(order_by 字段, _id)` 上**，与真实那边的复合排序一致——
+        少了次键，同分的排法两边不一样，而游标正好落在并列值上，那种不一致会漏条。
+        缺 `order_by` 那个字段的按空串算，与真实那边的排法不一致，`find` 的契约里写了这一条。
         """
+        if after is not None and order_by is None:
+            raise ValueError("翻页游标要跟 order_by 一起给：没有排序键就无从比较「之后」")
         found = [
             {"_id": doc_id, **document}
             for doc_id, document in sorted(self._collections.get(collection, {}).items())
             if matches_where(document, where)
         ]
         if order_by is not None:
-            found.sort(key=lambda document: document.get(order_by, ""), reverse=descending)
+            found.sort(key=lambda document: _key_of(document, order_by), reverse=descending)
+        if after is not None:
+            found = [
+                document
+                for document in found
+                if _beyond(_key_of(document, order_by), after, descending)
+            ]
         if fields:
             found = [
                 {"_id": document["_id"], **{f: document[f] for f in fields if f in document}}
                 for document in found
             ]
         return found[:limit] if limit is not None else found
+
+    def ensure_indexes(self, collection: str, fields: Sequence[tuple[str, int]]) -> None:
+        """内存里没有索引这回事：`find` 的次序本身就定得下来（见它的说明）。"""
+
+
+def _key_of(document: Mapping[str, Any], order_by: str) -> tuple[Any, str]:
+    """排序与翻页共用的那对键：`(排序字段, 文档 id)`。
+
+    两者必须**同一个取法**：排序按一对键、翻页按另一对，同分的那些就会漏条或重条。
+    缺 `order_by` 那个字段的按空串算（真实那边当 null，`find` 的契约里写了这条出入）。
+    """
+    return (document.get(order_by, ""), str(document["_id"]))
+
+
+def _beyond(here: tuple[Any, str], cursor: tuple[Any, str], descending: bool) -> bool:
+    """这一条是不是严格排在游标那一条之后。倒序往下翻时，「之后」是更小的那一边。"""
+    return here < cursor if descending else here > cursor
 
 
 class InMemoryObjectStore:

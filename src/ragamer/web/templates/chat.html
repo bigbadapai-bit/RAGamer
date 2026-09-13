@@ -67,21 +67,15 @@
     <section>
       <h2 class="mb-2 text-xs font-semibold tracking-wide text-slate-500 uppercase">近期会话</h2>
       {% if sessions %}
-      <ul class="space-y-1">
-        {% for item in sessions %}
-        <li>
-          <a href="/chat/{{ game_id }}/{{ item.session_id }}"
-             class="block rounded px-2 py-1 {% if item.current %}bg-slate-200 font-medium{% else %}hover:bg-slate-200{% endif %}">
-            {{ item.title or "（还没问过）" }}
-          </a>
-        </li>
-        {% endfor %}
+      {#
+        固定高度 + 自己滚：列表滚到底会接着取下一页（见 partials/session_list.html 的哨兵）。
+        整页一起滚的话，哨兵一上来就在视口里，会一口气把全部取完。
+      #}
+      <ul class="max-h-72 space-y-1 overflow-y-auto pr-1">
+        {% include "partials/session_list.html" %}
       </ul>
       {% else %}
       <p class="text-slate-500">这个库还没聊过。</p>
-      {% endif %}
-      {% if sessions | length >= list_limit %}
-      <p class="mt-2 text-xs text-slate-500">只列最近 {{ list_limit }} 条。</p>
       {% endif %}
 
       <form method="post" action="/chat/{{ game_id }}" class="mt-3">

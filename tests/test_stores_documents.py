@@ -28,8 +28,9 @@ class FakeCursor:
         self._documents = documents
         self._calls = calls
 
-    def sort(self, field: str, direction: int) -> FakeCursor:
-        self._calls.append(("sort", {"field": field, "direction": direction}))
+    def sort(self, key: Any) -> FakeCursor:
+        # 原样记下来：真客户端两种都收（单键或一组键值对），这里不替它归一
+        self._calls.append(("sort", key))
         return self
 
     def limit(self, count: int) -> FakeCursor:
@@ -46,6 +47,10 @@ class FakeCollection:
     def __init__(self) -> None:
         self.calls: list[tuple[str, Any]] = []
         self.document: dict[str, Any] | None = None
+        self.created_indexes: list[Any] = []
+
+    def create_index(self, keys: Any) -> None:
+        self.created_indexes.append(keys)
 
     def find_one(self, filter: dict[str, Any]) -> dict[str, Any] | None:
         self.calls.append(("find_one", filter))
@@ -207,7 +212,8 @@ def test_按字段取一批文档(store, mongo):
                 "projection": {"title": 1, "updated_at": 1},
             },
         ),
-        ("sort", {"field": "updated_at", "direction": -1}),
+        # 次键恒为 `_id`：翻页的游标落在 (排序键, id) 上，排序少了它就与游标对不上
+        ("sort", [("updated_at", -1), ("_id", -1)]),
         ("limit", 20),
     ]
 
@@ -245,3 +251,56 @@ def test_不可达时的报错里没有账号密码():
 
     assert "MONGO-PW" not in str(excinfo.value)
     assert "127.0.0.1:1" in str(excinfo.value)
+
+
+def test_翻页游标落成严格排在之后那个条件(store, mongo):
+    """游标必须落在 `(排序键, _id)` 上：单键在并列值上会漏条或重条。
+
+    `$and` 那个形状是「过滤条件还在，再加上游标那一条」；少了它，翻页会把别的库的
+    会话也捞进来。
+    """
+    store.find(
+        "conversations",
+        {"game_id": "black_myth"},
+        order_by="updated_at",
+        descending=True,
+        limit=20,
+        after=("2026-09-13T02:00:00+00:00", "s3"),
+    )
+
+    collection = _client(mongo)["ragamer-test"]["conversations"]
+    assert collection.calls[0] == (
+        "find",
+        {
+            "filter": {
+                "$and": [
+                    {"game_id": "black_myth"},
+                    {
+                        "$or": [
+                            {"updated_at": {"$lt": "2026-09-13T02:00:00+00:00"}},
+                            {
+                                "updated_at": "2026-09-13T02:00:00+00:00",
+                                "_id": {"$lt": "s3"},
+                            },
+                        ]
+                    },
+                ]
+            },
+            "projection": None,
+        },
+    )
+    # 排序也要带上次键，否则与游标算的不是同一个次序
+    assert collection.calls[1] == ("sort", [("updated_at", -1), ("_id", -1)])
+
+
+def test_翻页游标要跟排序键一起给(store):
+    with pytest.raises(ValueError):
+        store.find("conversations", after=("x", "s1"))
+
+
+def test_建索引按复合键的顺序落下去(store, mongo):
+    """键的顺序就是查询的顺序：先按库过滤，再按最后活跃倒序。"""
+    store.ensure_indexes("conversations", (("game_id", 1), ("updated_at", -1)))
+
+    collection = _client(mongo)["ragamer-test"]["conversations"]
+    assert collection.created_indexes == [[("game_id", 1), ("updated_at", -1)]]

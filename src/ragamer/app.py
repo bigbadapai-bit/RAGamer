@@ -20,7 +20,7 @@ from ragamer.__main__ import EXIT_CONFIG, EXIT_OK, EXIT_STORE
 from ragamer.api import create_app as create_api_app
 from ragamer.config import ConfigError, get_settings
 from ragamer.container import Container, build_container
-from ragamer.conversations import build_chat
+from ragamer.conversations import CONVERSATIONS, SESSION_INDEX, build_chat
 from ragamer.logging import get_logger, setup_logging
 from ragamer.stores.base import StoreError
 from ragamer.web import create_router
@@ -42,6 +42,22 @@ def create_app(container: Container) -> FastAPI:
     app = create_api_app(container, chat=stack.chat)
     app.include_router(create_router(container, stack))
     return app
+
+
+def _ensure_session_index(container: Container) -> None:
+    """把会话列表要用的复合索引落下来。**建不上不拦启动**。
+
+    没有它，每次列会话都是「全表扫 + 内存排序」——一页一次，而翻页把这份成本乘以页数。
+    但索引只影响快慢：建不上（没权限、库刚被别人删了）时列表照常能用，只是慢。
+    所以这里记一条 ERROR 继续走，不学存储自检那样把进程拦住。
+
+    放在这里而不是 `check()` 里：适配器不知道业务层查哪些集合，而自检那条路是刻意只读的
+    （它连库都不会平白建一个）。这里是唯一知道「哪个集合要哪个索引」的地方。
+    """
+    try:
+        container.docs.ensure_indexes(CONVERSATIONS, SESSION_INDEX)
+    except Exception as exc:  # 适配器只把「连不上」包成 StoreError，这里要的是「什么都不拦」
+        logger.error("会话列表的索引没建上，列表会退化成全表扫：%s", exc)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -68,6 +84,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         logger.error("%s", exc)
         return EXIT_STORE
 
+    _ensure_session_index(container)
     logger.info("界面在 http://%s:%d（Ctrl-C 停）", args.host, args.port)
     uvicorn.run(create_app(container), host=args.host, port=args.port)
     return EXIT_OK

@@ -11,10 +11,14 @@
 
 from __future__ import annotations
 
+import html
+import re
+
 from fastapi.testclient import TestClient
 
 from ragamer.app import create_app
 from ragamer.clarifying import CONFIDENT, UNSURE
+from ragamer.conversations import SESSION_PAGE_SIZE
 from ragamer.knowledge import KB_COLLECTION
 from ragamer.llm import FakeLlm
 
@@ -395,3 +399,64 @@ def _pending_id(page: str) -> str:
     marker = 'name="pending_id" value="'
     start_at = page.index(marker) + len(marker)
     return page[start_at : page.index('"', start_at)]
+
+
+# --- 会话列表翻页 ---
+
+
+def test_一页装不下时列表挂一个取下一页的哨兵():
+    """左栏滚到底接着取。哨兵带着上一页最后一条的位置，滚进视口就去取。"""
+    client = client_with(FakeLlm())
+    for _ in range(SESSION_PAGE_SIZE + 1):
+        start(client)
+
+    page = client.get(f"/chat/{GAME}").text
+
+    assert 'hx-trigger="revealed"' in page
+    assert "正在取更早的" in page
+
+
+def test_哨兵指向的那一段能单独取回来并且接得上():
+    """片段与整页走同一份数据、同一段模板——所以接上去的那一页跟第一页长得一样。"""
+    client = client_with(FakeLlm())
+    for _ in range(SESSION_PAGE_SIZE + 1):
+        start(client)
+    page = client.get(f"/chat/{GAME}").text
+    url = html.unescape(re.search(r'hx-get="([^"]+)"', page).group(1))
+
+    fragment = client.get(url, headers={"HX-Request": "true"})
+
+    assert fragment.status_code == 200
+    assert "<html" not in fragment.text  # 是片段，不是整页
+    assert f"/chat/{GAME}/" in fragment.text
+
+
+def test_一页装得下时没有哨兵():
+    """到底了就不该再挂一个「正在取更早的」——那是骗人往下滚。"""
+    client = client_with(FakeLlm())
+    start(client)
+
+    page = client.get(f"/chat/{GAME}").text
+
+    assert "正在取更早的" not in page
+
+
+def test_会话列表有自己的滚动区():
+    """**列表要有固定高度**：整页一起滚的话，哨兵一上来就在视口里，会一口气把全部取完。"""
+    client = client_with(FakeLlm())
+    start(client)
+
+    page = client.get(f"/chat/{GAME}").text
+
+    assert "overflow-y-auto" in page
+
+
+def test_取下一页的地址不带_hx_头时给整页():
+    """浏览器直接打开那个地址（没有 htmx 头）时，该拿到的是能看的整页。"""
+    client = client_with(FakeLlm())
+    start(client)
+
+    response = client.get(f"/chat/{GAME}?after=2026-09-13T00%3A00%3A00%2B00%3A00%7Cx")
+
+    assert response.status_code == 200
+    assert "<html" in response.text

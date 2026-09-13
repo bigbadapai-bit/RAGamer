@@ -17,6 +17,7 @@ from fastapi.testclient import TestClient
 
 from ragamer.api import create_app
 from ragamer.clarifying import CONFIDENT
+from ragamer.conversations import SESSION_PAGE_SIZE
 from ragamer.knowledge import KB_COLLECTION
 from ragamer.llm import FakeLlm
 
@@ -176,6 +177,37 @@ def test_没聊过的库回空列表():
     listed = client.get("/api/chat/sessions", params={"game_id": GAME}).json()
 
     assert listed["sessions"] == []
+    assert listed["next"] == ""
+
+
+def test_列表一页一页给_到底了_next_是空串():
+    """`next` 是「还有没有更多」唯一的信号：客户端不必懂它，原样带回来即可。"""
+    client = client_with(FakeLlm())
+    for _ in range(SESSION_PAGE_SIZE + 1):
+        start(client)
+
+    first = client.get("/api/chat/sessions", params={"game_id": GAME}).json()
+    second = client.get(
+        "/api/chat/sessions", params={"game_id": GAME, "after": first["next"]}
+    ).json()
+
+    assert len(first["sessions"]) == SESSION_PAGE_SIZE
+    assert first["next"]
+    assert len(second["sessions"]) == 1  # 第 101 条就在这一页上
+    assert second["next"] == ""
+    # 两页之间不重不漏
+    seen = [item["session_id"] for item in first["sessions"] + second["sessions"]]
+    assert len(seen) == len(set(seen)) == SESSION_PAGE_SIZE + 1
+
+
+def test_游标改坏了按第一页给():
+    """游标在 URL 上，人手改得动。改坏了不该让列表报错。"""
+    client = client_with(FakeLlm())
+    start(client)
+
+    listed = client.get("/api/chat/sessions", params={"game_id": GAME, "after": "乱写的"}).json()
+
+    assert len(listed["sessions"]) == 1
 
 
 def test_列出不存在的知识库时404():

@@ -204,7 +204,8 @@ uv run pytest -m integration     # 跑真模型的集成测试（首次会下载
 | 端点 | 做什么 |
 |---|---|
 | `POST /api/chat/sessions` | 开一次会话，绑一个知识库 |
-| `GET /api/chat/sessions?game_id=…` | 这个库的会话列表，按最后活跃倒序（左栏那一份） |
+| `GET /api/chat/sessions?game_id=…` | 这个库的会话列表，按最后活跃倒序，一页一页给（左栏那一份） |
+| `GET /api/chat/sessions?game_id=…&after=…` | 下一页。`after` 是上一页回的 `next`，原样带回来 |
 | `GET /api/chat/sessions/{id}` | 把历史读回来（刷新页面靠它） |
 | `GET /api/chat/sessions/{id}/ask?question=…` | 问一句，SSE 逐字回 |
 | `GET /api/chat/sessions/{id}/ask?…&pending_id=…&label=…` | 点完澄清候选，从暂停点继续 |
@@ -212,6 +213,12 @@ uv run pytest -m integration     # 跑真模型的集成测试（首次会下载
 列表只回 `session_id` / `title` / `updated_at` 三样，**正文不读**：会话文档里存着 `title`
 （首轮问句截断，只在第一轮写一次）与 `updated_at`（每次落库刷新），查询带着投影下发到
 Mongo——几十条会话逐条读回来的话，全文都进了内存而界面只显示一行字。
+
+**翻页走游标，不走 offset**：响应里的 `next` 是上一页最后一条的位置（不透明字符串），
+空串即到底了。游标落在 `(最后活跃, 会话 id)` 两个值上——`updated_at` 是可变的，
+单靠它在并列值上会漏条或重条，而会话列表恰恰常常并列。`conversations` 上因此有一个
+复合索引 `[(game_id, 1), (updated_at, -1)]`，启动时由 `ragamer.app` 落下（建不上只记一条
+ERROR：索引只影响快慢，不该拦住进程起来）。
 
 ## 界面
 
@@ -260,6 +267,8 @@ Mongo——几十条会话逐条读回来的话，全文都进了内存而界面
 - **热门问题**在选中一个库之后就显示：还没有会话时点一下会开一个会话再问。**切换版本**
   只让选语料里真有的版本（服务端也拦一道），下拉里若摆着「这个库里已经没有它了」，
   说明这个会话选的版本在语料重导之后不存在了。
+- **左栏那份会话列表可滚、滚到底接着取**：列表有固定高度与自己的滚动条，滚到底 htmx
+  去取下一页接上（不这么做的话哨兵一上来就在视口里，会一口气把全部取完）。
 - 页面上的 Tailwind 与 htmx 走 CDN。代价是首次加载要连得上外网；连不上时页面照常能用，
   只是没有样式、也不会局部刷新。
 

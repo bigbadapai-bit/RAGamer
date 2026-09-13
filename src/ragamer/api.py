@@ -32,7 +32,7 @@ SSE 事件、暂停点选错了翻成 422。**「这一轮算不算问完」「�
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterator, Mapping
 from dataclasses import asdict
 from typing import Annotated, Any
 
@@ -47,11 +47,12 @@ from ragamer.conversations import (
     Chat,
     Conversation,
     ConversationNotFound,
-    ConversationSummary,
     Reply,
+    SessionPage,
     Sources,
     Status,
     build_chat,
+    parse_session_cursor,
 )
 from ragamer.importing import STAGE_LABELS, Importer, ImportResult, ProgressEvent
 from ragamer.knowledge import (
@@ -135,16 +136,20 @@ def create_app(container: Container, chat: Chat | None = None) -> FastAPI:
         return _conversation_payload(conversation)
 
     @app.get("/api/chat/sessions")
-    def list_sessions(game_id: str) -> dict[str, Any]:
-        """一个知识库下的会话，按最后活跃倒序。**左栏那一份列表**。
+    def list_sessions(game_id: str, after: str = "") -> dict[str, Any]:
+        """一个知识库下的会话，按最后活跃倒序，**一页一页给**。**左栏那一份列表**。
 
         只回标题与时间——正文在 `GET /api/chat/sessions/{session_id}` 那一条上取。
         库里一条会话都没有时回空列表，不是 404；**「还没聊过」是正常状态**。
         知识库本身不存在则是 404，与建会话同一个口径：那是游戏选错了。
+
+        `after` 是上一页回的 `next`，**原样带回来即可**；不给就是从最新一页开始。
+        响应里的 `next` 空串表示到底了——这是「还有没有更多」唯一的信号。
         """
         _check_game_id(game_id)
         _knowledge_base(container, game_id)
-        return _sessions_payload(game_id, chat.list_for_game(game_id))
+        page = chat.list_for_game(game_id, after=parse_session_cursor(after))
+        return _sessions_payload(game_id, page)
 
     @app.get("/api/chat/sessions/{session_id}")
     def read_session(session_id: str) -> dict[str, Any]:
@@ -354,13 +359,20 @@ def _conversation(chat: Chat, session_id: str) -> Conversation:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-def _sessions_payload(game_id: str, summaries: Sequence[ConversationSummary]) -> dict[str, Any]:
+def _sessions_payload(game_id: str, page: SessionPage) -> dict[str, Any]:
     """会话列表对外的样子。
 
-    `ConversationSummary` 天生装不下正文，所以这里不必再挑一遍字段——列表就三样：
+    `ConversationSummary` 天生装不下正文，所以这里不必再挑一遍字段——每一项就三样：
     会话 id、标题、最后活跃时刻。正文在单条会话那一条端点上取。
+
+    `next` 是下一页的游标（空串即到底了）。**它是不透明的**：客户端不必懂它，原样带
+    回来即可——排序键与并列时按什么定序都在里面，自己拼是拼不对的。
     """
-    return {"game_id": game_id, "sessions": [asdict(summary) for summary in summaries]}
+    return {
+        "game_id": game_id,
+        "sessions": [asdict(summary) for summary in page.sessions],
+        "next": page.next,
+    }
 
 
 def _conversation_payload(conversation: Conversation) -> dict[str, Any]:

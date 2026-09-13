@@ -395,3 +395,67 @@ def test_自检在内存版上通过(memory_container):
     memory_container.check()
 
     assert [store.name for store in memory_container.stores()] == ["内存假件"] * 3
+
+
+#: 一批会话，**两条的最后活跃一模一样**——排序键并列正是游标最容易漏条的地方。
+#: 次序是「最后活跃倒序，并列时按 id 倒序」：与真实那边 `[("updated_at", -1), ("_id", -1)]`
+#: 同一个口径，两边的游标才接得上。
+TIED = (
+    ("s1", "2026-09-13T03:00:00+00:00"),
+    ("s2", "2026-09-13T02:00:00+00:00"),
+    ("s3", "2026-09-13T02:00:00+00:00"),
+    ("s4", "2026-09-13T01:00:00+00:00"),
+)
+
+
+def _tied_store(docs):
+    for doc_id, updated_at in TIED:
+        docs.put("conversations", doc_id, {"game_id": "black_myth", "updated_at": updated_at})
+    return docs
+
+
+def _page(docs, after=None, limit=2):
+    return [
+        document["_id"]
+        for document in docs.find(
+            "conversations",
+            {"game_id": "black_myth"},
+            order_by="updated_at",
+            descending=True,
+            limit=limit,
+            after=after,
+        )
+    ]
+
+
+def test_翻页一页一页取完不重不漏(memory_container):
+    """游标是「上一页最后一条」。**排序键并列时也必须走得下去**——只按它比较就会漏条。"""
+    docs = _tied_store(memory_container.docs)
+
+    first = _page(docs)
+    second = _page(docs, after=("2026-09-13T02:00:00+00:00", "s3"))
+    third = _page(docs, after=("2026-09-13T01:00:00+00:00", "s4"))
+
+    assert first == ["s1", "s3"]
+    assert second == ["s2", "s4"]
+    assert third == []
+    assert first + second == ["s1", "s3", "s2", "s4"]
+    assert sorted(first + second) == sorted(doc_id for doc_id, _ in TIED)
+
+
+def test_翻页游标要跟排序键一起给(memory_container):
+    """没有排序键就无从谈「之后」——当场报出来，不猜一个顺序。"""
+    with pytest.raises(ValueError):
+        memory_container.docs.find("conversations", after=("x", "s1"))
+
+
+def test_不传游标时与从前一样(memory_container):
+    """游标是可选的：不给就还是「排序 + 截断」那一条老路。"""
+    docs = _tied_store(memory_container.docs)
+
+    assert _page(docs, limit=10) == ["s1", "s3", "s2", "s4"]
+
+
+def test_建索引在内存上是空动作(memory_container):
+    """内存里没有索引这回事——方法的契约是「幂等且不报错」，这里如实做到。"""
+    memory_container.docs.ensure_indexes("conversations", (("game_id", 1), ("updated_at", -1)))

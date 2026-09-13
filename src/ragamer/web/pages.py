@@ -36,7 +36,12 @@ from fastapi.templating import Jinja2Templates
 
 from ragamer.clarifying import Clarification, NotACandidate, UnknownPending, version_choices
 from ragamer.container import Container
-from ragamer.conversations import LIST_LIMIT, ChatStack, ConversationNotFound, Turn
+from ragamer.conversations import (
+    ChatStack,
+    ConversationNotFound,
+    Turn,
+    parse_session_cursor,
+)
 from ragamer.importing import STAGE_LABELS, Importer, ImportResult
 from ragamer.knowledge import (
     KnowledgeBase,
@@ -367,8 +372,19 @@ def create_router(container: Container, stack: ChatStack) -> APIRouter:
         return _chat_page(request, container, stack)
 
     @router.get("/chat/{game_id}")
-    def chat_game(request: Request, game_id: str) -> Response:
-        """选中一个库：左栏列它的近期会话，右边提示开一个或点一个。"""
+    def chat_game(request: Request, game_id: str, after: str = "", selected: str = "") -> Response:
+        """选中一个库：左栏列它的近期会话，右边提示开一个或点一个。
+
+        `after` 是上一页最后一条的位置——**左栏滚到底时 htmx 拿它取下一页**。
+        片段与整页走同一份数据、同一段渲染（导入那条路是同一个打法），所以两条路
+        看到的东西一模一样，只是长过了多少条不同。
+        """
+        if after and request.headers.get("HX-Request"):
+            return templates.TemplateResponse(
+                request,
+                "partials/session_list.html",
+                _session_list(stack, game_id, after=after, selected=selected),
+            )
         return _chat_page(request, container, stack, game_id=game_id)
 
     @router.get("/chat/{game_id}/{session_id}")
@@ -553,12 +569,11 @@ def _chat_page(
         "game_id": game_id,
         "session_id": session_id,
         "sessions": [],
+        "selected": session_id,
+        "next": "",
         "turns": [],
         "versions": [],
         "hot": (),
-        # 列表是截断过的（`LIST_LIMIT`）：满了就在侧栏如实说一句，
-        # 免得人以为「就这些了」。真要看更早的得先有分页游标，那是另一张票。
-        "list_limit": LIST_LIMIT,
         "question": question,
         "clarification": _clarification_view(clarification, question) if clarification else None,
     }
@@ -592,17 +607,10 @@ def _chat_page(
                 status_code=_status_of(exc) if isinstance(exc, KnowledgeBaseError) else 404,
                 **context,
             )
-        selected = conversation.version if conversation is not None else knowledge.version
-        context["sessions"] = [
-            {
-                "session_id": summary.session_id,
-                "title": summary.title,
-                "updated_at": summary.updated_at,
-                "current": summary.session_id == session_id,
-            }
-            for summary in stack.chat.list_for_game(game_id)
-        ]
-        context["versions"] = _version_options(container, game_id, selected=selected)
+        context.update(_session_list(stack, game_id, selected=session_id))
+        context["versions"] = _version_options(
+            container, game_id, selected=conversation.version if conversation else knowledge.version
+        )
         context["hot"] = stack.cache.top_questions(game_id)
     return _page(
         request, "chat.html", "对话", "/chat", error=error, status_code=status_code, **context
@@ -711,6 +719,31 @@ def _clarification_view(clarification: Clarification, question: str) -> dict[str
         "prompt": clarification.prompt,
         "question": question,
         "choices": [{"label": choice.label} for choice in clarification.choices],
+    }
+
+
+def _session_list(
+    stack: ChatStack, game_id: str, *, after: str = "", selected: str = ""
+) -> dict[str, Any]:
+    """会话列表那一段的上下文。**整页与「滚到底取下一页」两条路共用它**。
+
+    共用的不只是数据，还有渲染它的那一个模板（`partials/session_list.html`）：
+    两条路各拼一遍的话，第一页与后面几页迟早长得不一样。
+    """
+    page = stack.chat.list_for_game(game_id, after=parse_session_cursor(after))
+    return {
+        "game_id": game_id,
+        "selected": selected,
+        # 空串即到底了：那个哨兵元素因此不再出现
+        "next": page.next,
+        "sessions": [
+            {
+                "session_id": summary.session_id,
+                "title": summary.title,
+                "updated_at": summary.updated_at,
+            }
+            for summary in page.sessions
+        ],
     }
 
 

@@ -29,6 +29,7 @@ from ragamer.conversations import (
     Delta,
     Reply,
     Sources,
+    parse_session_cursor,
 )
 from ragamer.knowledge import KB_COLLECTION
 from ragamer.llm import FakeLlm, LlmTimeout
@@ -319,10 +320,11 @@ def test_会话列表按最后活跃倒序且只给这个库的():
     asked(chat, second, "二郎神掉什么")
     asked(chat, first, "二郎神怎么打")  # 又绕回第一个会话说了一句
 
-    listed = chat.list_for_game(GAME)
+    page = chat.list_for_game(GAME)
 
-    assert [item.session_id for item in listed] == [first.session_id, second.session_id]
-    assert elsewhere.session_id not in {item.session_id for item in listed}
+    assert [item.session_id for item in page.sessions] == [first.session_id, second.session_id]
+    assert elsewhere.session_id not in {item.session_id for item in page.sessions}
+    assert not page.has_more
 
 
 def test_列表只给标题与时间():
@@ -333,10 +335,10 @@ def test_列表只给标题与时间():
 
     asked(chat, conversation, "二郎神掉什么")
 
-    listed = chat.list_for_game(GAME)
-    assert len(listed) == 1
-    assert listed[0].title == "二郎神掉什么"
-    assert listed[0].updated_at > conversation.updated_at  # 落库时刷新过
+    page = chat.list_for_game(GAME)
+    assert len(page.sessions) == 1
+    assert page.sessions[0].title == "二郎神掉什么"
+    assert page.sessions[0].updated_at > conversation.updated_at  # 落库时刷新过
 
 
 def test_标题取首轮问句且之后不再跟着改():
@@ -364,16 +366,19 @@ def test_标题长了截断并补省略号():
 
     asked(chat, conversation, question)
 
-    title = chat.list_for_game(GAME)[0].title
+    title = chat.list_for_game(GAME).sessions[0].title
     assert title == question[:TITLE_CHARS] + "…"
     assert len(title) == TITLE_CHARS + 1
 
 
-def test_没聊过的库返回空元组():
+def test_没聊过的库返回空的一页():
     """「这个库还没聊过」是正常状态，不是错误。"""
     chat = listing_chat(FakeLlm())
 
-    assert chat.list_for_game(GAME) == ()
+    page = chat.list_for_game(GAME)
+
+    assert page.sessions == ()
+    assert not page.has_more
 
 
 def test_检索不到时那句明确回复也进历史():
@@ -389,3 +394,59 @@ def test_检索不到时那句明确回复也进历史():
         "不存在的东西怎么打",
         NOT_FOUND,
     ]
+
+
+class FrozenClock:
+    """永远同一个时刻。**并列的排序键是游标最容易漏条的地方**，造得出来才测得了。"""
+
+    def __init__(self, moment: str = "2026-09-13T00:00:00+00:00") -> None:
+        self._moment = moment
+
+    def __call__(self) -> str:
+        return self._moment
+
+
+def test_会话列表能一页一页取到底():
+    """滚到底接着取：**每一页都从上一页最后一条之后往下取**，不重不漏。
+
+    这一批会话的最后活跃**全都一样**（冻结的时钟），次序只能靠 id 定——
+    而并列正是游标最容易漏条或重条的地方。
+    """
+    chat = replace(setup_chat(FakeLlm(), DOC), clock=FrozenClock())
+    sessions = [chat.start(game_id=GAME) for _ in range(5)]
+
+    walked: list[str] = []
+    cursor = None
+    for _ in range(10):  # 保险丝：真进了死循环也别把测试挂死
+        page = chat.list_for_game(GAME, after=cursor, limit=2)
+        walked += [item.session_id for item in page.sessions]
+        if not page.has_more:
+            break
+        cursor = parse_session_cursor(page.next)
+    else:  # pragma: no cover - 走到这儿说明翻页没到头
+        raise AssertionError("翻页没有走到头")
+
+    assert sorted(walked) == sorted(session.session_id for session in sessions)
+    assert len(walked) == len(set(walked))  # 不重
+    assert len(walked) == 5  # 不漏
+
+
+def test_一页装得下时没有下一页():
+    """`has_more` 是**多取一条**看出来的，不必额外数一遍。"""
+    chat = replace(setup_chat(FakeLlm(), DOC), clock=FrozenClock())
+    chat.start(game_id=GAME)
+
+    page = chat.list_for_game(GAME, limit=1)
+
+    assert len(page.sessions) == 1
+    assert not page.has_more
+    assert page.next == ""
+
+
+def test_游标解不回来时按第一页处理():
+    """游标在 URL 上，人手改得动。改坏了不该让整个列表报错——重头给第一页正是它该得的。"""
+    moment = "2026-09-13T00:00:00+00:00"
+
+    assert parse_session_cursor(f"{moment}|abc") == (moment, "abc")
+    assert parse_session_cursor("没有竖线") is None
+    assert parse_session_cursor(f"{moment}|") is None

@@ -75,15 +75,37 @@ class MongoDocStore:
         order_by: str | None = None,
         descending: bool = False,
         limit: int | None = None,
+        after: tuple[Any, str] | None = None,
     ) -> list[dict[str, Any]]:
+        if after is not None and order_by is None:
+            raise ValueError("翻页游标要跟 order_by 一起给：没有排序键就无从比较「之后」")
         # 投影留空即整份返回。`_id` 不用显式要：Mongo 默认就带，而调用方正靠它认人
         projection = {field: 1 for field in fields} if fields else None
-        cursor = self._collection(collection).find(dict(where or {}), projection)
+        query = dict(where or {})
+        direction = -1 if descending else 1
+        keys: list[tuple[str, int]] = []
         if order_by is not None:
-            cursor = cursor.sort(order_by, -1 if descending else 1)
+            # 次键恒为 `_id`：游标落在 (排序键, id) 上，排序少了它两边就对不上
+            keys = [(order_by, direction), ("_id", direction)]
+        if after is not None:
+            value, last_id = after
+            op = "$lt" if descending else "$gt"
+            # 严格排在游标之后：排序键更靠后的那些，以及**排序键相同但 id 更靠后**的那些。
+            # 第二个分支拿 `last_id` 比，不是拿排序键那个值比——写成同一个值就永远比不出东西，
+            # 并列的那几条会被整批跳过（而会话列表恰恰常常并列）。
+            cursor_filter: dict[str, Any] = {
+                "$or": [{order_by: {op: value}}, {order_by: value, "_id": {op: last_id}}]
+            }
+            query = {"$and": [query, cursor_filter]} if query else cursor_filter
+        cursor = self._collection(collection).find(query, projection)
+        if keys:
+            cursor = cursor.sort(keys)
         if limit is not None:
             cursor = cursor.limit(limit)
         return [dict(document) for document in cursor]
+
+    def ensure_indexes(self, collection: str, fields: Sequence[tuple[str, int]]) -> None:
+        self._collection(collection).create_index(list(fields))
 
     def _connect(self) -> MongoClient:
         if self._client is None:

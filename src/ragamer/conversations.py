@@ -63,10 +63,15 @@ CONVERSATIONS = "conversations"
 #: 只有「指代基本指向上一两轮」。落不进窗口的旧轮次仍留在会话里，只是不参与理解。
 HISTORY_TURNS = 3
 
-#: 会话列表一次给几条。**「近期」是一个截断，还不是分页**——左栏放得下这么多，
-#: 再多也没人往下翻。**代价是第 21 条起在界面上不可达**，而响应里没有「还有更多」
-#: 这个信号；真要看更早的得先有分页游标，那是另一张票的事。
-LIST_LIMIT = 20
+#: 会话列表一页给几条。**这不是上限**：左栏滚到底会接着取下一页，更早的会话到得了。
+#: 100 是「一打开就有一屏多的历史」这个口径；取多了本来不划算（每页一次全表扫），
+#: 那份成本由 :data:`SESSION_INDEX` 兜住。
+SESSION_PAGE_SIZE = 100
+
+#: 会话列表要用的复合索引。**键的顺序就是查询的顺序**：先按库过滤，再按最后活跃倒序。
+#: 没有它，每次列会话都是「全表扫 + 内存排序」，而翻页会把这份成本乘以页数——
+#: 复合索引才能把排序也一并免掉。落点在 `ragamer.app` 的启动那一段。
+SESSION_INDEX: tuple[tuple[str, int], ...] = (("game_id", 1), ("updated_at", -1))
 
 #: 会话标题的长度上限（**字符数**，不是显示宽度）。标题只是列表里的一行提示，
 #: 全文在会话里；截断处补一个省略号，免得看起来像问句本来就断在那里。
@@ -142,6 +147,45 @@ class ConversationSummary:
     session_id: str
     title: str
     updated_at: str
+
+
+@dataclass(frozen=True)
+class SessionPage:
+    """会话列表的一页。
+
+    `next` 是下一页的游标，**空串即到底了**。「还有没有更多」只留这一种表示，
+    免得两个字段各说各话；它是**多取一条**看出来的——请求 `limit + 1` 条，多的那条
+    就是信号，不必额外 count 一次（那本身又是一次全表扫）。
+    """
+
+    sessions: tuple[ConversationSummary, ...]
+    next: str = ""
+
+    @property
+    def has_more(self) -> bool:
+        """还有更早的会话。"""
+        return bool(self.next)
+
+
+def session_cursor(summary: ConversationSummary) -> str:
+    """一条会话在翻页里的位置。**不透明字符串**，取用的人原样带回来即可。
+
+    落在 `(最后活跃, 会话 id)` 两个值上：`updated_at` 是可变的（每落一次库就刷新），
+    单靠它在并列值上会漏条或重条——而会话列表恰恰常常并列（同一秒里问的两句）。
+    """
+    return f"{summary.updated_at}|{summary.session_id}"
+
+
+def parse_session_cursor(text: str) -> tuple[str, str] | None:
+    """把游标解回 `(最后活跃, 会话 id)`；**看不懂就返回 `None`**，由调用方按第一页处理。
+
+    游标在 URL 上，人手改得动。一个改坏的游标不该让整个列表报错——重头给第一页正是
+    它该得的。时间戳里不会有 `|`，所以按第一个 `|` 切是安全的。
+    """
+    updated_at, separator, session_id = text.partition("|")
+    if not separator or not session_id:
+        return None
+    return updated_at, session_id
 
 
 class ConversationNotFound(LookupError):
@@ -244,20 +288,26 @@ class Chat:
         logger.info("新建会话 %s：知识库 %s，版本 %r", conversation.session_id, game_id, version)
         return conversation
 
-    def list_for_game(self, game_id: str) -> tuple[ConversationSummary, ...]:
-        """这个知识库下的会话，**按最后活跃倒序**。
+    def list_for_game(
+        self,
+        game_id: str,
+        *,
+        after: tuple[str, str] | None = None,
+        limit: int = SESSION_PAGE_SIZE,
+    ) -> SessionPage:
+        """这个知识库下的会话，**按最后活跃倒序**，一页 `limit` 条。
 
-        左栏那一份列表。只取标题与时间：`find` 的投影把正文挡在外面——取回 id 再逐条
-        `get` 是另一条路，代价是每次都要读完整份文档，而界面上只显示一行字。
+        左栏那一份列表：滚到底就从 `after` 接着往下取，`after` 是上一页最后一条的
+        `(最后活跃, 会话 id)`（:func:`parse_session_cursor` 解出来的那个）。不给就是第一页。
 
-        **一次查询，过滤与排序都在存储那侧做完**。Mongo 上没有索引，所以现在是全表扫加
-        内存排序；Mongo 的阻塞排序超了内存是**直接报错**而不是变慢，而临界点取决于每份
-        会话多大，没有实测过。要管就是 `create_index([("game_id", 1), ("updated_at", -1)])`
-        ——复合索引才能把排序也一并免掉——按 2026-09-13 的决定先不做，等会话上百或侧栏
-        有可感延迟时再跟别的存储层改动一起动。
+        只取标题与时间：`find` 的投影把正文挡在外面——取回 id 再逐条 `get` 是另一条路，
+        代价是每次都要读完整份文档，而界面上只显示一行字。
+
+        **一次查询，过滤、排序、翻页都在存储那侧做完**。排序与游标都落在
+        `(updated_at, _id)` 上，:data:`SESSION_INDEX` 是这条查询的索引（见它的说明）。
 
         「最后一次说话」而不是「什么时候建的」：继续聊过的会话不该沉到下面去。
-        空库返回空元组——**「这个库还没聊过」是正常状态**，不是错误。
+        空库返回一页空的——**「这个库还没聊过」是正常状态**，不是错误。
 
         ⚠️ 加这两个字段**之前**写下的会话文档没有它们：标题会是空串、排序垫底。
         本项目还没部署过，实际不存在这种文档；真出现就写一次回填。
@@ -268,16 +318,20 @@ class Chat:
             fields=("title", "updated_at"),
             order_by="updated_at",
             descending=True,
-            limit=LIST_LIMIT,
+            # 多要一条：它在不在，就是「还有更早的」这个信号
+            limit=limit + 1,
+            after=after,
         )
-        return tuple(
+        sessions = tuple(
             ConversationSummary(
                 session_id=str(document["_id"]),
                 title=str(document.get("title", "")),
                 updated_at=str(document.get("updated_at", "")),
             )
-            for document in found
+            for document in found[:limit]
         )
+        beyond = bool(found[limit:])
+        return SessionPage(sessions, next=session_cursor(sessions[-1]) if beyond else "")
 
     def set_version(self, session_id: str, version: str) -> Conversation:
         """改这次会话选定的版本。**下一轮起按它走**，直到再改一次。

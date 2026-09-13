@@ -323,6 +323,7 @@ class DocStore(Store, Protocol):
         order_by: str | None = None,
         descending: bool = False,
         limit: int | None = None,
+        after: tuple[Any, str] | None = None,
     ) -> list[dict[str, Any]]:
         """按字段取一批文档。**只读**。
 
@@ -340,12 +341,33 @@ class DocStore(Store, Protocol):
           **缺这个字段的文档怎么排，两个后端不保证一致**（Mongo 把缺的当 null，内存假件
           当空串），别拿一个可能缺的字段来排。
         - `limit`：条数上限。
+        - `after`：**翻页游标**——只要排在「`(order_by` 的值`, 文档 id)` 这一条之后」的。
+          与 `order_by` 必须一起给：没有排序键就无从谈「之后」。取值是上一页最后一条的
+          那两个字段（`_id` 由返回的每一条带上）。
+
+          🔴 **游标落在两个字段上，不能只落排序键**：排序键在这里是可变的（会话每落一次库
+          就刷新 `updated_at`），单靠它在并列值上会漏条或重条。排序同理——给了 `order_by`
+          就一定带上 `_id` 作次键，两个后端才算出同一个次序，游标也才接得上。
 
         **返回的每一条都带 `_id`**。它是文档 id，批量取的时候调用方就是靠它认人的。
         `get` 那边把 `_id` 摘掉是因为 id 本来就是调用方给的，这里正好反过来。
 
         一条都没命中时返回空列表，不报错——**「一条都没有」是列表的正常状态**，
         与「这个集合不存在」也不作区分，两者对调用方是同一件事。
+
+        :raises ValueError: 给了 `after` 却没给 `order_by`。
+        """
+        ...
+
+    def ensure_indexes(self, collection: str, fields: Sequence[tuple[str, int]]) -> None:
+        """确保这个集合上有这个复合索引。**幂等**：已经有了就什么都不做。
+
+        列表查询与它的翻页靠它。没有索引时 `find` 是「全表扫 + 内存排序」，一页一次；
+        翻页把这份成本乘以页数——Mongo 的阻塞排序超了内存还是**直接报错**，不是变慢。
+
+        与 `ObjectStore.ensure_bucket` 同一个打法：存储层保证自己那一侧的形态，
+        调用方不必知道那边具体是索引还是桶。**但这一条不走 `check()`**——适配器不知道
+        业务层查哪些集合，而自检那条路是刻意只读的。调用点在 `ragamer.app` 的启动那一段。
         """
         ...
 
