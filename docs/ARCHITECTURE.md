@@ -82,7 +82,7 @@ flowchart LR
 
 > **上生产前必须做的实验**：拿 20 张真实攻略截图（长图 / Excel 截图 / wiki 截图各若干），分别用 `pipeline` 和 `vlm` 各跑一遍，统计 `type == "image"` 的条目中「有 `img_path` 但无 `content`」的比例 —— **这个比例就是必须依赖二次 OCR 的比例**。这比任何文档调研都准。
 >
-> **2026-09-13 已跑（T10 / #11）：比例 = 100%（56 / 56 个图片条目，pipeline 与 vlm 逐张完全一致）。** 22 张真实截图、44 次解析全部成功，无一张图内文字进得了正文。完整结论与逐张明细见 [`experiments/mineru-ocr.md`](./experiments/mineru-ocr.md)，重跑用 `uv run python tools/mineru_ocr_experiment.py <截图目录> --out …`。
+> **2026-09-13 已跑（T10 / #11）：比例 = 100%（56 / 56 个图片条目，pipeline 与 vlm 逐张完全一致）。** 22 张真实截图、44 次解析全部成功，无一张图内文字进得了正文。**同时要看清损失面**：22 张里 8 张几乎整页被判成一个图片区域（`12-30-06` 是整张论坛帖截图，抽出 0 字），11 张图文混排，3 张纯文字截图抽得干净——所以问题不在文字识别，而在**整页被当成一张图**之后内容就再也不会进库。完整结论、逐张明细与这一层量法见 [`experiments/mineru-ocr.md`](./experiments/mineru-ocr.md)，重跑用 `uv run python tools/mineru_ocr_experiment.py <截图目录> --out …`。
 >
 > 这一跑同时**推翻了 §1.2 的「转机」**：云端 vlm 的产物里根本没有 `<details>` 折叠块，它给 image 条目多一个 `content` 字段（实测全空串）。也就是说 `image_analysis` 在云端没生效——§1.2 第三点列的未确证项，答案是「没开」。**T12 的范围因此是：必须做，且覆盖每一个 image 条目，不挑大小图。**
 
