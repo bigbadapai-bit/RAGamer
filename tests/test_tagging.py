@@ -222,7 +222,8 @@ def test_内容性质逐切片判定_同一文档里两种性质并存():
     tagged = tag_document(WIKI_ARTICLE, _chunks(), vocabulary=BLACK_MYTH)
 
     assert [item.content_nature for item in tagged] == [
-        (ContentNature.INTRO,),  # 开篇：只有大标题那一段路径
+        (ContentNature.INTRO,),  # Infobox 整块一片，路径只有大标题
+        (ContentNature.INTRO,),  # 大标题下的引子正文，路径同样只有大标题
         (ContentNature.WHERE,),
         (ContentNature.STATS,),
         (ContentNature.GUIDE,),
