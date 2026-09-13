@@ -3,10 +3,11 @@
 
 {% if bases %}
 <section class="mb-8 rounded border border-slate-200 bg-white p-5">
-  <h2 class="mb-4 text-lg font-medium">传一份资料</h2>
+  <h2 class="mb-4 text-lg font-medium">导入资料</h2>
   {#
     action／method 与 hx-post 同时写着，这不是冗余：htmx 在时它接管提交、只换下面那一块；
     htmx 不在（脚本没加载出来）时浏览器走原生提交，回的是同一个结果的整页。
+    文件与网址是同一次提交的两半，所以只有一张表单、一个提交按钮。
   #}
   <form method="post" action="/import" enctype="multipart/form-data"
         hx-post="/import" hx-encoding="multipart/form-data"
@@ -35,10 +36,21 @@
 
     <label class="block text-sm">
       <span class="mb-1 block font-medium">资料</span>
-      <input type="file" name="files" multiple accept=".md,.markdown,.txt"
+      <input type="file" name="files" multiple accept="{{ accept }}"
              class="block w-full text-sm">
       <span class="mt-1 block text-xs text-slate-500">
-        现在只认 Markdown 与纯文本，可多选。一批里某个文件失败不牵连其余。
+        可多选。按扩展名挑处理方式：md／txt 直接读，PDF 与图片走 MinerU，图片里的文字另做二次 OCR
+        （{{ accept }}）。一批里某一条失败不牵连其余。
+      </span>
+    </label>
+
+    <label class="block text-sm">
+      <span class="mb-1 block font-medium">网址</span>
+      <textarea name="urls" rows="3" placeholder="一行一个地址"
+                class="w-full rounded border border-slate-300 px-3 py-2 text-sm"></textarea>
+      <span class="mt-1 block text-xs text-slate-500">
+        抓回来转成 Markdown 再入库，与本地文件走完全相同的后续链路。只抓允许复用的来源：
+        开放授权的 wiki、公开接口、官方公告；robots 挡下就报错，不绕。
       </span>
     </label>
 

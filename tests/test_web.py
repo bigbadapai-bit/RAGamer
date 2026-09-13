@@ -26,7 +26,7 @@ from ragamer.knowledge import (
 from ragamer.stores.base import UNVERSIONED, image_key, image_prefix
 from ragamer.tagging import SubjectType
 
-from .conftest import BrokenChunkStore, make_container
+from .conftest import BrokenChunkStore, FakeCrawler, make_container
 
 GAME = "black_myth"
 DOC_TITLE = "二郎神"
@@ -64,10 +64,38 @@ KB = {
     "term_mapping": {"妖王": "character", "根器": "item"},
 }
 
+#: 另一份词条页，一级标题与 ARTICLE 不同：一批里各成一篇。
+DRAGON = """\
+# 白龙马
+
+{{信息框
+| 名称 = 白龙马
+| 类型 = 妖王
+}}
+
+白龙马在第三章的码头出现。
+
+## 打法
+
+先打断它的冲刺。
+"""
+
+#: 与 ARTICLE 同一篇的另一版：一级标题一样、内容不同——一批里两份都叫「二郎神」。
+SHORT = """\
+# 二郎神
+
+二郎神是隐藏 BOSS。
+"""
+
+PAGE_URL = "https://wiki.test/wiki/二郎神"
+MISSING_URL = "https://wiki.test/wiki/没有这页"
+PAGE = "# 金角大王\n\n银角大王的哥哥，拿着紫金红葫芦与羊脂玉净瓶。\n"
+
 
 @pytest.fixture
 def container():
-    container = make_container()
+    # 抓取器排了这一页：网址那条入口在界面上与文件是同一次提交的两半
+    container = make_container(crawler=FakeCrawler(**{PAGE_URL: PAGE}))
     create_knowledge_base(
         container.docs,
         KnowledgeBase.new(GAME, "黑神话·悟空", (SubjectType.CHARACTER, SubjectType.ITEM)),
@@ -85,15 +113,39 @@ def upload(name: str, text: str = ARTICLE) -> tuple[str, tuple[str, bytes, str]]
     return ("files", (name, text.encode("utf-8"), "text/markdown"))
 
 
-def do_import(client, *files, game_id: str = GAME, version: str = "", htmx: bool = False):
+def do_import(
+    client,
+    *files,
+    urls: str = "",
+    game_id: str = GAME,
+    version: str = "",
+    htmx: bool = False,
+):
+    data = {"game_id": game_id, "version": version}
+    if urls:
+        data["urls"] = urls
     response = client.post(
         IMPORT_URL,
-        files=list(files) or [upload("二郎神.md")],
-        data={"game_id": game_id, "version": version},
+        files=list(files) or ([] if urls else [upload("二郎神.md")]),
+        data=data,
         headers={"HX-Request": "true"} if htmx else None,
     )
     assert response.status_code == 200, response.text
     return response
+
+
+def row(page: str, source: str) -> str:
+    """结果里这一条来源那一块 HTML。每行都带 `data-source`，不必靠位置猜。"""
+    match = re.search(rf'<li[^>]*data-source="{re.escape(source)}".*?</li>', page, re.S)
+    assert match is not None, f"结果里没有 {source} 这一条"
+    return match.group(0)
+
+
+def retry_form(page: str) -> str:
+    """「重试失败的那些」那张表单——只该带上失败的那几条。"""
+    match = re.search(r'<form id="import-retry".*?</form>', page, re.S)
+    assert match is not None, "结果区里没有重试表单"
+    return match.group(0)
 
 
 def stored(container, version: str = UNVERSIONED) -> list:
@@ -183,7 +235,7 @@ def test_一批里某个文件失败时其余照常入库_失败的说清卡在�
     )
 
     assert stored(container)  # 成功的那份确实入库了
-    assert "共 2 份，成功 1 份，失败 1 份" in response.text
+    assert "共 2 条，成功 1 条，失败 1 条" in response.text
     assert "卡在「归一化」" in response.text
 
 
@@ -191,7 +243,164 @@ def test_没选资料时给一句话而不是报错(client):
     response = client.post(IMPORT_URL, data={"game_id": GAME, "version": ""})
 
     assert response.status_code == 200
-    assert "先选一份资料再提交" in response.text
+    assert "先选一份资料或填一个网址再提交" in response.text
+
+
+# --- 验收：一次提交多条来源，每条各有各的状态 ---
+
+
+def test_一次提交多个文件与多个网址(client, container):
+    """两条输入合在一次提交里：编号连着排，结果也列在同一处。"""
+    response = do_import(
+        client,
+        upload("二郎神.md"),
+        upload("白龙马.md", DRAGON),
+        urls=f"{PAGE_URL}\n{MISSING_URL}",
+    )
+
+    assert "共 4 条，成功 3 条，失败 1 条" in response.text
+    for source in ("二郎神.md", "白龙马.md", PAGE_URL, MISSING_URL):
+        assert source in response.text
+    # 网页那条与本地文件走的是同一条链路：都进了库，只是带着来源地址
+    assert stored(container)
+    crawled = container.chunks.fetch_document(GAME, "金角大王", version=UNVERSIONED)
+    assert {chunk.source_url for chunk in crawled} == {PAGE_URL}
+
+
+def test_只填网址也能提交(client, container):
+    response = do_import(client, urls=PAGE_URL)
+
+    assert "共 1 条，成功 1 条" in response.text
+    assert container.chunks.fetch_document(GAME, "金角大王", version=UNVERSIONED)
+
+
+def test_网址里的空行不算一条(client, container):
+    response = do_import(client, urls=f"\n{PAGE_URL}\n\n   \n")
+
+    assert "共 1 条，成功 1 条" in response.text
+
+
+def test_每条来源各自显示状态与走过的阶段(client, container):
+    response = do_import(
+        client,
+        upload("甲.md"),
+        ("files", ("攻略.pdf", b"%PDF-1.7", "application/pdf")),
+    )
+
+    done = row(response.text, "甲.md")
+    failed = row(response.text, "攻略.pdf")
+
+    # 成功那条走完了全部六个阶段——界面上的「进度」就是这条已经走到哪
+    for label in ("归一化", "补图", "切分", "打标", "向量化", "入库"):
+        assert label in done, f"成功的那条该走过 {label}"
+    # 失败那条卡在归一化：后面的阶段一个都不出现，不假装走过
+    assert "归一化" in failed
+    assert "切分" not in failed and "入库" not in failed
+    assert "失败" in failed and "成功" in done
+
+
+def test_失败的那条说清是哪一条卡在哪一步为什么(client, container):
+    response = do_import(
+        client,
+        upload("甲.md"),
+        ("files", ("攻略.pdf", b"%PDF-1.7", "application/pdf")),
+    )
+
+    failed = row(response.text, "攻略.pdf")
+
+    assert "攻略.pdf" in failed  # 是哪一条
+    assert "归一化" in failed  # 卡在哪一步
+    assert "还没有对应的解析适配器" in failed  # 为什么
+
+
+def test_只重试失败的那些(client, container):
+    """重试表单里只该有失败的那几条：网址原样带上，成功的那条不重来。"""
+    response = do_import(
+        client,
+        upload("甲.md"),
+        urls=f"{PAGE_URL}\n{MISSING_URL}",
+    )
+
+    retry = retry_form(response.text)
+
+    assert MISSING_URL in retry
+    assert PAGE_URL not in retry
+    assert "甲.md" not in retry
+    assert 'name="files"' not in retry  # 失败的都是网址，不必让人再传文件
+
+    # 重试表单提交的就是那一批失败项：这一次只剩它一条
+    again = client.post(
+        IMPORT_URL,
+        data={"game_id": GAME, "version": "", "urls": MISSING_URL},
+        headers={"HX-Request": "true"},
+    )
+    assert "共 1 条，成功 0 条，失败 1 条" in again.text
+
+
+def test_失败的是文件时重试表单说清要重新选中(client, container):
+    """文件的字节在浏览器那边，提交完就不在页面上了——只能请人重新选。"""
+    response = do_import(
+        client,
+        ("files", ("攻略.pdf", b"%PDF-1.7", "application/pdf")),
+        urls=PAGE_URL,
+    )
+
+    retry = retry_form(response.text)
+
+    assert "攻略.pdf" in retry
+    assert "重新选中" in retry
+    assert PAGE_URL not in retry  # 成功的那条不重来
+    assert 'name="files"' in retry
+    # 文件名不该被当成网址带进重试（那会去抓一个不存在的站）
+    assert 'name="urls"' not in retry
+    # 重试走的是同一个端点：这张表单照原样交回去，选中的文件进的就是同一条链路
+    again = client.post(
+        IMPORT_URL,
+        files=[upload("甲.md")],
+        data={"game_id": GAME, "version": ""},
+        headers={"HX-Request": "true"},
+    )
+    assert "共 1 条，成功 1 条" in again.text
+
+
+def test_导入完成后报出切片数与覆盖到的标签(client, container):
+    response = do_import(client)
+
+    assert f"这批入库 {len(stored(container))} 条切片" in response.text
+    assert "覆盖到的标签：主体类型 角色" in response.text
+    assert "内容性质 介绍、位置与获取、数值、打法流程" in response.text
+    assert "游戏术语 妖王" in response.text
+
+
+def test_一批里两份同标题的文件不互相覆盖(client, container):
+    """「不会因为目录或命名互相覆盖」：后一份当场失败，前一份原样留在库里。"""
+    response = do_import(client, upload("甲.md"), upload("乙.md", SHORT))
+
+    assert "共 2 条，成功 1 条，失败 1 条" in response.text
+    failed = row(response.text, "乙.md")
+    assert "甲.md" in failed  # 说清是跟谁撞了
+    assert "二郎神" in failed
+    assert len(stored(container)) > 1  # 先来的那份还在，没有被后一份替掉
+
+
+def test_能选版本_不选记为未标注版本(client, container):
+    do_import(client, version="2.0")
+    assert stored(container, version="2.0")
+
+    do_import(client, urls=PAGE_URL, version="")
+    assert container.chunks.fetch_document(GAME, "金角大王", version=UNVERSIONED)
+
+
+def test_结果里写明这批资料标注的版本(client):
+    response = do_import(client, version="2.0")
+
+    assert "标注版本：2.0" in response.text
+
+
+def test_没标版本时结果里说的是未标注版本(client):
+    response = do_import(client)
+
+    assert "标注版本：未标注版本" in response.text
 
 
 def test_导进不存在的知识库时说清是哪个库(client):
@@ -229,7 +438,7 @@ def test_htmx_提交只回结果那一块(client):
 @pytest.mark.parametrize(
     ("game_id", "with_file", "message"),
     [
-        (GAME, False, "先选一份资料再提交"),
+        (GAME, False, "先选一份资料或填一个网址再提交"),
         ("zelda", True, "知识库 zelda 不存在"),
         ("黑神话", True, "游戏 id 不合法"),
     ],

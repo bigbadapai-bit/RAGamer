@@ -32,8 +32,8 @@ from fastapi import APIRouter, File, Form, Request, UploadFile
 from fastapi.responses import RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 
-from ragamer.container import Container
-from ragamer.importing import STAGE_LABELS, Importer, ImportResult
+from ragamer.container import Container, build_importer
+from ragamer.importing import STAGE_LABELS, ImportResult
 from ragamer.knowledge import (
     KnowledgeBase,
     KnowledgeBaseError,
@@ -80,9 +80,9 @@ EMPTY = "—"
 def create_router(container: Container) -> APIRouter:
     """把页面挂成一个路由器，由 `ragamer.app` 与 JSON 端点装进同一个应用。"""
     router = APIRouter()
-    # 进度回调用 Importer 的默认实现（落日志）：导入是同步的一整段，
-    # 在页面上等的时候只有日志看得见进度。
-    importer = Importer(chunks=container.chunks, embedder=container.embedder, llm=container.llm)
+    # 与 JSON 端点共用组合根里那一份接线（进度回调也是 Importer 的默认实现：落日志）。
+    # 各自拼一遍的话，页面这条会静默少接几样——PDF、图片与网址在界面上就永远用不了。
+    importer = build_importer(container)
 
     @router.get("/")
     def home() -> RedirectResponse:
@@ -246,7 +246,7 @@ def create_router(container: Container) -> APIRouter:
 
     @router.get("/import")
     def import_page(request: Request, game_id: str = "") -> Response:
-        """导入页：选库、传资料、看结果。进度与 URL 导入在后面的票里。"""
+        """导入页：选库、传资料或填网址、看结果。"""
         return _import_page(request, container, selected=game_id)
 
     @router.post("/import")
@@ -254,9 +254,13 @@ def create_router(container: Container) -> APIRouter:
         request: Request,
         game_id: Annotated[str, Form()] = "",
         version: Annotated[str, Form()] = "",
+        urls: Annotated[str, Form()] = "",
         files: Annotated[list[UploadFile] | None, File()] = None,
     ) -> Response:
-        """跑一次导入，把**逐文件**的结果渲染出来。
+        """跑一次导入，把**逐条**的结果渲染出来。
+
+        文件与网址是同一次提交的两半：一次请求里两条都收，交给同一个批次——编号连着排，
+        文档标识也共用一份认领表，同一次提交里一个文件与一个网址撞上才不会互相覆盖。
 
         htmx 发来的请求只回结果那一块，原生表单提交回整页，两块内容一模一样。
         """
@@ -295,8 +299,9 @@ def create_router(container: Container) -> APIRouter:
             # 空的文件框也会送上来一个 filename 为空的部件，那不是一份资料
             if file.filename
         ]
-        if not sources:
-            return reply("先选一份资料再提交")
+        links = _urls(urls)
+        if not sources and not links:
+            return reply("先选一份资料或填一个网址再提交")
         try:
             collection_name(game_id)
             vocabulary = vocabulary_of(container.docs, game_id)
@@ -308,6 +313,7 @@ def create_router(container: Container) -> APIRouter:
 
         results = importer.batch(
             sources,
+            urls=links,
             game_id=game_id,
             version=version or UNVERSIONED,
             vocabulary=vocabulary,
@@ -560,6 +566,8 @@ def _import_page(
         # 直接打开这个页面时默认选中第一个库，省得每回都挑一次
         selected=selected if selected in known else next(iter(sorted(known)), ""),
         version=version,
+        # 能传什么格式由解析适配器说了算，不在模板里再抄一份——抄的那份迟早对不上
+        accept=",".join(container.parser.SUFFIXES),
         message=message,
         result=result,
         status_code=status_code,
@@ -647,28 +655,94 @@ def _status_of(exc: Exception) -> int:
 def _import_result(
     results: Sequence[ImportResult], *, game_id: str, version: str
 ) -> dict[str, Any]:
-    """一次导入的逐文件结果。**失败也是结果**，和成功的一起列出来。"""
-    rows = [
-        {
-            "source": result.source,
-            "doc_title": result.doc_title,
-            "ok": result.ok,
-            "chunk_count": result.chunk_count,
-            "skipped": result.skipped,
-            "stage_label": EMPTY if result.stage is None else STAGE_LABELS[result.stage],
-            "error": result.error or "",
-            "subject_name": result.tags.subject_name,
-            "subject_types": _names(SUBJECT_TYPE_NAMES, result.tags.subject_type),
-            "content_natures": _names(CONTENT_NATURE_NAMES, result.tags.content_nature),
-            "preview_url": _preview_url(game_id, result.doc_title, version),
-        }
-        for result in results
-    ]
+    """一次导入的逐条结果。**失败也是结果**，和成功的一起列出来。"""
+    rows = [_import_row(result, game_id=game_id, version=version) for result in results]
+    failed = [result for result in results if not result.ok]
+    ok = [result for result in results if result.ok]
     return {
         "rows": rows,
-        "imported": sum(1 for row in rows if row["ok"]),
-        "failed": sum(1 for row in rows if not row["ok"]),
+        "game_id": game_id,
+        "total": len(rows),
+        "imported": len(ok),
+        "failed": len(failed),
+        # 这一批实际落下的东西：进了多少切片、覆盖到哪些标签（验收要的那两句）
+        "chunks": sum(result.chunk_count for result in ok),
+        "skipped": sum(result.skipped for result in ok),
+        "labels": _covered_labels(ok),
+        # 空串就是未标注版本。界面上直接显示空串的话，那一行读起来像没渲染出来
+        "version": version,
+        "version_label": version or "未标注版本",
+        "retry": _retry_payload(failed, version=version),
     }
+
+
+def _import_row(result: ImportResult, *, game_id: str, version: str) -> dict[str, Any]:
+    """一条来源的结果。**走过了哪些阶段就是它在界面上的进度**——
+
+    导入是同步的一整段，请求回来的时候它已经跑完，能说的只有「走到哪为止」。
+    """
+    return {
+        "source": result.source,
+        "doc_title": result.doc_title,
+        "ok": result.ok,
+        # 只列走过的阶段：卡在归一化的那条不该显示它走过切分
+        "steps": [STAGE_LABELS[event.stage] for event in result.progress],
+        "stage_label": EMPTY if result.stage is None else STAGE_LABELS[result.stage],
+        "error": result.error or "",
+        "chunk_count": result.chunk_count,
+        "skipped": result.skipped,
+        "subject_name": result.tags.subject_name,
+        "subject_types": _names(SUBJECT_TYPE_NAMES, result.tags.subject_type),
+        "content_natures": _names(CONTENT_NATURE_NAMES, result.tags.content_nature),
+        "preview_url": _preview_url(game_id, result.doc_title, version),
+    }
+
+
+def _covered_labels(results: Sequence[ImportResult]) -> dict[str, list[str]]:
+    """这一批成功的那几条合起来覆盖到哪些标签，按字段各取并集。
+
+    一份资料一个切片都可能是空的（比如整篇都没读出结构），所以是并集而不是「第一条的」。
+    """
+    return {
+        "subject_types": _union(SUBJECT_TYPE_NAMES, [r.tags.subject_type for r in results]),
+        "content_natures": _union(CONTENT_NATURE_NAMES, [r.tags.content_nature for r in results]),
+        "game_terms": sorted({term for result in results for term in result.tags.game_terms}),
+    }
+
+
+def _union(labels: Mapping[Any, str], groups: Iterable[Sequence[str]]) -> list[str]:
+    """并集，按词表里的顺序——界面上两个字段的排列才稳定。"""
+    values = {value for group in groups for value in group}
+    ordered = [name for value, name in labels.items() if value in values]
+    # 词表里没有的取值原样补在后面，不吞掉
+    return ordered + sorted(_names(labels, values - set(labels)))
+
+
+def _retry_payload(failed: Sequence[ImportResult], *, version: str) -> dict[str, Any]:
+    """「只重试失败的那些」要带上的东西。
+
+    网址能原样带上（它本身就是那条来源的凭据）；**文件带不了**——字节在浏览器那边，
+    提交完就不在页面上了，只能请人重新选中，所以这里只说清是哪些。
+    """
+    return {
+        # 只带地址那几条：把文件名塞进网址框，重试会去抓一个不存在的站
+        "urls": "\n".join(result.source for result in failed if _is_url(result.source)),
+        "files": [result.source for result in failed if not _is_url(result.source)],
+        "version": version,
+    }
+
+
+def _is_url(source: str) -> bool:
+    return source.startswith(("http://", "https://"))
+
+
+def _urls(raw: str) -> list[str]:
+    """网址输入框里的地址：一行一条，空行与前后空白丢掉。
+
+    重复的地址不去重——两条一样的地址就是同一份资料，导入侧按幂等处理（主键稳定，
+    写下去等于没写），这里替它做主反而会让人以为自己只填了一条。
+    """
+    return [line.strip() for line in raw.splitlines() if line.strip()]
 
 
 def _chunk_rows(chunks: Sequence[Chunk], version: str) -> list[dict[str, Any]]:

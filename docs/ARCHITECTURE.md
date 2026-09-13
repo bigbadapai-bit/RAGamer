@@ -178,12 +178,8 @@ flowchart LR
 | `game_id` | VARCHAR | **逃生舱**：为将来合并为共享 collection 预留 |
 | `version` | VARCHAR | 版本。**空串表示未标注版本** |
 | `doc_title` | VARCHAR | 来源文档标题 |
-<<<<<<< HEAD
-| `chunk_type` | VARCHAR | `text` / `table` / `image`。**v1 只产出前两种**：补图是把图内文字写回正文（§1.3），不另外产出图片切片，`image` 这一档留作预留 |
-=======
 | `source_url` | VARCHAR | **来源地址**。网页导入才有，本地文件是空串。答案是带引用给的，引用的落点就是它 |
-| `chunk_type` | VARCHAR | `text` / `table` / `image` |
->>>>>>> t11-crawler
+| `chunk_type` | VARCHAR | `text` / `table` / `image`。**v1 只产出前两种**：补图是把图内文字写回正文（§1.3），不另外产出图片切片，`image` 这一档留作预留 |
 | `content_hash` | VARCHAR | 变更检测，为增量导入预留 |
 | `dense_vector` | FLOAT_VECTOR(1024) | BGE-M3 稠密 |
 | `sparse_vector` | SPARSE_FLOAT_VECTOR | BGE-M3 稀疏 |
@@ -193,6 +189,11 @@ flowchart LR
 **显式声明全部字段，关闭动态字段** —— 不是随手写的，理由见第六节「必须继承的坑」第 1 条。
 
 **`doc_title` 与 `version` 上建倒排索引** —— 聚合父块要靠它们回查兄弟切片（见 2.5）。**schema 里没有 `parent_id`**，理由同样在 2.5。
+
+**`(doc_title, version)` 是文档标识，也是重导替换的范围** —— 所以同一次提交里它必须唯一：
+两条来源（两个文件、两个网址、或一样一个）落成同一个标识时，后写的那条会把前一条整批删掉，
+而两条结果都报成功。导入侧因此在一批内认领这个标识，撞上了就让后一条带着原因失败（§1.1）。
+同一份资料的另一个版本不受影响 —— `version` 不同就是另一个文档（[ADR-0004](./adr/0004-versioned-content-coexists.md)）。
 
 ### 2.3 标签体系
 

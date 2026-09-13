@@ -16,6 +16,8 @@ from dataclasses import dataclass
 
 from ragamer.config import Settings
 from ragamer.crawl import HttpCrawler
+from ragamer.enriching import ImageEnricher
+from ragamer.importing import Importer
 from ragamer.llm import LlmClient, OpenAiLlm
 from ragamer.logging import get_logger
 from ragamer.mineru import MineruParser
@@ -116,4 +118,28 @@ def build_container(settings: Settings) -> Container:
             )
         ),
         crawler=HttpCrawler(settings.crawl),
+    )
+
+
+def build_importer(container: Container) -> Importer:
+    """写入侧那条链路的接线。JSON 端点与页面两条入口共用这一份。
+
+    各自拼一遍的代价不是重复，而是**缺件不报错**：页面那条曾经只接了三个依赖，
+    PDF 与图片解析不了、网址导入不了、图片补不了，而那三样在界面上只是「用不了」，
+    没有任何一处会说自己没接上。
+    """
+    return Importer(
+        chunks=container.chunks,
+        embedder=container.embedder,
+        llm=container.llm,
+        parser=container.parser,
+        objects=container.objects,
+        # 补图要的三样（对象存储、OCR 引擎、视觉模型）都在组合根里造好了，
+        # 编排器只该看见一个 `Enricher`
+        enricher=ImageEnricher(
+            objects=container.objects,
+            ocr=container.ocr,
+            vision=container.vision,
+        ),
+        crawler=container.crawler,
     )

@@ -26,9 +26,8 @@ from typing import Annotated, Any
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
-from ragamer.container import Container
-from ragamer.enriching import ImageEnricher
-from ragamer.importing import STAGE_LABELS, Importer, ImportResult, ProgressEvent
+from ragamer.container import Container, build_importer
+from ragamer.importing import STAGE_LABELS, ImportResult, ProgressEvent
 from ragamer.knowledge import KnowledgeBaseError, vocabulary_of
 from ragamer.sources import SourceDocument
 from ragamer.stores.base import UNVERSIONED, collection_name
@@ -50,21 +49,7 @@ class UrlImport(BaseModel):
 def create_app(container: Container) -> FastAPI:
     """把组合根里那套依赖接成 ASGI 应用。"""
     app = FastAPI(title="RAGamer", summary="游戏攻略 RAG 助手")
-    importer = Importer(
-        chunks=container.chunks,
-        embedder=container.embedder,
-        llm=container.llm,
-        parser=container.parser,
-        objects=container.objects,
-        # 补图在这一层装好再交进去：它要的三样（对象存储、OCR 引擎、视觉模型）
-        # 都是组合根造的，编排器只该看见一个 `ImageEnricher`
-        enricher=ImageEnricher(
-            objects=container.objects,
-            ocr=container.ocr,
-            vision=container.vision,
-        ),
-        crawler=container.crawler,
-    )
+    importer = build_importer(container)
 
     @app.post("/api/kb/{game_id}/import")
     async def import_sources(
