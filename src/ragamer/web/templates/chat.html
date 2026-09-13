@@ -1,0 +1,249 @@
+{% extends "base.html" %}
+{% block content %}
+
+{#
+  两级导航：左栏先是**知识库列表**（不是「问过哪些游戏」——建了库一次没聊过也在里面，
+  它是「我能问什么」的入口），选中一个之后下面接着列它的近期会话；右边是会话正文。
+#}
+<div class="grid items-start gap-6 lg:grid-cols-[15rem_1fr]">
+
+  <aside class="space-y-6 text-sm">
+    <section>
+      <h2 class="mb-2 text-xs font-semibold tracking-wide text-slate-500 uppercase">知识库</h2>
+      {% if bases %}
+      <ul class="space-y-1">
+        {% for base in bases %}
+        <li>
+          <a href="/chat/{{ base.game_id }}"
+             class="block rounded px-2 py-1 {% if base.current %}bg-slate-900 text-white{% else %}hover:bg-slate-200{% endif %}">
+            {{ base.name }}
+            {% if base.version %}<span class="text-xs opacity-70">{{ base.version }}</span>{% endif %}
+          </a>
+        </li>
+        {% endfor %}
+      </ul>
+      {% else %}
+      <p class="text-slate-500">还没有知识库。<a class="underline" href="/kb">先建一个</a>。</p>
+      {% endif %}
+    </section>
+
+    {% if game_id %}
+    <section>
+      <h2 class="mb-2 text-xs font-semibold tracking-wide text-slate-500 uppercase">近期会话</h2>
+      {% if sessions %}
+      <ul class="space-y-1">
+        {% for item in sessions %}
+        <li>
+          <a href="/chat/{{ game_id }}/{{ item.session_id }}"
+             class="block rounded px-2 py-1 {% if item.current %}bg-slate-200 font-medium{% else %}hover:bg-slate-200{% endif %}">
+            {{ item.title or "（还没问过）" }}
+          </a>
+        </li>
+        {% endfor %}
+      </ul>
+      {% else %}
+      <p class="text-slate-500">这个库还没聊过。</p>
+      {% endif %}
+
+      <form method="post" action="/chat/{{ game_id }}" class="mt-3">
+        <button type="submit" class="rounded border border-slate-300 bg-white px-3 py-1 hover:bg-slate-100">
+          开一个新会话
+        </button>
+      </form>
+    </section>
+    {% endif %}
+  </aside>
+
+  <section class="min-w-0">
+    {% if not game_id %}
+    <p class="rounded border border-dashed border-slate-300 bg-white px-4 py-10 text-center text-sm text-slate-500">
+      左边选一个知识库，再开一个会话。
+    </p>
+    {% elif not session_id %}
+    <p class="rounded border border-dashed border-slate-300 bg-white px-4 py-10 text-center text-sm text-slate-500">
+      左边点一个会话接着聊，或者开一个新的。
+    </p>
+    {% else %}
+
+    <div class="mb-6 flex flex-wrap items-center gap-3 text-sm">
+      <form method="post" action="/chat/{{ game_id }}/{{ session_id }}/version"
+            class="flex flex-wrap items-center gap-2">
+        <label for="version" class="text-slate-500">按哪个版本检索</label>
+        <select id="version" name="version" class="rounded border border-slate-300 bg-white px-2 py-1">
+          {% for option in versions %}
+          <option value="{{ option.value }}" {% if option.current %}selected{% endif %}>{{ option.label }}</option>
+          {% endfor %}
+        </select>
+        <button type="submit" class="rounded border border-slate-300 bg-white px-3 py-1 hover:bg-slate-100">
+          切换
+        </button>
+      </form>
+    </div>
+
+    {% if hot %}
+    <section class="mb-6">
+      <h2 class="mb-2 text-xs font-semibold tracking-wide text-slate-500 uppercase">热门问题</h2>
+      <div class="flex flex-wrap gap-2">
+        {% for question, count in hot %}
+        <form method="post" action="/chat/{{ game_id }}/{{ session_id }}/ask" data-ask>
+          <input type="hidden" name="question" value="{{ question }}">
+          <button type="submit"
+                  class="rounded-full border border-slate-300 bg-white px-3 py-1 text-sm hover:bg-slate-100">
+            {{ question }} <span class="text-slate-400">{{ count }}</span>
+          </button>
+        </form>
+        {% endfor %}
+      </div>
+    </section>
+    {% endif %}
+
+    {% if clarification %}
+    {# 没开 JavaScript 时的那条路：候选按钮由服务端渲染回来，点一下整页提交。 #}
+    <section class="mb-6 rounded border border-amber-300 bg-amber-50 px-4 py-3 text-sm">
+      <p class="mb-3">{{ clarification.prompt }}</p>
+      <div class="flex flex-wrap gap-2">
+        {% for choice in clarification.choices %}
+        <form method="post" action="/chat/{{ game_id }}/{{ session_id }}/resolve">
+          <input type="hidden" name="pending_id" value="{{ clarification.pending_id }}">
+          <input type="hidden" name="label" value="{{ choice.label }}">
+          <input type="hidden" name="question" value="{{ clarification.question }}">
+          <button type="submit"
+                  class="rounded border border-slate-300 bg-white px-3 py-1 hover:bg-slate-100">
+            {{ choice.label }}
+          </button>
+        </form>
+        {% endfor %}
+      </div>
+    </section>
+    {% endif %}
+
+    <div id="turns"
+         data-turns-url="/chat/{{ game_id }}/{{ session_id }}/turns"
+         data-session-id="{{ session_id }}"
+         class="space-y-4">
+      {% include "partials/turns.html" %}
+    </div>
+
+    <form id="ask-form" method="post" action="/chat/{{ game_id }}/{{ session_id }}/ask"
+          data-ask class="mt-6">
+      <textarea name="question" rows="2" placeholder="问一句，比如「二郎神怎么打」"
+                class="w-full rounded border border-slate-300 px-3 py-2 text-sm">{{ question }}</textarea>
+      <div class="mt-2 flex items-center gap-3">
+        <button type="submit" class="rounded bg-slate-900 px-4 py-1.5 text-sm text-white hover:bg-slate-700">
+          提问
+        </button>
+        <span class="text-xs text-slate-500">答案一个字一个字出来。</span>
+      </div>
+    </form>
+
+    {% endif %}
+  </section>
+</div>
+
+{% if session_id %}
+<script>
+  /*
+    对话页那一小块用原生 `EventSource`：htmx 的 SSE 扩展做逐字输出太别扭，架构文档 §5
+    明确允许这一处退回原生 JS。其余交互——开会话、换版本、点候选——都是普通表单，
+    没有脚本时走 `POST /chat/{库}/{会话}/ask` 那条整轮跑完再回来的路。
+
+    收到 `done` 之后必须 `close()`：`EventSource` 在连接关闭后会重连同一个 URL，
+    而重连就是再问一遍，历史里会多出一轮一模一样的问答（见 `ragamer.api.SSE_RETRY`）。
+  */
+  (function () {
+    var turns = document.getElementById("turns");
+    var form = document.getElementById("ask-form");
+    if (!turns || !form) return;
+
+    var source = null;
+
+    function refresh() {
+      htmx.ajax("GET", turns.dataset.turnsUrl, { target: "#turns", swap: "innerHTML" });
+    }
+
+    function ask(question, extra) {
+      if (!question.trim()) return;
+      if (source) source.close();
+      // `#turns` 会被整块换掉，所以每轮都重新取一次，不缓存这三个节点
+      document.getElementById("live").classList.remove("hidden");
+      document.getElementById("live-status").textContent = "";
+      document.getElementById("live-text").textContent = "";
+
+      var params = new URLSearchParams({ question: question });
+      Object.keys(extra || {}).forEach(function (key) { params.set(key, extra[key]); });
+      source = new EventSource(
+        "/api/chat/sessions/" + turns.dataset.sessionId + "/ask?" + params.toString()
+      );
+
+      source.addEventListener("status", function (event) {
+        document.getElementById("live-status").textContent = JSON.parse(event.data).text;
+      });
+      source.addEventListener("delta", function (event) {
+        document.getElementById("live-status").textContent = "";
+        document.getElementById("live-text").textContent += JSON.parse(event.data).text;
+      });
+      source.addEventListener("clarification", function (event) {
+        stop();
+        choices(JSON.parse(event.data), question);
+      });
+      source.addEventListener("done", function () {
+        stop();
+        document.getElementById("live").classList.add("hidden");
+        refresh();
+      });
+      // 服务端发的是 `event: error`；浏览器连不上时也会派发同名的内建事件，那个没有 data
+      source.addEventListener("error", function (event) {
+        if (!event.data) {
+          stop();
+          document.getElementById("live-status").textContent = "连接断了，刷新页面看看这一轮记上没有。";
+          return;
+        }
+        stop();
+        document.getElementById("live-status").textContent = JSON.parse(event.data).message;
+      });
+    }
+
+    function stop() {
+      if (source) source.close();
+      source = null;
+    }
+
+    function choices(payload, question) {
+      var box = document.createElement("section");
+      box.className = "rounded border border-amber-300 bg-amber-50 px-4 py-3 text-sm";
+
+      var prompt = document.createElement("p");
+      prompt.className = "mb-3";
+      prompt.textContent = payload.prompt;
+      box.appendChild(prompt);
+
+      var row = document.createElement("div");
+      row.className = "flex flex-wrap gap-2";
+      payload.choices.forEach(function (choice) {
+        var button = document.createElement("button");
+        button.type = "button";
+        button.className = "rounded border border-slate-300 bg-white px-3 py-1 hover:bg-slate-100";
+        button.textContent = choice.label;
+        button.addEventListener("click", function () {
+          box.remove();
+          // 回传的是 `label`：暂停点认的是用户看到的那个字面（见 `ragamer.clarifying`）
+          ask(question, { pending_id: payload.pending_id, label: choice.label });
+        });
+        row.appendChild(button);
+      });
+      box.appendChild(row);
+      turns.appendChild(box);
+    }
+
+    document.querySelectorAll("form[data-ask]").forEach(function (item) {
+      item.addEventListener("submit", function (event) {
+        event.preventDefault();
+        var box = item.querySelector("[name=question]");
+        ask(box.value, {});
+        if (item === form) box.value = "";
+      });
+    });
+  })();
+</script>
+{% endif %}
+{% endblock %}

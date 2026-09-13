@@ -333,9 +333,8 @@ def test_每个页面都有四项导航(client, path):
         assert label in page, f"{path} 的导航里少了「{label}」"
 
 
-@pytest.mark.parametrize("path", ["/chat", "/eval"])
-def test_还没做的页面点进去是一句人话而不是_404(client, path):
-    response = client.get(path)
+def test_还没做的页面点进去是一句人话而不是_404(client):
+    response = client.get("/eval")
 
     assert response.status_code == 200
     assert "这个页面还没做" in response.text

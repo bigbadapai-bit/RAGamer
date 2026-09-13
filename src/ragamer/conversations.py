@@ -41,8 +41,10 @@ from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from typing import Any, Literal
 
-from ragamer.answering import Citation, ReadSide, require_question
+from ragamer.answering import Answerer, Citation, ReadSide, require_question
+from ragamer.caching import CachedAnswerer
 from ragamer.clarifying import Clarification, Clarifier
+from ragamer.container import Container
 from ragamer.llm import Message
 from ragamer.logging import get_logger
 from ragamer.query import effective_version
@@ -277,6 +279,20 @@ class Chat:
             for document in found
         )
 
+    def set_version(self, session_id: str, version: str) -> Conversation:
+        """改这次会话选定的版本。**下一轮起按它走**，直到再改一次。
+
+        `updated_at` 不动：它是「最后一次说话」的时刻，左栏按它倒序——改个版本不该让
+        一次会话在列表里往上跳。标题同理，那是这一串问答的招牌。
+
+        :raises ConversationNotFound: 没有这个会话。
+        """
+        conversation = self.open(session_id)
+        updated = replace(conversation, version=version)
+        _save(self.docs, updated)
+        logger.info("会话 %s 改按版本 %r 检索", session_id, version)
+        return updated
+
     def open(self, session_id: str) -> Conversation:
         """把一次会话读回来。刷新页面之后靠它把历史拿回来。
 
@@ -410,6 +426,51 @@ class Chat:
             self.docs,
             _appended(conversation, question, "".join(produced), sources, self.clock()),
         )
+
+
+@dataclass(frozen=True)
+class ChatStack:
+    """读取侧接好的那一套：对话、澄清、以及挡在生成前面的缓存。
+
+    **装配只有 `build_chat` 这一处**（JSON 端点与页面都从它拿）：两处各接一遍的话，
+    缓存挡没挡上、澄清器有没有接，就可能两边不一样——而那种差别在界面上看不出来，
+    只会表现为「页面上会反问的提问，接口上直接作答」。
+    """
+
+    #: 多轮对话。开会话、列会话、问一轮都走它。
+    chat: Chat
+    #: 挡了缓存的读取侧入口。**热门问题要直接问它**——那不是某一次对话的事，
+    #: 但它与对话共用同一份缓存连接与同一个键空间，问的也是同一批提问。
+    cache: CachedAnswerer
+
+
+def build_chat(container: Container) -> ChatStack:
+    """按组合根里那套依赖接出读取侧。
+
+    缓存挡在检索生成前面（架构文档 §4）：命中就把上次那份结果原样交回，未命中才走
+    完整链路。澄清器与生成走的是同一个 `Answerer`——判完就作答与逐字流式生成只差
+    正文怎么出来，两处各接一个的话，同一次提问在两条路上会拿到两份不同的引用。
+    """
+    answers = Answerer(
+        chunks=container.chunks,
+        embedder=container.embedder,
+        reranker=container.reranker,
+        llm=container.llm,
+    )
+    cache = CachedAnswerer(answers=answers, cache=container.cache)
+    return ChatStack(
+        chat=Chat(
+            docs=container.docs,
+            answerer=cache,
+            clarifier=Clarifier(
+                chunks=container.chunks,
+                docs=container.docs,
+                llm=container.llm,
+                answerer=answers,
+            ),
+        ),
+        cache=cache,
+    )
 
 
 def _history(turns: Sequence[Turn]) -> tuple[Message, ...]:

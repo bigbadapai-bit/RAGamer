@@ -1,6 +1,6 @@
 """HTTP 端点：写入侧与读取侧对外的唯一入口。
 
-五个端点分三组：
+五个端点分两组：
 
 - **写入侧** `POST /api/kb/{game_id}/import`。批量提交、**逐文件独立**：某个文件失败时
   其余照常入库，失败的那个在结果里带文件名与失败阶段。
@@ -22,8 +22,7 @@ SSE 事件、暂停点选错了翻成 422。**「这一轮算不算问完」「�
 知识库元数据从 MongoDB 读（`knowledge_bases` 集合，id 就是游戏 id）：打标要用的词表
 ——启用了哪些主体类型、这个游戏的术语映射——就在它里面（docs/ARCHITECTURE.md §2.3），
 检索回落哪个版本也从它取（§2.4）。形状与判断在 `ragamer.knowledge`，界面那条写入路径
-用的是同一份。知识库列表同时是**游戏候选**：给模型的是显示名，拿回来再换回 id，
-理由见 `_games`。
+用的是同一份。
 本层**一个适配器都不构造**，全部来自组合根（`ragamer.container`），缝因此立得住。
 
 这是**只有 JSON 端点**的应用；给人看的页面由 `ragamer.web` 挂上去，两者在
@@ -41,9 +40,8 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from ragamer.answering import Answerer, Citation
-from ragamer.caching import CachedAnswerer
-from ragamer.clarifying import Clarification, Clarifier, NotACandidate, UnknownPending
+from ragamer.answering import Citation
+from ragamer.clarifying import Clarification, NotACandidate, UnknownPending
 from ragamer.container import Container
 from ragamer.conversations import (
     Chat,
@@ -53,6 +51,7 @@ from ragamer.conversations import (
     Reply,
     Sources,
     Status,
+    build_chat,
 )
 from ragamer.importing import STAGE_LABELS, Importer, ImportResult, ProgressEvent
 from ragamer.knowledge import (
@@ -80,8 +79,14 @@ SSE_HEADERS = {"Cache-Control": "no-cache"}
 SSE_RETRY = "retry: 86400000\n\n"
 
 
-def create_app(container: Container) -> FastAPI:
-    """把组合根里那套依赖接成 ASGI 应用。"""
+def create_app(container: Container, chat: Chat | None = None) -> FastAPI:
+    """把组合根里那套依赖接成 ASGI 应用。
+
+    `chat` 由 `ragamer.app` 传进来：整站只有一套读取侧，JSON 端点与页面共用同一份
+    （缓存与澄清器都在它里面，接两遍就可能两边不一样）。不传就现接一份——
+    直接打这个应用的测试走那条。
+    """
+    chat = chat if chat is not None else build_chat(container).chat
     app = FastAPI(title="RAGamer", summary="游戏攻略 RAG 助手")
     importer = Importer(
         chunks=container.chunks,
@@ -91,23 +96,6 @@ def create_app(container: Container) -> FastAPI:
         objects=container.objects,
         # 导入完成时按游戏前缀清缓存（架构文档 §4）：语料变了，基于旧语料的答案不该再命中
         cache=container.cache,
-    )
-    answers = Answerer(
-        chunks=container.chunks,
-        embedder=container.embedder,
-        reranker=container.reranker,
-        llm=container.llm,
-    )
-    chat = Chat(
-        docs=container.docs,
-        # 缓存挡在检索生成前面：命中就重放，未命中才走完整链路（架构文档 §4）
-        answerer=CachedAnswerer(answers=answers, cache=container.cache),
-        clarifier=Clarifier(
-            chunks=container.chunks,
-            docs=container.docs,
-            llm=container.llm,
-            answerer=answers,
-        ),
     )
 
     @app.post("/api/kb/{game_id}/import")

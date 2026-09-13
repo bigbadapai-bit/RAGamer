@@ -22,34 +22,46 @@ htmx 只用在**有一块明显可以就地换掉的结果区**的地方——�
 
 from __future__ import annotations
 
+import mimetypes
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
 from typing import Annotated, Any
 from urllib.parse import urlencode
 
-from fastapi import APIRouter, File, Form, Request, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 
+from ragamer.clarifying import Clarification, version_choices
 from ragamer.container import Container
+from ragamer.conversations import ChatStack, ConversationNotFound, Turn
 from ragamer.importing import STAGE_LABELS, Importer, ImportResult
 from ragamer.knowledge import (
     KnowledgeBase,
     KnowledgeBaseError,
     PurgeError,
     create_knowledge_base,
+    find_knowledge_base,
     knowledge_base_of,
     list_knowledge_bases,
     purge_inventory,
     purge_knowledge_base,
+    readable_knowledge_base,
     remove_term,
     set_term,
     update_knowledge_base,
     vocabulary_of,
 )
 from ragamer.sources import SourceDocument
-from ragamer.stores.base import UNVERSIONED, Chunk, collection_name, image_folder
+from ragamer.stores.base import (
+    IMAGE_PREFIX,
+    UNVERSIONED,
+    Chunk,
+    StoreError,
+    collection_name,
+    image_folder,
+)
 from ragamer.tagging import (
     CONTENT_NATURE_NAMES,
     SUBJECT_TYPE_NAMES,
@@ -62,7 +74,11 @@ TEMPLATES = Path(__file__).parent / "templates"
 
 templates = Jinja2Templates(directory=str(TEMPLATES))
 
-#: 导航。四个位置一次留齐，对话与评测的页面在后面的票里接上。
+#: 原图路由的前缀。库里存的图片地址就是对象 key（`images/…`），
+#: 页面按 `/images/…` 取——多一层前缀，这个路由就只放行图片那一块。
+IMAGE_ROUTE = "/images"
+
+#: 导航。四个位置一次留齐，评测的页面在后面的票里接上。
 NAV: tuple[tuple[str, str], ...] = (
     ("对话", "/chat"),
     ("知识库管理", "/kb"),
@@ -77,8 +93,12 @@ CHUNK_TYPE_NAMES: Mapping[str, str] = {"text": "正文", "table": "表格", "ima
 EMPTY = "—"
 
 
-def create_router(container: Container) -> APIRouter:
-    """把页面挂成一个路由器，由 `ragamer.app` 与 JSON 端点装进同一个应用。"""
+def create_router(container: Container, stack: ChatStack) -> APIRouter:
+    """把页面挂成一个路由器，由 `ragamer.app` 与 JSON 端点装进同一个应用。
+
+    `stack` 是读取侧接好的那一套（`ragamer.conversations.build_chat`）：对话页与 JSON
+    端点打的是同一批会话、同一份缓存，所以**由装配那一处传进来**，页面不再接一遍。
+    """
     router = APIRouter()
     # 进度回调用 Importer 的默认实现（落日志）：导入是同步的一整段，
     # 在页面上等的时候只有日志看得见进度。
@@ -337,15 +357,123 @@ def create_router(container: Container) -> APIRouter:
         chunks = container.chunks.fetch_document(game_id, doc_title, version=version)
         return _preview_page(request, game_id, doc_title, version, chunks)
 
-    # 两个还没做的页面。留位置是这一票的要求，所以点进来要有一句人话，而不是一个 404。
+    # --- 对话页（T24）---
+
     @router.get("/chat")
-    def chat(request: Request) -> Response:
-        return _page(
+    def chat_home(request: Request) -> Response:
+        """还没选库：左栏把知识库列出来，右边请人选一个。"""
+        return _chat_page(request, container, stack)
+
+    @router.get("/chat/{game_id}")
+    def chat_game(request: Request, game_id: str) -> Response:
+        """选中一个库：左栏列它的近期会话，右边提示开一个或点一个。"""
+        return _chat_page(request, container, stack, game_id=game_id)
+
+    @router.get("/chat/{game_id}/{session_id}")
+    def chat_session(request: Request, game_id: str, session_id: str) -> Response:
+        """一次会话的正文。刷新页面回到这里——历史在服务端存着。"""
+        return _chat_page(request, container, stack, game_id=game_id, session_id=session_id)
+
+    @router.get("/chat/{game_id}/{session_id}/turns")
+    def chat_turns(request: Request, game_id: str, session_id: str) -> Response:
+        """会话正文那一段。**流答完之后 htmx 拿它换掉整块**。
+
+        换掉而不是在页面里拼：引用、图片、版本徽章都由模板渲染，拼第二遍迟早与第一遍
+        长得不一样（导入那条路是同一个打法）。片段与整页渲染的是同一份数据，所以两条路
+        看到的东西一模一样。
+        """
+        try:
+            conversation = stack.chat.open(session_id)
+        except ConversationNotFound as exc:
+            return _page(
+                request,
+                "partials/turns.html",
+                "对话",
+                "/chat",
+                error=str(exc),
+                status_code=404,
+                turns=[],
+                game_id=game_id,
+                session_id=session_id,
+            )
+        return templates.TemplateResponse(
             request,
-            "placeholder.html",
-            "对话",
-            "/chat",
-            note="这个页面还没做。等检索链路与澄清反问接上之后，问答开在这里。",
+            "partials/turns.html",
+            {"turns": _turn_rows(conversation.turns), "error": ""},
+        )
+
+    @router.post("/chat/{game_id}")
+    def start_session(request: Request, game_id: str, version: str = Form("")) -> Response:
+        """开一次会话，然后转过去。「提交 → 重定向」：刷新一下不会又开一个。"""
+        try:
+            knowledge = readable_knowledge_base(container.docs, game_id)
+        except KnowledgeBaseError as exc:
+            return _chat_page(request, container, stack, game_id=game_id, error=str(exc))
+        conversation = stack.chat.start(game_id=game_id, version=version or knowledge.version)
+        return RedirectResponse(f"/chat/{game_id}/{conversation.session_id}", status_code=303)
+
+    @router.post("/chat/{game_id}/{session_id}/ask")
+    def ask_whole(
+        request: Request, game_id: str, session_id: str, question: str = Form("")
+    ) -> Response:
+        """不用 JavaScript 时走这条：整轮跑完再回来。
+
+        页面上的提问框默认由 `EventSource` 接管（逐字流式），这条是它禁用脚本时的退路——
+        结果一样，只是答案一次给全。澄清也一样：判不准时这一页把候选按钮渲染出来。
+        """
+        return _whole_turn(request, container, stack, game_id, session_id, question)
+
+    @router.post("/chat/{game_id}/{session_id}/resolve")
+    def resolve_whole(
+        request: Request,
+        game_id: str,
+        session_id: str,
+        pending_id: str = Form(...),
+        label: str = Form(...),
+        question: str = Form(""),
+    ) -> Response:
+        """不用 JavaScript 时点澄清按钮走这条：从暂停点继续，整轮跑完再回来。"""
+        return _whole_turn(
+            request,
+            container,
+            stack,
+            game_id,
+            session_id,
+            question,
+            pending_id=pending_id,
+            label=label,
+        )
+
+    @router.post("/chat/{game_id}/{session_id}/version")
+    def change_version(
+        request: Request, game_id: str, session_id: str, version: str = Form("")
+    ) -> Response:
+        """换这次会话选定的版本。**下一轮起按它走**，直到再换一次。"""
+        try:
+            stack.chat.set_version(session_id, version)
+        except ConversationNotFound as exc:
+            return _chat_page(
+                request, container, stack, game_id=game_id, error=str(exc), status_code=404
+            )
+        return RedirectResponse(f"/chat/{game_id}/{session_id}", status_code=303)
+
+    @router.get(IMAGE_ROUTE + "/{key:path}")
+    def image(key: str) -> Response:
+        """原图。库里存的图片地址就是对象 key，答案带回来的也是它，页面照它取。
+
+        路径上那一段 `images/` 与对象 key 的顶层前缀是同一段（`IMAGE_PREFIX`）：
+        这样这个路由只放行图片那一块，不会变成一个万能的对象读口。
+        """
+        address = f"{IMAGE_PREFIX}/{key}"
+        try:
+            data = container.objects.get(address)
+        except StoreError as exc:
+            raise HTTPException(status_code=404, detail=f"没有这张图：{exc}") from exc
+        return Response(
+            content=data,
+            media_type=_content_type(address),
+            # key 里带着来源内容的摘要（§1.2），同一张图的内容不会变——可以放心让浏览器留着
+            headers={"Cache-Control": "private, max-age=86400"},
         )
 
     @router.get("/eval")
@@ -362,6 +490,225 @@ def create_router(container: Container) -> APIRouter:
 
 
 # --- 页面 ---
+
+
+def _chat_page(
+    request: Request,
+    container: Container,
+    stack: ChatStack,
+    *,
+    game_id: str = "",
+    session_id: str = "",
+    question: str = "",
+    error: str = "",
+    clarification: Clarification | None = None,
+    status_code: int = 200,
+) -> Response:
+    """对话页。两级导航都在这一页上：左栏是知识库，选中之后下面接着列它的近期会话。
+
+    **左栏是知识库列表，不是「问过哪些游戏」**：建了库一次没聊过也要在里面——它是
+    「我能问什么」的入口，不是历史记录。会话列表才是历史，按最后活跃倒序。
+    """
+    context: dict[str, Any] = {
+        "bases": [
+            {
+                "game_id": base.game_id,
+                "name": base.name,
+                "version": base.version,
+                "current": base.game_id == game_id,
+            }
+            for base in list_knowledge_bases(container.docs)
+        ],
+        "game_id": game_id,
+        "session_id": session_id,
+        "sessions": [],
+        "turns": [],
+        "versions": [],
+        "hot": (),
+        "question": question,
+        "clarification": _clarification_view(clarification, question) if clarification else None,
+    }
+    conversation = None
+    if session_id:
+        try:
+            conversation = stack.chat.open(session_id)
+        except ConversationNotFound as exc:
+            return _page(
+                request,
+                "chat.html",
+                "对话",
+                "/chat",
+                error=error or str(exc),
+                status_code=404,
+                **context,
+            )
+        context["turns"] = _turn_rows(conversation.turns)
+    if game_id:
+        try:
+            knowledge = readable_knowledge_base(container.docs, game_id)
+        except (KnowledgeBaseError, ValueError) as exc:
+            # id 不合法与库不存在对页面是同一件事：这个库点不进来。两者都归 404——
+            # 页面上没有「换个 id 再试」这个动作，那是建库页的事。
+            return _page(
+                request,
+                "chat.html",
+                "对话",
+                "/chat",
+                error=error or str(exc),
+                status_code=_status_of(exc) if isinstance(exc, KnowledgeBaseError) else 404,
+                **context,
+            )
+        selected = conversation.version if conversation is not None else knowledge.version
+        context["sessions"] = [
+            {
+                "session_id": summary.session_id,
+                "title": summary.title,
+                "updated_at": summary.updated_at,
+                "current": summary.session_id == session_id,
+            }
+            for summary in stack.chat.list_for_game(game_id)
+        ]
+        context["versions"] = _version_options(container, game_id, selected=selected)
+        context["hot"] = stack.cache.top_questions(game_id)
+    return _page(
+        request, "chat.html", "对话", "/chat", error=error, status_code=status_code, **context
+    )
+
+
+def _whole_turn(
+    request: Request,
+    container: Container,
+    stack: ChatStack,
+    game_id: str,
+    session_id: str,
+    question: str,
+    *,
+    pending_id: str = "",
+    label: str = "",
+) -> Response:
+    """一轮问答跑到底，然后回整页。**这是没开 JavaScript 时的那条路**。
+
+    流式那条路把答案一片一片推给页面；这一条等它全跑完，再把结果渲染回来。两条路走的是
+    同一个 `Chat.ask`，所以落库、澄清、版本回落全都一致——差别只在答案怎么出来。
+
+    澄清那一轮不重定向：页面要把候选按钮渲染出来，而那段状态（暂停点、候选）不在会话里，
+    只在这一刻手上。所以直接把它渲染进这一页。
+    """
+    if not question.strip():
+        return _chat_page(
+            request,
+            container,
+            stack,
+            game_id=game_id,
+            session_id=session_id,
+            question=question,
+            error="问题不能为空",
+        )
+    try:
+        # 先读一次会话拿它绑的库：现行版本要从那里取（ADR-0004）。
+        # `chat.ask` 自己还会再读一次，那是它的事——会话不可变，`ask` 落的是新的一份。
+        bound = stack.chat.open(session_id).game_id
+    except ConversationNotFound as exc:
+        return _chat_page(
+            request,
+            container,
+            stack,
+            game_id=game_id,
+            error=str(exc),
+            status_code=404,
+        )
+    replies = list(
+        stack.chat.ask(
+            session_id,
+            question,
+            current_version=_current_version(container, bound),
+            pending_id=pending_id,
+            label=label,
+        )
+    )
+    outcome = replies[-1] if replies else None
+    if isinstance(outcome, Clarification):
+        return _chat_page(
+            request,
+            container,
+            stack,
+            game_id=game_id,
+            session_id=session_id,
+            question=question,
+            clarification=outcome,
+        )
+    return RedirectResponse(f"/chat/{game_id}/{session_id}", status_code=303)
+
+
+def _clarification_view(clarification: Clarification, question: str) -> dict[str, Any]:
+    """一次反问渲染成按钮要的那几样。`value` 是回传的取值（游戏是 id），
+    `label` 是按钮上显示的（游戏是显示名）——两者不一样的理由见 `Choice`。"""
+    return {
+        "pending_id": clarification.pending_id,
+        "prompt": clarification.prompt,
+        "question": question,
+        "choices": [
+            {"label": choice.label, "value": choice.value} for choice in clarification.choices
+        ],
+    }
+
+
+def _version_options(container: Container, game_id: str, *, selected: str) -> list[dict[str, Any]]:
+    """版本下拉的选项：这个库里**真实有过**的版本，外加「跟随知识库现行版本」。
+
+    候选只从语料里读（`ragamer.clarifying.version_choices`），不让人手输一个：输一个库里
+    没有的版本，检索会静默查空，而界面上看不出区别——与澄清反问那一条是同一个理由。
+    """
+    base = find_knowledge_base(container.docs, game_id)
+    current = base.version if base else ""
+    options = [
+        {
+            "value": "",
+            "label": f"跟随现行版本（{current}）" if current else "跟随现行版本",
+            "current": selected == "",
+        }
+    ]
+    options += [
+        {"value": choice.value, "label": choice.label, "current": selected == choice.value}
+        for choice in version_choices(container.chunks, game_id)
+    ]
+    return options
+
+
+def _turn_rows(turns: Sequence[Turn]) -> list[dict[str, Any]]:
+    """会话里的消息 → 模板要的那几样。用户那一侧只有原话，模型那一侧还带来源与图。"""
+    return [
+        {
+            "role": turn.role,
+            "content": turn.content,
+            "version": turn.version,
+            "citations": [
+                {
+                    "index": citation.index,
+                    "label": citation.label,
+                    "doc_title": citation.doc_title,
+                    "ancestor_path": citation.ancestor_path,
+                }
+                for citation in turn.citations
+            ],
+            # 地址本身就是对象 key（`images/…`），而路由那一段也是 `images/`：
+            # 去掉一层再拼，页面上看到的就是 `/images/black_myth/…`，不是 `images` 叠两遍
+            "images": [
+                {
+                    "url": f"{IMAGE_ROUTE}/{address.removeprefix(IMAGE_PREFIX + '/')}",
+                    "name": address.rsplit("/", 1)[-1],
+                }
+                for address in turn.images
+            ],
+        }
+        for turn in turns
+    ]
+
+
+def _content_type(address: str) -> str:
+    """按扩展名给一个内容类型。认不出来时按二进制流——浏览器仍会当图显示。"""
+    guessed, _ = mimetypes.guess_type(address)
+    return guessed or "application/octet-stream"
 
 
 def _page(

@@ -20,6 +20,7 @@ from ragamer.__main__ import EXIT_CONFIG, EXIT_OK, EXIT_STORE
 from ragamer.api import create_app as create_api_app
 from ragamer.config import ConfigError, get_settings
 from ragamer.container import Container, build_container
+from ragamer.conversations import build_chat
 from ragamer.logging import get_logger, setup_logging
 from ragamer.stores.base import StoreError
 from ragamer.web import create_router
@@ -32,9 +33,14 @@ DEFAULT_PORT = 8000
 
 
 def create_app(container: Container) -> FastAPI:
-    """完整应用：JSON 端点 + 页面。"""
-    app = create_api_app(container)
-    app.include_router(create_router(container))
+    """完整应用：JSON 端点 + 页面。
+
+    **读取侧只接一套**，两组路由共用：它们打的是同一批会话、同一份缓存，
+    各接一遍就可能一边挡了缓存、一边没挡，而那种差别在界面上看不出来。
+    """
+    stack = build_chat(container)
+    app = create_api_app(container, chat=stack.chat)
+    app.include_router(create_router(container, stack))
     return app
 
 

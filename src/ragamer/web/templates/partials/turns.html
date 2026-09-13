@@ -1,0 +1,67 @@
+{#
+  会话正文。整页渲染时被 chat.html 包在 #turns 里；流答完之后 htmx 单独取这一段换掉整块
+  （`GET /chat/{库}/{会话}/turns`）。两条路渲染的是同一份数据，所以看到的东西一模一样：
+  引用、图片、版本徽章都在这里定形态，页面里不再拼第二遍。
+#}
+{% if error %}
+<p class="mb-4 rounded border border-red-300 bg-red-50 px-4 py-3 text-sm text-red-800">{{ error }}</p>
+{% endif %}
+
+{% for turn in turns %}
+{% if turn.role == "user" %}
+<article class="ml-auto max-w-[85%] rounded-lg bg-slate-900 px-4 py-2 text-sm text-white">
+  {{ turn.content }}
+</article>
+{% else %}
+<article class="max-w-[95%] rounded-lg border border-slate-200 bg-white px-4 py-3">
+  <div class="mb-2 flex flex-wrap items-center gap-2 text-xs text-slate-500">
+    <span>回答</span>
+    {% if turn.version %}
+    {# 版本徽章：这一轮是按哪个版本检索的。空串表示没定下来（不过滤版本）。 #}
+    <span class="rounded bg-slate-100 px-1.5 py-0.5">版本 {{ turn.version }}</span>
+    {% endif %}
+  </div>
+
+  <p class="text-sm leading-relaxed whitespace-pre-wrap">{{ turn.content }}</p>
+
+  {% if turn.citations %}
+  <details class="mt-3 text-xs">
+    <summary class="cursor-pointer text-slate-500">来源 {{ turn.citations | length }} 条</summary>
+    <ol class="mt-2 space-y-1">
+      {% for citation in turn.citations %}
+      <li class="text-slate-600">
+        <span class="text-slate-400">[{{ citation.index }}]</span>
+        <span class="font-medium">{{ citation.doc_title }}</span>
+        {% if citation.ancestor_path %}
+        <span class="text-slate-400">·</span> {{ citation.ancestor_path }}
+        {% endif %}
+      </li>
+      {% endfor %}
+    </ol>
+  </details>
+  {% endif %}
+
+  {% if turn.images %}
+  <div class="mt-3 flex flex-wrap gap-2">
+    {% for image in turn.images %}
+    <a href="{{ image.url }}" target="_blank" rel="noopener">
+      <img src="{{ image.url }}" alt="{{ image.name }}"
+           class="max-h-40 rounded border border-slate-200">
+    </a>
+    {% endfor %}
+  </div>
+  {% endif %}
+</article>
+{% endif %}
+{% else %}
+<p class="rounded border border-dashed border-slate-300 bg-white px-4 py-6 text-center text-sm text-slate-500">
+  还没有问过。下面问一句试试。
+</p>
+{% endfor %}
+
+{# 正在流的那一轮先长在这里：进度一行、正文一段。答完之后整块被服务端重渲染的结果换掉，
+   所以这里不必也不该拼引用与图片——那些由 templates/partials/turns.html 上面的部分负责。 #}
+<div id="live" class="hidden max-w-[95%] rounded-lg border border-slate-200 bg-white px-4 py-3">
+  <div id="live-status" class="mb-1 text-xs text-slate-500"></div>
+  <p id="live-text" class="text-sm leading-relaxed whitespace-pre-wrap"></p>
+</div>
