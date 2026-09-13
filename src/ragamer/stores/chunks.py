@@ -356,8 +356,15 @@ class MilvusChunkStore:
         return [_hit(row) for row in rows]
 
     def fetch_document(self, game_id: str, doc_title: str, *, version: str) -> list[Chunk]:
-        rows = self._client().query(
-            collection_name=collection_name(game_id),
+        client = self._client()
+        name = collection_name(game_id)
+        if not client.has_collection(name, timeout=self._timeout):
+            # 这个库还什么都没导进来过。没有表就是没有切片，如实返回空——直接查会把
+            # 供应商的异常漏给调用方，而内存假件在这条路径上返回的是空列表。
+            # 切分预览页可以直接翻一个空库，靠的就是这一条。
+            return []
+        rows = client.query(
+            collection_name=name,
             filter=filter_expression(ChunkFilter(doc_title=doc_title, version=version)),
             output_fields=list(SCALAR_FIELDS),
             timeout=self._timeout,

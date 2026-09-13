@@ -64,11 +64,14 @@ class FakeMilvusClient:
     rows: ClassVar[list[dict[str, Any]]] = []
     #: `search` / `hybrid_search` 的返回（外层那圈是"每个查询一路"）
     hits: ClassVar[list[dict[str, Any]]] = []
+    #: 开连之前就预置成「已经存在的表」。默认空——多数用例要看着表被建出来，
+    #: 查询与删除那几条要的是「表已经在」，用 `existing` fixture 预置。
+    existing: ClassVar[set[str]] = set()
 
     def __init__(self, **kwargs: Any) -> None:
         self.init_kwargs = kwargs
         self.calls: list[tuple[str, dict[str, Any]]] = []
-        self.collections: set[str] = set()
+        self.collections: set[str] = set(self.existing)
         #: 每次调用时的连接上下文（真客户端是把 db_name 塞进每条 RPC 的）
         self.context: list[tuple[str, str]] = []
         self.db_name = ""
@@ -80,6 +83,7 @@ class FakeMilvusClient:
         cls.databases = ["default"]
         cls.rows = []
         cls.hits = []
+        cls.existing = set()
 
     def _record(self, name: str, **kwargs: Any) -> None:
         self.calls.append((name, kwargs))
@@ -147,6 +151,17 @@ def milvus(monkeypatch: pytest.MonkeyPatch) -> type[FakeMilvusClient]:
     FakeMilvusClient.reset()
     monkeypatch.setattr(chunks, "MilvusClient", FakeMilvusClient)
     return FakeMilvusClient
+
+
+@pytest.fixture
+def existing(milvus: type[FakeMilvusClient]) -> type[FakeMilvusClient]:
+    """预置「black_myth 这张表已经在」。
+
+    `fetch_document` 会先问一句有没有这张表（没有就如实返回空，见适配器里的说明），
+    所以查询与删除那几条用例得先让假件知道表在。
+    """
+    milvus.existing.add("black_myth")
+    return milvus
 
 
 @pytest.fixture
@@ -299,7 +314,7 @@ def test_database_已存在时不重复创建(store, milvus):
 DATA_CALLS = {"create_collection", "has_collection", "upsert", "search", "hybrid_search", "query"}
 
 
-def test_每条数据路径都落在配置的_database_上(store, milvus):
+def test_每条数据路径都落在配置的_database_上(store, existing):
     """切库只做在 ensure_collection 里的话，没先建表的那条路径会静默落进 default。
 
     这是静默失效：数据写进了与原项目共用的库，本地看着一切正常。
@@ -310,7 +325,7 @@ def test_每条数据路径都落在配置的_database_上(store, milvus):
     store.ensure_collection("black_myth")
     store.drop("black_myth")
 
-    contexts = [db for call, db in _client(milvus).context if call in DATA_CALLS]
+    contexts = [db for call, db in _client(existing).context if call in DATA_CALLS]
 
     assert contexts, "一条数据调用都没记到，测试本身失效了"
     assert set(contexts) == {"ragamer-test"}
@@ -443,27 +458,35 @@ def test_行里没有主键时明确报错(store, milvus):
         store.search("black_myth", dense=fake_vector(7))
 
 
-def test_空数组回_None_也当空处理(store, milvus):
+def test_空数组回_None_也当空处理(store, existing):
     row = _row_of(make_chunk(1))
     row["subject_type"] = None
-    milvus.rows = [row]
+    existing.rows = [row]
 
     assert store.fetch_document("black_myth", "二郎神", version="1.0")[0].subject_type == ()
 
 
-def test_取一份文档的切片按顺序返回(store, milvus):
-    milvus.rows = [_row_of(make_chunk(index)) for index in (2, 0, 1)]
+def test_取一份文档的切片按顺序返回(store, existing):
+    existing.rows = [_row_of(make_chunk(index)) for index in (2, 0, 1)]
 
     chunks_ = store.fetch_document("black_myth", "二郎神", version="1.0")
 
     assert [chunk.chunk_index for chunk in chunks_] == [0, 1, 2]
-    call = _client(milvus).called("query")[0]
+    call = _client(existing).called("query")[0]
     assert call["filter"] == 'version in ["1.0", ""] and doc_title == "二郎神"'
 
 
-def test_按文档删只删这个版本的切片(store, milvus):
+def test_表还没建起来时取文档返回空_而不是把供应商的异常漏出去(store, milvus):
+    """切分预览页可以直接翻一个空库：没有表就是没有切片，如实说，不报错。"""
+    chunks_ = store.fetch_document("black_myth", "二郎神", version="1.0")
+
+    assert chunks_ == []
+    assert _client(milvus).called("query") == []
+
+
+def test_按文档删只删这个版本的切片(store, existing):
     """重导 1.0 版不该连带删掉未标注版本——那是「新版本与旧版本并存」要留的（ADR-0004）。"""
-    milvus.rows = [
+    existing.rows = [
         _row_of(make_chunk(1, chunk_index=0, version="1.0")),
         _row_of(make_chunk(2, chunk_index=1, version="1.0")),
         _row_of(make_chunk(3, chunk_index=0, version=UNVERSIONED)),
@@ -472,20 +495,20 @@ def test_按文档删只删这个版本的切片(store, milvus):
 
     store.delete_document("black_myth", "二郎神", version="1.0")
 
-    assert _client(milvus).called("delete") == [
+    assert _client(existing).called("delete") == [
         {"collection_name": "black_myth", "ids": [1, 2], "timeout": 2.5}
     ]
 
 
-def test_按文档删时查回来的一批不带版本过滤之外的口径(store, milvus):
+def test_按文档删时查回来的一批不带版本过滤之外的口径(store, existing):
     """查询那一趟仍走既有的表达式生成，删除不另开一个转义点。"""
-    milvus.rows = []
+    existing.rows = []
 
     store.delete_document("black_myth", "二郎神", version="1.0")
 
-    call = _client(milvus).called("query")[0]
+    call = _client(existing).called("query")[0]
     assert call["filter"] == 'version in ["1.0", ""] and doc_title == "二郎神"'
-    assert _client(milvus).called("delete") == []
+    assert _client(existing).called("delete") == []
 
 
 def test_删库是幂等的(store, milvus):
