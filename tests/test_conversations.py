@@ -20,10 +20,10 @@ from ragamer.api import KB_COLLECTION
 from ragamer.conversations import (
     HISTORY_TURNS,
     Chat,
-    Cited,
     Conversation,
     ConversationNotFound,
     Delta,
+    Sources,
 )
 from ragamer.llm import FakeLlm, LlmTimeout
 from ragamer.vectors.fake import FakeReranker
@@ -199,7 +199,7 @@ def test_客户端中途断开时不留半个答案():
     conversation = chat.start(game_id=GAME)
 
     replies = chat.ask(conversation.session_id, "那它掉什么")
-    assert isinstance(next(replies), Cited)
+    assert isinstance(next(replies), Sources)
     assert isinstance(next(replies), Delta)  # 已经吐了一片出去
     replies.close()  # 客户端在这时候断了
 
@@ -263,7 +263,7 @@ def test_检索不到时那句明确回复也进历史():
 
     replies = list(chat.ask(conversation.session_id, "不存在的东西怎么打"))
 
-    assert [reply.citations for reply in replies if isinstance(reply, Cited)] == [()]
+    assert [reply.citations for reply in replies if isinstance(reply, Sources)] == [()]
     assert [turn.content for turn in chat.open(conversation.session_id).turns] == [
         "不存在的东西怎么打",
         NOT_FOUND,

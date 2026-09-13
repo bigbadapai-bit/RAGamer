@@ -32,7 +32,14 @@ from pydantic import BaseModel
 
 from ragamer.answering import Answerer, Citation
 from ragamer.container import Container
-from ragamer.conversations import Chat, Cited, Conversation, ConversationNotFound, Reply
+from ragamer.conversations import (
+    Chat,
+    Conversation,
+    ConversationNotFound,
+    Game,
+    Reply,
+    Sources,
+)
 from ragamer.importing import STAGE_LABELS, Importer, ImportResult, ProgressEvent
 from ragamer.llm import LlmError
 from ragamer.logging import get_logger
@@ -108,7 +115,8 @@ def create_app(container: Container) -> FastAPI:
         会话 id 由服务端生成并返回，之后的两次请求都带着它。
         """
         _kb_document(container, payload.game_id)
-        return _conversation_payload(chat.start(game_id=payload.game_id, version=payload.version))
+        conversation = chat.start(game_id=payload.game_id, version=payload.version)
+        return _conversation_payload(conversation)
 
     @app.get("/api/chat/sessions/{session_id}")
     def read_session(session_id: str) -> dict[str, Any]:
@@ -126,9 +134,15 @@ def create_app(container: Container) -> FastAPI:
         走 GET 是给浏览器原生的 `EventSource` 留的路——它只会发 GET（架构文档 §5 允许
         对话页那一小块用它）。**客户端收到 `done` 之后必须 `close()`**，理由见 :data:`SSE_RETRY`。
 
-        会话不存在与问题为空都在**开流之前**判掉：这两个都能给出正常的 HTTP 状态码，
-        不该伪装成流里的一条错误事件。检索与生成的失败发生在开流之后，只能走 `error` 事件
-        ——那时响应头已经发出去了，状态码改不了。
+        看着别扭是承认的：**这一条 GET 带写库副作用**（答完要落一轮历史），而「GET 是安全
+        方法」正是浏览器敢自动重连的前提。两个约束撞在一起——`EventSource` 只会发 GET，
+        而这一轮问答又必须写进去——取的是前者。页面若改用 `fetch` 读流就不必受这条约束，
+        :data:`SSE_RETRY` 那行也就可以不看。
+
+        失败分两段，**以「流开没开」为界**：会话不存在、问题为空、检索炸了都发生在
+        `chat.ask` 返回之前（理解、检索、精排都是急切跑的），所以还能给出正常的 HTTP
+        状态码——404 / 400 / 500。开了流之后才失败的（模型在生成中途挂掉）只剩 `error`
+        事件这一条路：响应头那时已经发出去了，状态码改不了。
 
         这一层**不等正文**：返回的是个还没开始跑的生成器，读正文由 ASGI 那边拉。
         端点本身是同步的，FastAPI 会把它放进线程池——检索与生成都是阻塞调用，
@@ -173,13 +187,15 @@ def _events(replies: Iterator[Reply]) -> Iterator[str]:
     「模型挂了」只能以 `error` 收尾。收不到 `done` 就是这一轮没有正常结束——会话里
     相应地什么都没写（见 `ragamer.conversations`）。
 
-    消费方中途断开时这里走不到 `done`：`GeneratorExit` 不是 `Exception`，下面那个
-    `except` 接不住它，它会一路把上游那个生成器也关掉，这一轮于是不留痕迹。
+    **兜住「断开不留痕」的不是这里，是落库的时机**：会话只在正文全部收完之后才写，
+    所以流在半路停住时它一个字都没写。消费方把生成器丢掉时，这里收到的是
+    `GeneratorExit`——它不是 `Exception`，下面那个 `except` 接不住它，于是它一路把
+    上游那个生成器也关掉，模型那边的请求跟着结束。
     """
     yield SSE_RETRY
     try:
         for reply in replies:
-            if isinstance(reply, Cited):
+            if isinstance(reply, Sources):
                 payload = {"citations": [_citation_payload(item) for item in reply.citations]}
                 yield _event("citations", payload)
             else:
@@ -238,7 +254,7 @@ def _kb_document(container: Container, game_id: str) -> dict[str, Any]:
     if payload is None:
         raise HTTPException(
             status_code=404,
-            detail=f"知识库 {game_id} 不存在。先在知识库管理里建一个，再导入资料",
+            detail=f"知识库 {game_id} 不存在。先在知识库管理里建一个",
         )
     return payload
 
@@ -259,7 +275,7 @@ def _vocabulary(container: Container, game_id: str) -> TagVocabulary:
         ) from exc
 
 
-def _games(container: Container) -> tuple[tuple[str, str], ...]:
+def _games(container: Container) -> tuple[Game, ...]:
     """游戏候选：`(显示名, 知识库 id)`。
 
     候选值必须是**用户问句里会出现的那种写法**。知识库 id 同时是 Milvus 的 collection 名，

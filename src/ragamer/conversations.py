@@ -18,11 +18,16 @@
   一条等不到回复的提问。引用只跟着**完整的**正文走——半截答案配一份完整的引用列表，
   指向的是正文里根本没写到的来源（`docs/ARCHITECTURE.md` §5 的对话页靠这份记录
   做「刷新后还在」）。
+  **代价是那一问也跟着没了**，用户得重问一次；这是有意选的一侧——反过来（先把问题写进去、
+  答案回头再补）会留下一个「问了但没答」的中间态，而刷新页面最容易撞上的就是它，
+  下一轮的提问理解也会拿到一段半截上下文。
 - **一问一答各占一条**，不是一次提问写一份。按轮存的话，展示侧要自己拆轮次，
   而拆法迟早会和 :data:`HISTORY_TURNS` 那条口径打起来。
 
-会话绑定一个知识库（`game_id`：建会话时选的游戏），版本可以落在会话上，
-也可以每次提问时临时点名。
+会话绑定一个知识库（`game_id`：建会话时选的游戏），版本可以落在会话上，也可以每次提问时
+临时点名。**这个库是落点不是牢笼**：问题里点名了另一个真实存在的库时，这一轮就去那儿查
+（`ragamer.query.understand` 判得出来时优先用它）——那一步本来就在判问的是哪款游戏，
+判出来却不用，等于把它接了个空。会话绑的那个不变，下一轮没点名就还回到它上面。
 """
 
 from __future__ import annotations
@@ -32,7 +37,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 from typing import Any, Literal
 
-from ragamer.answering import Answerer, AnswerStream, Citation
+from ragamer.answering import Answerer, AnswerStream, Citation, require_question
 from ragamer.llm import LlmClient, Message
 from ragamer.logging import get_logger
 from ragamer.query import understand
@@ -91,12 +96,19 @@ class ConversationNotFound(LookupError):
     """
 
 
+#: 游戏候选的一项是**一对**：显示名 → 知识库 id（见 :meth:`Chat.ask` 的 `games`）。
+#: 两个都是字符串，顺序从签名上看不出来，所以起个名字、每次都带注释地传。
+Game = tuple[str, str]
+
+
 @dataclass(frozen=True)
-class Cited:
+class Sources:
     """这一轮用到的来源。**流的第一件事**。
 
     引用在检索那一步就定下来了，比正文早得多。先把它交出去，界面才能一边吐字一边
-    把来源列出来，而不是等正文吐完再闪一下。
+    把来源列出来，而不是等正文吐完再闪一下。名字取「来源」而不是「引用」：后者是
+    `ragamer.answering` 里那个 :class:`~ragamer.answering.Citation` 的名字，
+    一个是对外的一批、一个是里面的一条，两个词分开用免得读岔。
     """
 
     citations: tuple[Citation, ...]
@@ -109,8 +121,8 @@ class Delta:
     text: str
 
 
-#: 一次提问流出来的东西：先一个 :class:`Cited`，然后若干个 :class:`Delta`。
-Reply = Cited | Delta
+#: 一次提问流出来的东西：先一个 :class:`Sources`，然后若干个 :class:`Delta`。
+Reply = Sources | Delta
 
 
 @dataclass(frozen=True)
@@ -158,9 +170,9 @@ class Chat:
         *,
         version: str = "",
         current_version: str = "",
-        games: Sequence[tuple[str, str]] = (),
+        games: Sequence[Game] = (),
     ) -> Iterator[Reply]:
-        """问一句，逐字拿回答案：先一个 :class:`Cited`，再若干个 :class:`Delta`。
+        """问一句，逐字拿回答案：先一个 :class:`Sources`，再若干个 :class:`Delta`。
 
         **改写与检索在调用时就跑完**（所以问题为空、检索炸了都在这里当场报出来，
         还没开始吐字），返回的那个迭代器只管生成与落库。分成两段是为了让「开流之前」
@@ -181,17 +193,16 @@ class Chat:
         :param question: 用户的原话。写进会话的是它，不是改写之后那一句。
         :param version: 这次点名按哪个版本检索。空串即回落会话选定的那一个。
         :param current_version: 知识库标着的现行版本，会话与点名都没有时才轮到它。
-        :param games: 游戏候选，形如 `(显示名, 知识库 id)`。**显示名是用户问句里会出现
-            的那种写法**——知识库 id 是 collection 名，只能是英文标识符，拿 id 当候选，
-            模型只会把「黑神话」判成不在候选里。判出来的显示名在这里换回 id；
-            没有候选、或者判不出来，都回落会话选定的知识库。
+        :param games: 游戏候选（:data:`Game`，显示名与知识库 id 成对）。**显示名是用户
+            问句里会出现的那种写法**——知识库 id 是 collection 名，只能是英文标识符，
+            拿 id 当候选，模型只会把「黑神话」判成不在候选里。判出来的显示名在这里换回
+            id；没有候选、或者判不出来，都回落会话选定的知识库。
         :raises ConversationNotFound: 没有这个会话。
         :raises ValueError: 问题为空。空问题会让检索查出任意一批切片。
         :raises ragamer.llm.LlmError: 生成失败。已经吐出去的正文收不回来，
             调用方应当把这一轮整个丢掉——这一层保证它不会被写进会话。
         """
-        if not question.strip():
-            raise ValueError("问题不能为空：空问题会让检索查出任意一批切片，答案也就是编的")
+        require_question(question)  # 拦在理解那一步之前：空问题没得可理解，别白调一次模型
         conversation = self.open(session_id)
         understanding = understand(
             question,
@@ -225,7 +236,7 @@ class Chat:
         迭代器被丢掉时（客户端断开）这里会收到 `GeneratorExit`，最后那一行写不进会话——
         这正是要的效果：已经吐出去的那半句与它那批引用一起消失，历史里不留痕迹。
         """
-        yield Cited(stream.citations)
+        yield Sources(stream.citations)
         produced: list[str] = []
         for piece in stream.deltas:
             produced.append(piece)
@@ -243,7 +254,7 @@ def _history(turns: Sequence[Turn]) -> tuple[Message, ...]:
     return tuple(Message(turn.role, turn.content) for turn in turns[-HISTORY_TURNS * 2 :])
 
 
-def _game_id(picked: str, games: Sequence[tuple[str, str]]) -> str:
+def _game_id(picked: str, games: Sequence[Game]) -> str:
     """理解那一步判出的显示名换回知识库 id。判不出来就留空，由调用方回落。
 
     `understand` 已经把候选之外的取值丢掉了，所以这里对不上只剩一种可能：

@@ -146,8 +146,12 @@ class AnswerStream:
     deltas: Iterator[str]
 
 
-def _require_question(question: str) -> None:
-    """空问题会让检索查出任意一批切片，答案也就是编的。两条路都在最前面拦它。"""
+def require_question(question: str) -> None:
+    """空问题会让检索查出任意一批切片，答案也就是编的。
+
+    两条路都在最前面拦它。**对外**是因为会话那一步也得在调模型之前先拦一次
+    （晚一步就白花一次提问理解的调用），而文案只有这一份——`ragamer.conversations`。
+    """
     if not question.strip():
         raise ValueError("问题不能为空：空问题会让检索查出任意一批切片，答案也就是编的")
 
@@ -208,7 +212,7 @@ class Answerer:
         :raises ValueError: 问题为空。空问题会让检索查出任意一批切片。
         :raises ragamer.llm.LlmError: 生成失败。没有答案就是没有答案，不降级。
         """
-        _require_question(question)
+        require_question(question)
         sources = self._sources(
             question, game_id=game_id, version=version, current_version=current_version
         )
@@ -243,7 +247,7 @@ class Answerer:
         :raises ragamer.llm.LlmError: 生成失败。`deltas` 迭代到一半才炸是常事——
             这时已经吐出去的内容是收不回的，调用方应当把整轮丢掉而不是记半句。
         """
-        _require_question(question)
+        require_question(question)
         sources = self._sources(
             question, game_id=game_id, version=version, current_version=current_version
         )
