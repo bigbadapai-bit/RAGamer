@@ -36,6 +36,10 @@ def describe(settings: Settings) -> str:
             f" secure={settings.minio.secure} access_key=已配置 secret_key=已配置",
             f"llm: base_url={redact_address(settings.llm.base_url)} model={settings.llm.model}"
             " api_key=已配置",
+            f"mineru: base_url={redact_address(settings.mineru.base_url)}"
+            f" model_version={settings.mineru.model_version}"
+            f" poll_interval={settings.mineru.poll_interval_seconds:g}"
+            f" poll_timeout={settings.mineru.poll_timeout_seconds:g} api_key=已配置",
             f"models: device={settings.models.device} fp16={settings.models.fp16}",
             f"embed: model={settings.embed.model} batch_size={settings.embed.batch_size}"
             f" max_length={settings.embed.max_length}",

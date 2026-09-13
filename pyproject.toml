@@ -21,12 +21,19 @@ dependencies = [
     "fastapi>=0.115",
     # 上面那个的 multipart 解析：导入端点收的是上传的文件
     "python-multipart>=0.0.20",
+    # 页面模板。fastapi 自己不依赖它，要渲染模板得显式声明
+    "jinja2>=3.1",
+    # 起界面的那个 ASGI 服务器（`ragamer-web` 命令）。测试用 TestClient，不走它
+    "uvicorn>=0.30",
     # minio 的传输层就是 urllib3；要自定义 PoolManager 才能设连接超时并关掉重试
     "urllib3>=2.0",
 ]
 
 [project.scripts]
 ragamer = "ragamer.__main__:main"
+# 起界面与后端的本地服务。与上一条分开：自检是「配置对不对」的快速检查，
+# 不该因为要开界面而多花一次启动时间；而开界面又必须先过自检。
+ragamer-web = "ragamer.app:main"
 
 [project.optional-dependencies]
 # 真实向量化模型（BGE-M3 与长上下文 reranker）。它拉进 torch 与 transformers，
@@ -50,6 +57,8 @@ packages = ["src/ragamer"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# tools/ 下的实验脚本不进包，但它的口径（哪种图片条目算「有图无字」）要能测
+pythonpath = ["tools"]
 markers = [
     "integration: 需要真实云端与真实模型，默认不跑",
 ]

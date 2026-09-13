@@ -57,6 +57,12 @@ def test_每个配置键都能从环境变量读入(settings_env):
     assert settings.llm.max_attempts == 5
     assert settings.llm.backoff_base == 0.25
     assert settings.llm.backoff_max == 4.0
+    assert settings.mineru.base_url == "https://mineru.test"
+    assert settings.mineru.api_key.get_secret_value() == "test-mineru-api-key"
+    assert settings.mineru.model_version == "pipeline"
+    assert settings.mineru.poll_interval_seconds == 0.5
+    assert settings.mineru.poll_timeout_seconds == 30.0
+    assert settings.mineru.request_timeout_seconds == 12.5
     assert settings.models.device == "cuda:1"
     assert settings.models.fp16 is True
     assert settings.embed.model == "test-embed-model"
@@ -77,6 +83,11 @@ def test_未给出可选项时取默认值(settings_env, monkeypatch):
         "RAGAMER_LLM_MAX_ATTEMPTS",
         "RAGAMER_LLM_BACKOFF_BASE",
         "RAGAMER_LLM_BACKOFF_MAX",
+        "RAGAMER_MINERU_BASE_URL",
+        "RAGAMER_MINERU_MODEL_VERSION",
+        "RAGAMER_MINERU_POLL_INTERVAL_SECONDS",
+        "RAGAMER_MINERU_POLL_TIMEOUT_SECONDS",
+        "RAGAMER_MINERU_REQUEST_TIMEOUT_SECONDS",
         "RAGAMER_MODELS_DEVICE",
         "RAGAMER_MODELS_FP16",
         "RAGAMER_EMBED_BATCH_SIZE",
@@ -96,6 +107,13 @@ def test_未给出可选项时取默认值(settings_env, monkeypatch):
     assert settings.llm.backoff_base == 0.5
     assert settings.llm.backoff_max == 8.0
     # 默认落在 CPU 与单精度上：这台机器上不一定有 GPU，CPU 上也用不了半精度
+    assert settings.mineru.base_url == "https://mineru.net"
+    # 默认 vlm：只有它默认带图内文字分析，pipeline 拿到图是一片空白（§1.2）
+    assert settings.mineru.model_version == "vlm"
+    # 原项目标定过的轮询间隔与总时长上限：到点报错，不无限等
+    assert settings.mineru.poll_interval_seconds == 3.0
+    assert settings.mineru.poll_timeout_seconds == 600.0
+    assert settings.mineru.request_timeout_seconds == 300.0
     assert settings.models.device == "cpu"
     assert settings.models.fp16 is False
     assert settings.embed.batch_size == 8
@@ -136,6 +154,26 @@ def test_重试次数与超时超出可接受范围时报错并指出键名(sett
         load_settings(env_file=None)
 
     assert key in str(excinfo.value)
+
+
+def test_mineru_的取值非法时报错并指出键名(settings_env, monkeypatch):
+    """后端名写错、轮询上限给成天文数字：两个都会让整条导入链路静默跑偏。"""
+    monkeypatch.setenv("RAGAMER_MINERU_MODEL_VERSION", "vlm2")
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_settings(env_file=None)
+
+    assert "RAGAMER_MINERU_MODEL_VERSION" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("value", ["0", "-3", "永远"])
+def test_mineru_轮询上限非法时报错(settings_env, monkeypatch, value):
+    monkeypatch.setenv("RAGAMER_MINERU_POLL_TIMEOUT_SECONDS", value)
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_settings(env_file=None)
+
+    assert "RAGAMER_MINERU_POLL_TIMEOUT_SECONDS" in str(excinfo.value)
 
 
 def test_milvus_的库名不能叫_default(settings_env, monkeypatch):
@@ -349,6 +387,7 @@ def test_必需的是凭据与地址_有默认值的不在其中():
         "RAGAMER_MONGO_URI",
         "RAGAMER_MINIO_SECRET_KEY",
         "RAGAMER_LLM_API_KEY",
+        "RAGAMER_MINERU_API_KEY",
     } <= required
     assert not required & {
         "RAGAMER_LOG_LEVEL",

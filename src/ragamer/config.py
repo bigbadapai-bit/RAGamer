@@ -96,6 +96,27 @@ class LlmSettings(BaseModel):
     backoff_max: float = Field(default=8.0, gt=0, le=120)
 
 
+class MineruSettings(BaseModel):
+    """MinerU 云端解析：PDF 与图片 → Markdown（docs/ARCHITECTURE.md §1.1）。
+
+    三个上限都是「不无限等」的落点：单次请求、轮询间隔、轮询总时长。任务本身失败
+    （`state == failed`）当场抛错，不等满时长——那是失败，不是还没好。
+    """
+
+    #: 服务地址。批量上传解析接口挂在它下面的 `/api/v4`
+    base_url: NonEmptyStr = "https://mineru.net"
+    api_key: NonEmptySecret
+    #: 解析后端。**默认 vlm 是有意的**：图内文字的分析只有 vlm 才默认开着（§1.2）
+    model_version: Literal["pipeline", "vlm", "MinerU-HTML"] = "vlm"
+    #: 轮询间隔（秒）。再密也只是空转，原项目标定的是 3 秒
+    poll_interval_seconds: Annotated[float, Field(gt=0, le=60)] = 3.0
+    #: 轮询的总时长上限（秒）。到点还没完就报错，原项目标定的是 600 秒
+    poll_timeout_seconds: Annotated[float, Field(gt=0, le=3600)] = 600.0
+    #: 单次 HTTP 请求的超时（秒）。上传与下载都是几十上百 MB，不能用几秒的默认值——
+    #: 接口自己的上限是 200MB，按 1MB/s 估要 200 秒，故留到 300
+    request_timeout_seconds: Annotated[float, Field(gt=0, le=3600)] = 300.0
+
+
 class ModelSettings(BaseModel):
     """向量化与精排**共用**的加载参数。
 
@@ -162,6 +183,7 @@ class Settings(BaseSettings):
     mongo: MongoSettings
     minio: MinioSettings
     llm: LlmSettings
+    mineru: MineruSettings
     # 三个模型配置组都有完整默认值：不配也能跑，配了才落进 .env
     models: ModelSettings = Field(default_factory=ModelSettings)
     embed: EmbedSettings = Field(default_factory=EmbedSettings)

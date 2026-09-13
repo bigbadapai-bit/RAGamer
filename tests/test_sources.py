@@ -12,11 +12,18 @@ from ragamer.sources import (
     ImageEnricher,
     MarkdownParser,
     NormalizedDoc,
+    ParserRouter,
+    SourceAsset,
     SourceDocument,
     SourceError,
     SourceParser,
     UnsupportedSourceError,
+    image_refs,
+    publish_assets,
+    rewrite_image_refs,
 )
+from ragamer.stores.base import image_key, image_prefix
+from ragamer.stores.memory import InMemoryObjectStore
 
 PARSER = MarkdownParser()
 
@@ -106,3 +113,150 @@ def test_补图的协议进出都是归一化文档():
             return doc
 
     assert isinstance(Passthrough(), ImageEnricher)
+
+
+# --- 图片引用的两种形式 ---
+
+
+def test_HTML_形式引用的图片也认():
+    """MinerU 把表格内嵌的图片导成 `<img>`，只认 Markdown 会静默漏掉它们。"""
+    doc = PARSER.parse(markdown('<table><tr><td><img src="images/info.png"/></td></tr></table>'))
+
+    assert doc.images == ("images/info.png",)
+
+
+def test_两种形式的引用按出现顺序排():
+    text = '![甲](a.png)\n\n<img src="b.png">\n\n![乙](c.png)\n'
+
+    assert image_refs(text) == ("a.png", "b.png", "c.png")
+
+
+def test_没有_src_的_img_不算引用():
+    assert image_refs('<img class="icon" alt="图">') == ()
+
+
+def test_换掉两种形式的引用():
+    text = '![甲](a.png)\n\n<img src="b.png">\n'
+
+    assert rewrite_image_refs(text, {"a.png": "K1", "b.png": "K2"}) == (
+        '![甲](K1)\n\n<img src="K2">\n'
+    )
+
+
+def test_认不出的引用原样留着并留一条痕(caplog):
+    """静默留着就是答案里一条坏图，还没人知道为什么；抛错又太重——一张图不该毁一份资料。"""
+    text = "![甲](a.png)\n\n![乙](b.png)\n"
+
+    with caplog.at_level("WARNING"):
+        rewritten = rewrite_image_refs(text, {"a.png": "K1"})
+
+    assert rewritten == "![甲](K1)\n\n![乙](b.png)\n"
+    assert "b.png" in caplog.text
+
+
+# --- 按扩展名挑适配器 ---
+
+
+class StubParser:
+    """只认一种扩展名的假适配器：回什么由构造时给。"""
+
+    def __init__(self, suffixes: tuple[str, ...], markdown: str) -> None:
+        self.SUFFIXES = suffixes
+        self.markdown = markdown
+
+    def parse(self, source: SourceDocument) -> NormalizedDoc:
+        return NormalizedDoc(markdown=f"{self.markdown}:{source.filename}")
+
+
+def test_按扩展名把资料交给对应的适配器():
+    router = ParserRouter((StubParser((".md",), "md"), StubParser((".pdf",), "pdf")))
+
+    assert router.parse(markdown("正文", "a.md")).markdown == "md:a.md"
+    assert router.parse(SourceDocument("a.pdf", b"%PDF")).markdown == "pdf:a.pdf"
+
+
+def test_扩展名大小写不敏感():
+    router = ParserRouter((StubParser((".md",), "md"),))
+
+    assert router.parse(markdown("正文", "A.MD")).markdown == "md:A.MD"
+
+
+def test_不认识的格式点名全部认得的扩展名():
+    router = ParserRouter((MarkdownParser(), StubParser((".pdf",), "pdf")))
+
+    with pytest.raises(UnsupportedSourceError) as excinfo:
+        router.parse(SourceDocument("a.docx", b"x"))
+
+    message = str(excinfo.value)
+    assert "a.docx" in message
+    assert ".md" in message
+    assert ".pdf" in message
+
+
+def test_一个适配器都没有的_router_当场报错():
+    with pytest.raises(ValueError):
+        ParserRouter(())
+
+
+def test_两个适配器认领同一个扩展名时当场报错():
+    """先命中的那个赢，另一条来源就成了摆设——而且不会有任何提示。"""
+    with pytest.raises(ValueError) as excinfo:
+        ParserRouter((StubParser((".md", ".txt"), "甲"), StubParser((".txt",), "乙")))
+
+    assert ".txt" in str(excinfo.value)
+    assert ".md" not in str(excinfo.value)  # 只点重叠的那个
+
+
+def test_路由器本身也是解析器():
+    assert isinstance(ParserRouter((MarkdownParser(),)), SourceParser)
+
+
+# --- 附件发布 ---
+
+
+def scanned_doc() -> NormalizedDoc:
+    """一份带附件的归一化文档：正文里 Markdown 与 HTML 各引用一张图。"""
+    return NormalizedDoc(
+        markdown='# 二郎神\n\n![立绘](images/a.png)\n\n<img src="images/b.png">\n',
+        images=("images/a.png", "images/b.png"),
+        content_list=(
+            {"type": "text", "text": "二郎神"},
+            {"type": "image", "img_path": "images/a.png"},
+        ),
+        assets=(
+            SourceAsset("images/a.png", b"A", "image/png"),
+            SourceAsset("images/b.png", b"B", "image/jpeg"),
+        ),
+    )
+
+
+def test_附件进对象存储_引用改指对象_key():
+    objects = InMemoryObjectStore()
+
+    published = publish_assets(scanned_doc(), objects, game_id="black_myth", digest="d1")
+
+    first = image_key("black_myth", "d1", "a.png")
+    second = image_key("black_myth", "d1", "b.png")
+    assert published.images == (first, second)
+    assert f"![立绘]({first})" in published.markdown
+    assert f'src="{second}"' in published.markdown
+    assert published.content_list[1]["img_path"] == first
+    # 附件已经发出去了，归一化文档里不再留着字节
+    assert published.assets == ()
+    assert objects.get(first) == b"A"
+    assert objects.get(second) == b"B"
+    # 对象名两级：游戏一级、来源文件一级——删库时按游戏那一级清一次就够
+    assert objects.list_keys(image_prefix("black_myth")) == sorted([first, second])
+    assert image_prefix("black_myth", "d1").startswith(image_prefix("black_myth"))
+
+
+def test_没有附件时一次也不碰对象存储():
+    class ExplodingStore:
+        """碰一下就炸：没有附件时连一次 put 都不该发生。"""
+
+        def put(self, *args: object, **kwargs: object) -> None:
+            raise AssertionError("没有附件的文档不该碰对象存储")
+
+    doc = NormalizedDoc("光有正文")
+
+    assert publish_assets(doc, ExplodingStore(), game_id="g", digest="d") is doc

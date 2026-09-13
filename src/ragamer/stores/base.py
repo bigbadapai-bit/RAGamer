@@ -262,6 +262,14 @@ class ChunkStore(Store, Protocol):
         """
         ...
 
+    def count(self, game_id: str) -> int:
+        """该游戏 collection 里的切片数。**还没建表就是 0**，不报错。
+
+        删库前的确认页用它说清「将清掉多少条」——报一个异常的话，一个空库会把
+        整条确认路径断在那里，而「0 条」本来就是一个说得通的答案。
+        """
+        ...
+
     def drop(self, game_id: str) -> None:
         """删掉该游戏的 collection。删库要清四处，这是其中一处。"""
         ...
@@ -363,3 +371,45 @@ def normalize_prefix(prefix: str) -> str:
     静默失效。列表与按前缀删共用这一个函数，前缀对不上的可能就不存在了。
     """
     return prefix.lstrip("/")
+
+
+#: 原图在对象存储里的顶层前缀。删库清原图按它下面那一级走。
+IMAGE_PREFIX = "images"
+
+
+def image_prefix(game_id: str, digest: str = "") -> str:
+    """一个游戏的原图前缀；给了 `digest` 就再收窄到这一份来源文件。
+
+    对象名分两级：游戏一级、来源文件一级。**写入与清理共用这一个函数**——
+    原项目那处坑是 list 与 put 各拼一遍前缀、两处对不上，于是清旧图静默失效；
+    这里只要两处都调它，前缀就没有对不上的余地。
+
+    清点与清理按 :func:`image_folder` 走，不必知道当初导过哪些文件。
+    """
+    return "/".join(part for part in (IMAGE_PREFIX, game_id, digest) if part)
+
+
+def image_folder(game_id: str) -> str:
+    """这个游戏的原图那一层，**带尾随斜杠**。按前缀清点与清理走它。
+
+    尾随的斜杠不是装饰：`delete_prefix` / `list_keys` 比的是**字符串前缀**，不是目录。
+    拿 `image_prefix(game_id)`（`images/black_myth`）去删，id 为 `black_myth_2` 的那个库
+    的原图会被一并收走——而且不报错，人只会在很久以后发现另一个库的图没了。
+    一游戏一 collection 要保证的正是互相隔离（ADR-0002），边界就在这里补上，
+    不指望每个调用点都记得自己加。
+    """
+    return f"{image_prefix(game_id)}/"
+
+
+def image_key(game_id: str, digest: str, name: str) -> str:
+    """一个附件的对象 key。
+
+    `digest` 取自来源文件的字节：同一份文件重导算出的 key 完全一致，图片原地覆盖，
+    与切片主键由导入侧分配（`ragamer.importing.chunk_id`）是同一套幂等思路；
+    不同文件即使同名也各有各的一层，不会互相覆盖。
+
+    **代价**：同一份资料改了内容再导，算出的 digest 变了，上一版的图片会留在旧的
+    那一层——它按游戏一级清理时一并收走（`image_folder(game_id)`）。比按文件名分层强：
+    那样两份同名不同内容的截图会互相覆盖，答案是配错图，而且不报错。
+    """
+    return f"{image_prefix(game_id, digest)}/{name}"

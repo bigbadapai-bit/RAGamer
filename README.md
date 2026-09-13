@@ -12,6 +12,7 @@
 uv sync                  # 建虚拟环境、装依赖
 cp .env.example .env     # 然后按注释把值填成自己的
 uv run ragamer           # 启动自检：配置合格、Milvus/Mongo/MinIO 都连得上才通过
+uv run ragamer-web       # 起界面：浏览器打开 http://127.0.0.1:8000
 ```
 
 退出码 `0` 通过、`2` 配置有问题、`3` 存储连不上——远端不可达时在
@@ -21,6 +22,8 @@ uv run ragamer           # 启动自检：配置合格、Milvus/Mongo/MinIO 都�
 
 | 命令 | 作用 |
 | --- | --- |
+| `uv run ragamer` | 启动自检：配置合格、Milvus/Mongo/MinIO 都连得上才通过 |
+| `uv run ragamer-web` | 起界面与后端（先跑一遍同样的自检，通了才起；默认 `127.0.0.1:8000`） |
 | `uv run pytest` | 跑测试（集成测试默认不跑，加 `-m integration` 才跑） |
 | `uv run ruff check .` | 跑 lint |
 | `uv run ruff format .` | 格式化 |
@@ -73,7 +76,8 @@ uv run pytest -m integration     # 跑真模型的集成测试（首次会下载
 
 写入侧的入口是 `POST /api/kb/{game_id}/import`——上传若干份资料、每个文件独立处理。
 四个来源先归一为 Markdown（`ragamer.sources`），之后串起补图、切分、打标、向量化与入库
-（`ragamer.importing`）。现在只接上了 md／txt 一条来源，MinerU 与网页爬虫在后面两张票里接。
+（`ragamer.importing`）。按扩展名挑适配器：md／txt 直接读，**PDF 与图片走 MinerU 云端解析**
+（`ragamer.mineru`），网页爬虫在后面一张票里接。
 
 - **一批里某个文件失败不牵连其余**：响应的 `results` 逐文件给结果，失败的那个带
   `filename`、`stage`（卡在哪一步）与 `error`。整批都失败也是 200，不是 500。
@@ -83,6 +87,29 @@ uv run pytest -m integration     # 跑真模型的集成测试（首次会下载
 - **入库的字段与建表时的显式声明一一对应**，不开动态字段。
 - 打标用的词表来自知识库元数据（MongoDB 的 `knowledge_bases` 集合，id 即游戏 id）。
   库不存在时 404，不静默按默认词表建内容。
+
+### PDF 与图片
+
+一份资料走四步：申请上传链接 → PUT 上传 → 轮询结果 → 下载结果包（`RAGAMER_MINERU_*` 那组配置）。
+
+- **不无限等**：轮询有间隔与总时长两个上限，到点报错并带上最后看到的状态；
+  任务本身 `failed` 当场抛错，不等满时长。5xx 会重试，凭据被拒不会。
+- **大文件不走系统代理**：客户端 `trust_env=False`——上传与下载都是几十上百 MB，
+  走代理会超时。
+- **凭据不外流**：Token 只发给 MinerU 的接口，上传与下载走预签名地址，单独不带它。
+- **原图进对象存储**：结果包里的图片存到 MinIO，正文与条目级结构里的引用一并改指
+  对象 key。key 是 `images/<游戏>/<来源文件摘要>/<文件名>`，**写入与清理共用
+  `ragamer.stores.base.image_key` 一个函数**——两处各拼一遍前缀就会对不上，
+  清旧图时静默失效（原项目踩过）。摘要取自来源文件的字节，所以重导同一份资料是原地覆盖。
+- **按前缀清点与清理走 `image_folder(game_id)`，它带尾随斜杠**。`delete_prefix` /
+  `list_keys` 比的是字符串前缀不是目录：拿不带斜杠的 `images/black_myth` 去删，
+  id 为 `black_myth_2` 的那个库的原图会被一并收走，而且不报错。
+- **图内文字别指望它**：MinerU 不把图片区域里的文字 OCR 成正文，这是它的产品决策
+  （见 [§1.2](docs/ARCHITECTURE.md)）。2026-09-13 用 22 张真实截图实测过：
+  **必须依赖二次 OCR 的比例是 100%**（56/56 个图片条目，两个后端完全一致），
+  二次 OCR 回填因此是必需项而不是兜底，在下一张票里接。
+  实验怎么跑的、结论与限制见 [`docs/experiments/mineru-ocr.md`](docs/experiments/mineru-ocr.md)，
+  重跑用 `uv run python tools/mineru_ocr_experiment.py <截图目录> --out …`。
 
 ## 提问理解
 
@@ -153,15 +180,59 @@ uv run pytest -m integration     # 跑真模型的集成测试（首次会下载
 （首轮问句截断，只在第一轮写一次）与 `updated_at`（每次落库刷新），查询带着投影下发到
 Mongo——几十条会话逐条读回来的话，全文都进了内存而界面只显示一行字。
 
+## 界面
+
+**FastAPI + Jinja2 + htmx，零构建步骤**——没有 npm、没有打包产物（[ADR-0005](docs/adr/0005-htmx-frontend.md)）。
+页面在 `ragamer.web`，模板跟着包走；`ragamer.app` 把 JSON 端点与页面装成同一个应用。
+
+| 路径 | 页面 |
+| --- | --- |
+| `/kb` | 知识库管理：建库（游戏 id + 显示名 + 勾选启用的主体类型）、列出已有的库 |
+| `/kb/{game_id}` | 单个库的配置：显示名、启用的主体类型、**术语映射**、**现行版本**，以及删库入口 |
+| `/kb/{game_id}/delete` | **删库确认**：逐条列出将要清理的数据与条数，勾选确认之后才删 |
+| `/import` | 导入：选库、传 md／txt、标注版本，逐文件的导入结果就地列出来 |
+| `/kb/{game_id}/preview` | **切分预览（只读）**：正文、祖先标题路径、主体类型、内容性质、来源文档 |
+| `/chat`、`/eval` | 占位，后面几张票接上 |
+
+- **禁用 JavaScript 也能用**。每条写入路径都是普通的 HTML 表单。htmx 只用在有一块明显可以
+  就地换掉的结果区的地方——导入那条路就是（表单同时带 `action`／`method` 与 `hx-post`，
+  服务端按 `HX-Request` 决定回整页还是回片段）。改配置与删库不挂 htmx：它们的结果是「这个库
+  现在是什么样」，整页重渲染本来就是对的。术语映射因此拆成「加一条／删一条」两个小表单，
+  而不是一张要靠脚本加行的表。
+- **改配置与删库一律「提交 → 重定向 → 重新渲染」**：直接回 200 的话，刷新一下就把上一次的
+  删除或改动再提交一遍。
+- **术语映射存完立即生效**：下一次导入读的就是它。只能归到这个库勾选启用的类目上——归到没
+  启用的类目那条映射永远落不进标签，页面上会把它标出来。两条叫法只差大小写或首尾空白时当场
+  报错：归一之后它们本来就是同一条，静默顶掉一条不好查。
+- **现行版本**：检索与聚合父块按它过滤（检索链路见 T14），**切分预览不带版本参数时也按它取
+  切片**——设了却看不见它在哪儿生效，那个设置就只是一行字。
+- **删库清四处**：Milvus collection + MinIO 前缀 + MongoDB（知识库配置与术语映射）+ 缓存。
+  会话与缓存两处还没有存储承载（T16／T21），接上时在 `purge_knowledge_base` 里补一行，
+  确认页那张清单也要跟着加一条。**配置排在最后删**——它是「这个库还在」的凭据，前面哪一处
+  没清干净就把它留着，界面上还能再点一次（清过的再清一次也不出错）。确认页列的是三处实际
+  会清的数据与条数，勾选之后才动手；数不出来就不让人确认。
+- **配置读不出来的库也列出来、也点得进去**。列表里藏起来的话，id 被占着，人既建不了同 id 的
+  新库，也不知道该去修哪个。它的配置页能存一次把它重建，也能整个删掉；但**改不了术语映射**
+  ——那份映射本来就没读出来，照着内存里的默认值写回去等于把它悄悄清空。
+- **切分预览页没有任何编辑入口**，它把库里存下来的东西读回来渲染。取切片走的是检索那条路
+  （`fetch_document`），所以看到的就是检索时会看见的：该版本的内容与**未标注版本**的内容一并
+  列出（[ADR-0004](docs/adr/0004-versioned-content-coexists.md)），后者挂个徽章说明来历。
+- 页面上的 Tailwind 与 htmx 走 CDN。代价是首次加载要连得上外网；连不上时页面照常能用，
+  只是没有样式、也不会局部刷新。
+
 ## 目录
 
 ```
 src/ragamer/          应用代码（config 配置装载、logging 日志、llm 语言模型适配器、sources 归一化、
-                      chunking 切分器、tagging 打标、importing 导入编排器、query 提问理解、
+                      mineru PDF 与图片的云端解析、chunking 切分器、tagging 打标、
+                      importing 导入编排器、knowledge 知识库元数据、query 提问理解、
                       retrieval 主检索路、answering 生成与引用、conversations 会话与流式、
-                      api HTTP 端点、container 组合根、__main__ 启动自检）
+                      clarifying 澄清反问、caching 答案缓存与热门问题、api JSON 端点、
+                      web 页面、app 应用装配与起服务、container 组合根、__main__ 启动自检）
 src/ragamer/stores/   存储适配器：base 协议与共享类型、chunks Milvus、documents Mongo、objects MinIO、memory 内存假件
 src/ragamer/vectors/  向量化与精排：base 协议与共享类型、bge 真实模型、fake 确定性假件
+src/ragamer/web/      页面与模板（templates/ 跟着包走，装成 wheel 也在）
 tests/                测试：行为测试 + 结构约束 + 集成测试
-docs/                 架构文档、ADR、给 agent 的说明
+tools/                一次性脚本：mineru_ocr_experiment 量图内文字提取率（不进包，需真实凭据与截图）
+docs/                 架构文档、ADR、实验记录、给 agent 的说明
 ```

@@ -87,6 +87,27 @@ CONTENT_NATURE_LABELS: Mapping[ContentNature, str] = {
     ContentNature.REVIEW: "好不好／哪个强",
 }
 
+#: 界面上的叫法，取自 CONTEXT.md 的词条名。与上面那两组 `*_LABELS` **不是一回事**：
+#: 那两组说的是「这一类覆盖哪些说法」，进提示词；这一组只是「这一类叫什么」，进界面。
+#: 界面上照抄那两组会把一整句覆盖说明塞进表格里。
+SUBJECT_TYPE_NAMES: Mapping[SubjectType, str] = {
+    SubjectType.CHARACTER: "角色",
+    SubjectType.ITEM: "物品",
+    SubjectType.PLACE: "地点",
+    SubjectType.QUEST: "任务",
+    SubjectType.SKILL: "技能",
+    SubjectType.BACKGROUND: "背景设定",
+    SubjectType.SYSTEM: "机制系统",
+}
+
+CONTENT_NATURE_NAMES: Mapping[ContentNature, str] = {
+    ContentNature.INTRO: "介绍",
+    ContentNature.WHERE: "位置与获取",
+    ContentNature.STATS: "数值",
+    ContentNature.GUIDE: "打法流程",
+    ContentNature.REVIEW: "评价推荐",
+}
+
 #: 内容性质的判定词表：标题里含哪个词就算哪一类，含几个算几个。
 #: 词之间用空格分开。表里的次序就是结果里各类的先后——越具体的越靠前，
 #: 「属性说明」这类两头都沾的标题，数值排在介绍前头。
@@ -142,6 +163,10 @@ class TagVocabulary:
             raise ValueError("至少要启用一个主体类型，否则全部切片都会漏标")
         # 叫法的比对形式在构造时定下来，查表时才不必指望调用方先洗干净
         normalized = {_normalize(term): kind for term, kind in self.term_mapping.items()}
+        if len(normalized) != len(self.term_mapping):
+            # 两条叫法只差大小写或首尾空白时，归一之后是同一条，后写的那条会静默顶掉前一条。
+            # 界面上两张行看起来都在，实际只有一条生效——在这里拦下，别让它在库里躺成谜
+            raise ValueError("术语映射里有两条叫法归一之后是同一条（只差大小写或首尾空白）")
         object.__setattr__(self, "term_mapping", normalized)
 
     @classmethod

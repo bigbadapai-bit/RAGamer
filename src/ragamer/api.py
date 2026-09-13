@@ -14,9 +14,13 @@ SSE 事件。**「这一轮算不算问完」「要不要写进历史」在 `rag
 
 知识库元数据从 MongoDB 读（`knowledge_bases` 集合，id 就是游戏 id）：打标要用的词表
 ——启用了哪些主体类型、这个游戏的术语映射——就在它里面（docs/ARCHITECTURE.md §2.3），
-检索回落哪个版本也从它取（§2.4）。知识库列表同时是**游戏候选**：给模型的是显示名，
-拿回来再换回 id，理由见 `_games`。
+检索回落哪个版本也从它取（§2.4）。形状与判断在 `ragamer.knowledge`，界面那条写入路径
+用的是同一份。知识库列表同时是**游戏候选**：给模型的是显示名，拿回来再换回 id，
+理由见 `_games`。
 本层**一个适配器都不构造**，全部来自组合根（`ragamer.container`），缝因此立得住。
+
+这是**只有 JSON 端点**的应用；给人看的页面由 `ragamer.web` 挂上去，两者在
+`ragamer.app` 里装成同一个应用。
 """
 
 from __future__ import annotations
@@ -43,6 +47,12 @@ from ragamer.conversations import (
     Status,
 )
 from ragamer.importing import STAGE_LABELS, Importer, ImportResult, ProgressEvent
+from ragamer.knowledge import (
+    KB_COLLECTION,
+    KnowledgeBase,
+    KnowledgeBaseError,
+    readable_knowledge_base,
+)
 from ragamer.llm import LlmError
 from ragamer.logging import get_logger
 from ragamer.sources import SourceDocument
@@ -51,9 +61,6 @@ from ragamer.tagging import TagVocabulary
 from ragamer.vectors.base import ModelOutputError
 
 logger = get_logger(__name__)
-
-#: 知识库元数据所在的集合，文档 id 就是游戏 id。
-KB_COLLECTION = "knowledge_bases"
 
 #: SSE 的响应头。`no-cache` 是这条流的标准要求：中间任何一层缓存住它，逐字就变成一次给全。
 SSE_HEADERS = {"Cache-Control": "no-cache"}
@@ -73,7 +80,8 @@ def create_app(container: Container) -> FastAPI:
         chunks=container.chunks,
         embedder=container.embedder,
         llm=container.llm,
-        on_progress=_log_progress,
+        parser=container.parser,
+        objects=container.objects,
     )
     chat = Chat(
         docs=container.docs,
@@ -117,7 +125,8 @@ def create_app(container: Container) -> FastAPI:
         知识库不存在当场 404——与导入端点同一个口径：那是游戏选错了。
         会话 id 由服务端生成并返回，之后的两次请求都带着它。
         """
-        _kb_document(container, payload.game_id)
+        _check_game_id(payload.game_id)
+        _knowledge_base(container, payload.game_id)
         conversation = chat.start(game_id=payload.game_id, version=payload.version)
         return _conversation_payload(conversation)
 
@@ -129,7 +138,8 @@ def create_app(container: Container) -> FastAPI:
         库里一条会话都没有时回空列表，不是 404；**「还没聊过」是正常状态**。
         知识库本身不存在则是 404，与建会话同一个口径：那是游戏选错了。
         """
-        _kb_document(container, game_id)
+        _check_game_id(game_id)
+        _knowledge_base(container, game_id)
         return _sessions_payload(game_id, chat.list_for_game(game_id))
 
     @app.get("/api/chat/sessions/{session_id}")
@@ -167,12 +177,12 @@ def create_app(container: Container) -> FastAPI:
         # 先读一次会话：不存在当场 404，顺带拿到它绑的知识库（现行版本要从那里取）。
         # `chat.ask` 自己还会再读一次，那是它的事——会话是上一次请求写下的，
         # 这一层手里这一份只用来决定「去哪个库问」。
-        knowledge = _kb_document(container, _conversation(chat, session_id).game_id)
+        knowledge = _knowledge_base(container, _conversation(chat, session_id).game_id)
         replies = chat.ask(
             session_id,
             question,
             version=version,
-            current_version=str(knowledge.get("version", "")),
+            current_version=knowledge.version,
             games=_games(container),
         )
         return StreamingResponse(
@@ -278,19 +288,17 @@ def _check_game_id(game_id: str) -> None:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-def _kb_document(container: Container, game_id: str) -> dict[str, Any]:
+def _knowledge_base(container: Container, game_id: str) -> KnowledgeBase:
     """这个知识库的元数据。**它是「当前该用哪个版本」的唯一真相来源**（ADR-0004）。
 
-    检索与聚合父块都从这里取现行版本，不各自维护一份。知识库不存在是游戏选错了，
-    当场 404，不静默按默认值把内容查一遍。
+    检索与聚合父块都从这里取现行版本，不各自维护一份。判断在 `ragamer.knowledge` 里
+    （界面那条写入路径用的是同一份），这里只把问题翻成它自带的那个状态码——库不存在 404、
+    配置读不了 422，两种问题的分法见那边的类文档。
     """
-    payload = container.docs.get(KB_COLLECTION, game_id)
-    if payload is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"知识库 {game_id} 不存在。先在知识库管理里建一个",
-        )
-    return payload
+    try:
+        return readable_knowledge_base(container.docs, game_id)
+    except KnowledgeBaseError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
 
 
 def _vocabulary(container: Container, game_id: str) -> TagVocabulary:
@@ -299,14 +307,7 @@ def _vocabulary(container: Container, game_id: str) -> TagVocabulary:
     配置里没写的项一律走默认值（全部主体类型、映射为空）——用户自定义库没配映射时
     就是这条降级路径，标签会稀疏但不会漏（docs/ARCHITECTURE.md §2.3）。
     """
-    try:
-        return TagVocabulary.from_mapping(_kb_document(container, game_id))
-    except ValueError as exc:
-        # 库里配了个不认识的主体类型：是知识库自己的数据坏了，不是这份资料的错，
-        # 也不该长成一个 500——那样界面上只会看见「服务器错误」，查无可查
-        raise HTTPException(
-            status_code=422, detail=f"知识库 {game_id} 的配置读不了：{exc}"
-        ) from exc
+    return _knowledge_base(container, game_id).vocabulary
 
 
 def _games(container: Container) -> tuple[Game, ...]:
