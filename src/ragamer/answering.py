@@ -97,6 +97,11 @@ class Citation:
     **`url` 非空即网络来源**（`origin` 那个属性就是照它判的）。分成两个字段而不是一个
     `origin` 枚举：对网络来源来说地址本来就要显示出来，而语料里的切片没有地址可给——
     一个空串与一个有值的串，比「枚举 + 可能为空的地址」少一种对不上的组合。
+
+    这个判据的边界要记住：`url` 说的是**检索期从外面搜回来的那一条**。另一条堆叠线上
+    的 `Chunk.source_url`（导入的网页）是语料自己的出处，不是网络来源——哪天要把它也
+    显示出来，这个判据就得换成显式的来源标记，否则每一份导入的网页都会变成「网络来源」，
+    而那是静默的。
     """
 
     index: int
@@ -437,8 +442,12 @@ def _sources(sources: Sequence[_Source]) -> str:
 
 
 def _mark(citation: Citation) -> str:
-    """资料清单里那一行的来路前缀。语料里查到的不标——标的是少数那一类。"""
-    return WEB_PREFIX if citation.url else ""
+    """资料清单里那一行的来路前缀。语料里查到的不标——标的是少数那一类。
+
+    判据取 `citation.origin` 而不是「url 是不是空串」：两者今天等价，但来源的判法
+    只该有一处（`Citation.origin`），在这里重写一遍就等着哪天两处对不上。
+    """
+    return WEB_PREFIX if citation.origin == "web" else ""
 
 
 def _warn_on_unknown_citations(text: str, given: int) -> None:

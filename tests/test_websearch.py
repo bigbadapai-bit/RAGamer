@@ -187,6 +187,18 @@ def test_一条结果都没有时是空列表():
     assert replying(httpx.Response(200, json=payload)).search(QUERY, limit=5) == []
 
 
+def test_没有地址的结果丢掉():
+    """地址既是引用必须给出来的东西，也是「这是网络来源」的判据
+    （`Citation.origin`）——留一条没有地址的进来，它在引用里与语料里查到的切片
+    长得一模一样，而那正是「区分标注」要防的。"""
+    payload = json.loads(json.dumps(PAYLOAD))
+    payload["data"]["webPages"]["value"].append({"name": "没有地址的一条", "summary": "正文"})
+
+    found = replying(httpx.Response(200, json=payload)).search(QUERY, limit=5)
+
+    assert [result.title for result in found] == ["1.1 版本更新公告"]
+
+
 def test_响应形状不对时返回空并留痕(caplog):
     """搜索服务改了响应结构：这不是「这次搜失败了」，是「搜成功了但一条也没解析出来」，
     要改的是适配器。留一条痕，别让它静默成「确实没搜到」。"""

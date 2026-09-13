@@ -54,6 +54,10 @@ class WebResult:
     `text` 是**搜索服务给的摘要**，不是我们自己抓的正文——理由见模块说明。
     它可能为空（有的页面没有摘要），那种结果照样交出去：标题与地址本身还算一条线索，
     而且要不要用它由生成那一步判断。
+
+    `url` **一定非空**：没有地址的结果在这一层就被丢掉了。地址既是引用必须给出来的
+    东西，也是「这是网络来源」这个判断的判据（`ragamer.answering.Citation.origin`）
+    ——留一条没有地址的进来，它在引用里与语料里查到的切片长得一模一样。
     """
 
     title: str
@@ -181,7 +185,7 @@ def _count(limit: int) -> int:
 
 
 def _results(payload: Any) -> list[WebResult]:
-    """响应体 → 结果。
+    """响应体 → 结果。**没有地址的那些丢掉**，理由见下。
 
     形状不对时返回空列表而不是抛异常：那是服务端换了版本，不是这一路该失败的理由——
     抛出去会被当成「这次搜失败了」，而实际发生的是「搜成功了但一条也没解析出来」，
@@ -196,7 +200,7 @@ def _results(payload: Any) -> list[WebResult]:
     if not isinstance(value, list):
         logger.warning("检索服务的响应里没有 %s：得改的是适配器", ".".join(_RESULTS_PATH))
         return []
-    return [_result(item) for item in value if isinstance(item, dict)]
+    return [_result(item) for item in value if isinstance(item, dict) and item.get("url")]
 
 
 def _result(item: dict[str, Any]) -> WebResult:

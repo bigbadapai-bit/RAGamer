@@ -872,6 +872,59 @@ def test_有一路跑成了就不抛(caplog):
     assert [item.chunk.chunk_id for item in found.hits] == [1]
 
 
+def test_有一路查空另一路失败时也抛(caplog):
+    """判据是**最终有没有东西交得出去**，不是「是不是每一路都失败了」。
+
+    元数据路跑成了但查空、主检索那一路失败：结局同样是「没东西可答，而且有故障」，
+    报成「知识库里没有找到相关资料」就把一次故障说成了语料问题。
+    """
+    store = broken_store(failing_times=1)
+    store.drop(GAME)  # 元数据路查得到、但库里什么都没有
+
+    with pytest.raises(StoreError):
+        retrieve(
+            "二郎神怎么打",
+            game_id=GAME,
+            chunks=store,
+            embedder=FakeEmbedder(),
+            reranker=ScriptedReranker({}),
+            route=Route((RecallPath.MAIN, RecallPath.METADATA)),
+        )
+
+
+def test_没有失败时查空就是查空():
+    """一路都没出错、就是没查到——这时「没找到资料」是实话，不该报成故障。"""
+    found = retrieve(
+        "二郎神怎么打",
+        game_id=GAME,
+        chunks=InMemoryChunkStore(),
+        embedder=FakeEmbedder(),
+        reranker=ScriptedReranker({}),
+        route=Route((RecallPath.MAIN, RecallPath.METADATA)),
+    )
+
+    assert not found
+
+
+def test_本地失败但联网搜到了就不抛(caplog):
+    """有东西交得出去时，失败的那一路只留在日志里——这一轮照样答得出。"""
+    store = broken_store(failing_times=1)
+
+    with caplog.at_level(logging.WARNING, logger="ragamer.retrieval"):
+        found = retrieve(
+            "这版本改了什么",
+            game_id=GAME,
+            chunks=store,
+            embedder=FakeEmbedder(),
+            reranker=ScriptedReranker({}),
+            route=Route((RecallPath.MAIN, RecallPath.WEB)),
+            search=web(WebResult("公告", "https://example.com/p", "改了")),
+        )
+
+    assert found.hits == ()
+    assert len(found.web) == 1
+
+
 # --- RRF 融合 ---
 
 
