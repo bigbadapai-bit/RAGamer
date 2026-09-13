@@ -34,7 +34,7 @@ from ragamer.stores.base import UNVERSIONED
 from ragamer.stores.memory import InMemoryChunkStore, InMemoryDocStore
 from ragamer.vectors.fake import FakeEmbedder, FakeReranker
 
-from .conftest import make_chunk
+from .conftest import joint_reply, make_chunk
 
 GAME_ID = "black_myth"
 OTHER_ID = "yanyun"
@@ -46,23 +46,6 @@ YANYUN = {"name": "燕云十六声", "version": "3.0"}
 
 #: 一段答案。编号指的就是提示词里那批切片的编号。
 REPLY = "先定身再贴身输出[1]。"
-
-
-def joint(
-    game: str = "黑神话·悟空",
-    game_confidence: float = 0.9,
-    version: str = "1.0",
-    version_confidence: float = 0.9,
-    rewritten_query: str = QUESTION,
-) -> dict[str, object]:
-    """联合输出节点的一次回复。确定度与取值成对，默认都是「确定」那一档。"""
-    return {
-        "game": game,
-        "game_confidence": game_confidence,
-        "version": version,
-        "version_confidence": version_confidence,
-        "rewritten_query": rewritten_query,
-    }
 
 
 def store(*chunks) -> InMemoryChunkStore:
@@ -103,7 +86,7 @@ def clarifier(chunks=None, doc_store=None, *replies) -> Clarifier:
 def test_确定度足够时直接作答不反问():
     """两档里的第一档：模型判得出游戏与版本、确定度过线，就别再拿问题去烦用户。"""
     asker = clarifier(
-        store(make_chunk(1, content=QUESTION, version="1.0")), both_bases(), joint(), REPLY
+        store(make_chunk(1, content=QUESTION, version="1.0")), both_bases(), joint_reply(), REPLY
     )
 
     result = asker.start(QUESTION, game_id=GAME_ID)
@@ -118,7 +101,7 @@ def test_接近但不肯定时暂停并给出候选():
     asker = clarifier(
         store(make_chunk(1, content=QUESTION, version="1.0")),
         both_bases(),
-        joint(game_confidence=UNSURE),
+        joint_reply(game_confidence=UNSURE),
     )
 
     result = asker.start(QUESTION)
@@ -131,7 +114,7 @@ def test_接近但不肯定时暂停并给出候选():
 
 def test_反问时不调生成():
     """暂停就是暂停：只为生成排了一条脚本，反问这条路不该把它取走。"""
-    asker = clarifier(store(), both_bases(), joint(game_confidence=UNSURE), REPLY)
+    asker = clarifier(store(), both_bases(), joint_reply(game_confidence=UNSURE), REPLY)
 
     asker.start(QUESTION)
 
@@ -143,7 +126,9 @@ def test_两档的边界落在阈值上():
 
     def asks(confidence: float) -> bool:
         return isinstance(
-            clarifier(store(), both_bases(), joint(game_confidence=confidence)).start(QUESTION),
+            clarifier(store(), both_bases(), joint_reply(game_confidence=confidence)).start(
+                QUESTION
+            ),
             Clarification,
         )
 
@@ -153,7 +138,7 @@ def test_两档的边界落在阈值上():
 
 def test_压根没判出游戏时也反问而不用调用方之外的库():
     """游戏留空、调用方也没指定：没有任何依据，只能问——这时候选是全部库。"""
-    asker = clarifier(store(), both_bases(), joint(game=""))
+    asker = clarifier(store(), both_bases(), joint_reply(game=""))
 
     result = asker.start(QUESTION)
 
@@ -167,7 +152,7 @@ def test_调用方已经定下游戏时不再问游戏():
     asker = clarifier(
         store(make_chunk(1, content=QUESTION, version="1.0")),
         both_bases(),
-        joint(game="", version=""),
+        joint_reply(game="", version=""),
         REPLY,
     )
 
@@ -186,7 +171,7 @@ def test_只有一个库时没有可问的直接用它():
     asker = clarifier(
         store(make_chunk(1, content=QUESTION, version="1.0")),
         docs(black_myth=BLACK_MYTH),
-        joint(game="", version=""),
+        joint_reply(game="", version=""),
         REPLY,
     )
 
@@ -196,12 +181,49 @@ def test_只有一个库时没有可问的直接用它():
     assert result.text == REPLY
 
 
-def test_一个库都没有时当场报错():
-    """没有候选可问，也没有已定的游戏可依：这一问无解，不能等走到检索那一步才炸。"""
-    asker = clarifier(InMemoryChunkStore(), InMemoryDocStore(), joint(game=""))
+def test_模型判的游戏与调用方给的一致时不再问():
+    """两档之间也不见得该问：模型说的正是会话里那一个，问了也只有同一个答案。
+
+    真正拿不准的是**对不上**——那种才把候选摆出来（下一条）。
+    """
+    asker = clarifier(
+        store(make_chunk(1, content=QUESTION, version="1.0")),
+        both_bases(),
+        joint_reply(game_confidence=UNSURE),
+        REPLY,
+    )
+
+    result = asker.start(QUESTION, game_id=GAME_ID)
+
+    assert not isinstance(result, Clarification)
+    assert result.text == REPLY
+
+
+def test_模型判的游戏与调用方给的对不上时问一问():
+    """会话里选的是这个库，模型读出的是另一个库、又不太肯定：这才值得问一句。"""
+    asker = clarifier(
+        store(make_chunk(1, content=QUESTION, version="1.0")),
+        both_bases(),
+        joint_reply(game="燕云十六声", game_confidence=UNSURE),
+    )
+
+    result = asker.start(QUESTION, game_id=GAME_ID)
+
+    assert isinstance(result, Clarification)
+    assert result.dimension == GAME
+
+
+def test_一个库都没有时当场报错且不白调一次模型():
+    """没有候选可问，也没有已定的游戏可依：这一问无解，不能等走到检索那一步才炸。
+
+    而且**拦在理解之前**：候选为空时模型判不出任何游戏，这一次理解注定白调。
+    """
+    asker = clarifier(InMemoryChunkStore(), InMemoryDocStore(), joint_reply(game=""))
 
     with pytest.raises(NoKnowledgeBase):
         asker.start(QUESTION)
+
+    assert asker.llm.calls == []
 
 
 # --- 候选的来源：语料里真有的取值 ---
@@ -209,7 +231,7 @@ def test_一个库都没有时当场报错():
 
 def test_模型编出来的游戏进不了候选():
     """库里的游戏只有那两个，模型说「塞尔达传说」——取值丢掉，候选照旧只有库里那些。"""
-    asker = clarifier(store(), both_bases(), joint(game="塞尔达传说", game_confidence=0.99))
+    asker = clarifier(store(), both_bases(), joint_reply(game="塞尔达传说", game_confidence=0.99))
 
     result = asker.start(QUESTION)
 
@@ -228,7 +250,7 @@ def test_版本候选来自语料且不含未标注版本():
         make_chunk(2, content="世界观设定", version=UNVERSIONED),
         make_chunk(3, content="旧版打法", version="0.9"),
     )
-    asker = clarifier(chunks, both_bases(), joint(version_confidence=UNSURE))
+    asker = clarifier(chunks, both_bases(), joint_reply(version_confidence=UNSURE))
 
     result = asker.start(QUESTION, game_id=GAME_ID)
 
@@ -242,7 +264,7 @@ def test_库里没有别的版本时不反问版本():
     asker = clarifier(
         store(make_chunk(1, content=QUESTION, version="1.0")),
         both_bases(),
-        joint(version_confidence=UNSURE),
+        joint_reply(version_confidence=UNSURE),
         REPLY,
     )
 
@@ -263,7 +285,7 @@ def test_模型判成另一个库时它那条版本判断作废():
             make_chunk(2, content=QUESTION, version="3.0", game_id=OTHER_ID),
         ),
         both_bases(),
-        joint(game="燕云十六声", version="3.0"),
+        joint_reply(game="燕云十六声", version="3.0"),
         REPLY,
     )
 
@@ -296,7 +318,7 @@ def test_两个库重名时候选标签带上_id_以免认错():
 
 def test_用户选完从暂停点继续给出答案():
     chunks = store(make_chunk(1, content=QUESTION, version="1.0", doc_title="二郎神"))
-    asker = clarifier(chunks, both_bases(), joint(game_confidence=UNSURE), REPLY)
+    asker = clarifier(chunks, both_bases(), joint_reply(game_confidence=UNSURE), REPLY)
 
     pending = asker.start(QUESTION)
     result = asker.resume(pending.pending_id, "黑神话·悟空")
@@ -311,12 +333,52 @@ def test_版本还原样回到检索里():
         make_chunk(1, content=QUESTION, version="1.0", ancestor_path="二郎神 › 旧版"),
         make_chunk(2, content=QUESTION, version="2.0", ancestor_path="二郎神 › 新版"),
     )
-    asker = clarifier(chunks, both_bases(), joint(version_confidence=UNSURE), REPLY)
+    asker = clarifier(chunks, both_bases(), joint_reply(version_confidence=UNSURE), REPLY)
 
     pending = asker.start(QUESTION, game_id=GAME_ID)
     result = asker.resume(pending.pending_id, "2.0")
 
     assert [citation.ancestor_path for citation in result.citations] == ["二郎神 › 新版"]
+
+
+def test_选回同一个库时已经确定的版本照旧算数():
+    """模型判出的版本是照那个库的版本列表判的，用户点的还是它，就没有理由作废。
+
+    不作数的话，一次**确定**的判断会在点完游戏之后凭空消失，答案悄悄换了个版本过滤。
+    """
+    chunks = store(
+        make_chunk(1, content=QUESTION, version="1.0", ancestor_path="二郎神 › 旧版"),
+        make_chunk(2, content=QUESTION, version="2.0", ancestor_path="二郎神 › 新版"),
+        make_chunk(3, content=QUESTION, version="3.0", game_id=OTHER_ID),
+    )
+    asker = clarifier(
+        chunks, both_bases(), joint_reply(game="燕云十六声", game_confidence=UNSURE), REPLY
+    )
+
+    pending = asker.start(QUESTION, game_id=GAME_ID)
+    result = asker.resume(pending.pending_id, "黑神话·悟空")
+
+    assert [citation.ancestor_path for citation in result.citations] == ["二郎神 › 旧版"]
+
+
+def test_换成另一个库时那条版本判断作废():
+    """同一个暂停点里换成另一个库：拿 A 库判出的版本去检索 B 库只会查空。"""
+    chunks = store(
+        make_chunk(1, content=QUESTION, version="1.0", ancestor_path="二郎神 › 旧版"),
+        make_chunk(2, content=QUESTION, version="2.0", ancestor_path="二郎神 › 新版"),
+        make_chunk(
+            3, content=QUESTION, version="3.0", game_id=OTHER_ID, ancestor_path="燕云 › 打法"
+        ),
+    )
+    asker = clarifier(
+        chunks, both_bases(), joint_reply(game="燕云十六声", game_confidence=UNSURE), REPLY
+    )
+
+    pending = asker.start(QUESTION, game_id=GAME_ID)
+    result = asker.resume(pending.pending_id, "燕云十六声")
+
+    # 燕云那个库的现行版本是 3.0，判作废之后就按它走
+    assert [citation.ancestor_path for citation in result.citations] == ["燕云 › 打法"]
 
 
 def test_恢复多次结果一致且不多写记录():
@@ -328,7 +390,7 @@ def test_恢复多次结果一致且不多写记录():
     asker = clarifier(
         store(make_chunk(1, content=QUESTION, version="1.0")),
         both_bases(),
-        joint(game_confidence=UNSURE),
+        joint_reply(game_confidence=UNSURE),
         REPLY,
         REPLY,  # 恢复两次，各生成一次
     )
@@ -343,7 +405,7 @@ def test_恢复多次结果一致且不多写记录():
 
 def test_选了候选之外的东西当场报错():
     """按钮之外的值说明这次请求不是这份暂停点发出来的，不能拿它去检索。"""
-    asker = clarifier(store(), both_bases(), joint(game_confidence=UNSURE))
+    asker = clarifier(store(), both_bases(), joint_reply(game_confidence=UNSURE))
 
     pending = asker.start(QUESTION)
 
@@ -371,7 +433,7 @@ def test_恢复一个不存在的暂停点当场报错():
 def test_暂停点里存着恢复所需的那几样():
     """恢复不该重新问一遍模型：改写后的问法、已经定下来的取值、候选都存下来。"""
     asker = clarifier(
-        store(), both_bases(), joint(game_confidence=UNSURE, rewritten_query="二郎神 怎么打")
+        store(), both_bases(), joint_reply(game_confidence=UNSURE, rewritten_query="二郎神 怎么打")
     )
 
     pending = asker.start(QUESTION)

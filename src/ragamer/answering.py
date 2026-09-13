@@ -105,6 +105,18 @@ class _Source:
     chunk: Chunk
 
 
+def require_question(question: str) -> None:
+    """问题不能是空的。读取侧的两个入口都从这里过一遍（`Answerer.answer` 与
+    `ragamer.clarifying.Clarifier.start`）——空问题会让检索查出任意一批切片，
+    答案也就是编的，而两种失败都不会报错。
+
+    提到一个函数里是因为两个入口各自守一遍时，那句话会被抄成两份——文案一旦分岔，
+    同一个毛病在两处就说成两件事了（与 `ragamer.stores.base.require_vectors` 同一个打法）。
+    """
+    if not question.strip():
+        raise ValueError("问题不能为空：空问题会让检索查出任意一批切片，答案也就是编的")
+
+
 @dataclass(frozen=True)
 class Answer:
     """一次提问的结果。
@@ -156,11 +168,10 @@ class Answerer:
         :param version: 这次按哪个版本检索。空串表示没点名（回落 `current_version`）。
         :param current_version: 知识库标着的现行版本。两个都是空串时不做版本过滤，
             并留一条 warning——见 `ragamer.query.version_filter`。
-        :raises ValueError: 问题为空。空问题会让检索查出任意一批切片。
+        :raises ValueError: 问题为空（由 :func:`require_question` 报出来）。
         :raises ragamer.llm.LlmError: 生成失败。没有答案就是没有答案，不降级。
         """
-        if not question.strip():
-            raise ValueError("问题不能为空：空问题会让检索查出任意一批切片，答案也就是编的")
+        require_question(question)
         where = version_filter(version, current_version=current_version)
         found = retrieve(
             question,

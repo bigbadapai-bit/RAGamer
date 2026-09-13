@@ -106,6 +106,22 @@ class FailingStore:
         raise StoreUnavailableError(self.name, self.address, 2.5, self.reason)
 
 
+def joint_reply(**overrides: object) -> dict[str, object]:
+    """联合输出节点的一次回复（`ragamer.query._JointOutput` 的那几个字段）。
+
+    读取侧三条链路（理解、澄清、端点）都要按它排 `FakeLlm` 的脚本，摆在这里免得各抄一份
+    ——确定度与取值成对，「取值空 ⇒ 确定度 0」这条不变量抄岔了会变成一条静默失效的用例。
+    """
+    reply: dict[str, object] = {
+        "game": "黑神话·悟空",
+        "game_confidence": 0.9,
+        "version": "1.0",
+        "version_confidence": 0.9,
+        "rewritten_query": "二郎神怎么打",
+    }
+    return {**reply, **overrides}
+
+
 def make_chunk(chunk_id: int, **overrides: object) -> Chunk:
     """造一个切片：缺省值都合法且已向量化，测试只覆盖自己关心的那几个字段。"""
     defaults: dict[str, object] = {

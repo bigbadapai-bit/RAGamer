@@ -36,7 +36,7 @@ from dataclasses import dataclass, replace
 from typing import Any
 from uuid import uuid4
 
-from ragamer.answering import Answer, Answerer
+from ragamer.answering import Answer, Answerer, require_question
 from ragamer.knowledge import KnowledgeBase, knowledge_base, knowledge_bases
 from ragamer.llm import LlmClient
 from ragamer.logging import get_logger
@@ -135,12 +135,15 @@ class Pending:
     pending_id: str
     rewritten_query: str
     dimension: str
+    #: 这一轮的取值是照哪个库取的：问版本时是已经定下来的游戏，问游戏时是调用方给的那个。
+    #: 用户点的若不是这个库，记录里那条版本判断就不作数（见 `Clarifier.resume`）。
     game_id: str
+    #: 已经定下来的版本。只有确定度过线的那种才带得走；问版本时它是要问的东西，留空。
     version: str
     choices: tuple[Choice, ...]
 
     def payload(self) -> dict[str, Any]:
-        """落库的形态。键名与 `_pending` 一一对应，两边一起改。"""
+        """落库的形态。键名与 `_from_payload` 一一对应，两边一起改。"""
         return {
             "rewritten_query": self.rewritten_query,
             "dimension": self.dimension,
@@ -155,6 +158,10 @@ def game_choices(docs: DocStore) -> tuple[Choice, ...]:
 
     **显示名重名时标签带上 id**：标签是模型与用户认的依据，两个库同名时标签分不开，
     模型选的那个就会被认到另一个库上去——查出来的是另一款游戏的资料，而且不报错。
+
+    **建了库却一份资料都没导的库也在候选里**。它确实「在语料里没有内容」，但把它藏起来
+    的代价更大：用户看得到自己建过这个库，点了却没有任何反应，那才是真正说不清的状态。
+    摆出来，点进去得到的是「知识库里没有找到与这个问题相关的资料」——那句话正是实情。
     """
     bases = knowledge_bases(docs)
     names = Counter(base.name for base in bases)
@@ -192,14 +199,17 @@ class Clarifier:
         :param game_id: 这次提问所在的游戏知识库（页面或会话里选定的那一个）。
             空串表示没有上下文可依——那就只能从库里读候选来问。
         :param version: 会话里选定的版本。空串表示没选定，按知识库的现行版本走。
-        :raises NoKnowledgeBase: 一个库都没有，问题里的游戏又判不出来。
-        :raises ValueError: 问题为空。空问题连理解都不必做——它本来就没什么可理解的，
-            而照它问下去会得到一次「你问的是哪款游戏」的反问。
+        :raises NoKnowledgeBase: 一个库都没有。**拦在理解之前**：候选为空时模型判不出
+            任何游戏（`ragamer.query._pick` 不会接受候选外的取值），这一次理解注定白调。
+        :raises ValueError: 问题为空（由 :func:`ragamer.answering.require_question` 报出来）。
+            **拦在理解之前**：空问题本来就没什么可理解的，而照它问下去会得到一次
+            「你问的是哪款游戏」的反问。
         :raises ragamer.llm.LlmError: 理解或生成失败。
         """
-        if not question.strip():
-            raise ValueError("问题不能为空：空问题会让检索查出任意一批切片，答案也就是编的")
+        require_question(question)
         games = game_choices(self.docs)
+        if not games:
+            raise NoKnowledgeBase
         # 版本候选按游戏取。不知道是哪款游戏时给不出候选，模型也就判不出版本（见模块说明）
         versions = version_choices(self.chunks, game_id) if game_id else ()
         understanding = understand(
@@ -210,7 +220,10 @@ class Clarifier:
         )
         resolved_game = self._game(understanding, games, game_id)
         if resolved_game is None:
-            return self._ask(understanding, GAME, games)
+            # 已经判出来的版本一并带上：用户点的还是同一个库时它照旧算数（见 `resume`）
+            return self._ask(
+                understanding, GAME, games, game_id=game_id, version=_settled(understanding)
+            )
         if resolved_game != game_id:
             # 版本候选是照调用方那个库给的，模型说的却是另一个库：它那条版本判断没有依据
             understanding = replace(understanding, version="", version_confidence=0.0)
@@ -228,14 +241,15 @@ class Clarifier:
         :raises NotACandidate: 选的不在这次反问给出的候选里。
         :raises ragamer.llm.LlmError: 生成失败。
         """
-        pending = self._pending(pending_id)
-        choice = _chosen(pending, label)
-        game_id = pending.game_id
-        version = pending.version
+        pending = self._load_pending(pending_id)
+        choice = _choice_of(pending.choices, label, pending.dimension)
         if pending.dimension == GAME:
             game_id = choice.value
+            # 记录里那条版本判断是照 `pending.game_id` 那个库给的：用户点的若不是它，
+            # 拿 A 库的版本去检索 B 库只会查空，所以换库就作废
+            version = pending.version if choice.value == pending.game_id else ""
         else:
-            version = choice.value
+            game_id, version = pending.game_id, choice.value
         logger.info("从暂停点 %s 继续：%s 取 %r", pending_id, pending.dimension, choice.value)
         return self._answer(pending.rewritten_query, game_id, version)
 
@@ -244,19 +258,20 @@ class Clarifier:
     ) -> str | None:
         """定下问的是哪款游戏。定不下来返回 `None`，由调用方去问。
 
-        两档在这里分开（见模块说明）：确定度够就用模型判的那个；落在中间那档就问。
-        调用方给的游戏是**默认值**：模型没读出别的来时按它走。
+        两档在这里分开（见模块说明）：确定度够就用模型判的那个；落在中间那档才考虑问。
+        调用方给的游戏是**默认值**：模型判出的那个与它一致时不必再问——问了也只有同一个
+        答案，白白打断一次；**对不上才是真的拿不准**，那种才值得把候选摆出来。
+        `choices` 已经由 `start` 保证非空——空的那一档进不了这里。
         """
-        if not choices:
-            raise NoKnowledgeBase
         if understanding.game and understanding.game_confidence >= CONFIDENT:
-            return _value_of(understanding.game, choices)
-        if _worth_asking(choices) and (
-            (understanding.game and understanding.game_confidence >= UNSURE) or not game_id
-        ):
+            return _choice_of(choices, understanding.game, GAME).value
+        judged = _choice_of(choices, understanding.game, GAME).value if understanding.game else ""
+        if game_id and judged in ("", game_id):
+            return game_id
+        if _worth_asking(choices):
             return None
         # 只有一个库时没有可问的：候选已经把它定死了
-        return game_id or choices[0].value
+        return judged or game_id or choices[0].value
 
     def _version(
         self, understanding: Understanding, choices: Sequence[Choice], version: str
@@ -323,11 +338,22 @@ class Clarifier:
             current_version=base.version if base else "",
         )
 
-    def _pending(self, pending_id: str) -> Pending:
+    def _load_pending(self, pending_id: str) -> Pending:
         payload = self.docs.get(PENDING_COLLECTION, pending_id)
         if payload is None:
             raise UnknownPending(pending_id)
-        return _pending(pending_id, payload)
+        return _from_payload(pending_id, payload)
+
+
+def _settled(understanding: Understanding) -> str:
+    """这一轮已经定下来的版本，带得走的那种。
+
+    只有确定度过 :data:`CONFIDENT` 的才算：夹在两档之间的那个还等着问，不是结论。
+    没有判出版本时是空串——调用方给的那个版本属于它自己的库，跟着游戏一起换库就错了。
+    """
+    if understanding.version and understanding.version_confidence >= CONFIDENT:
+        return understanding.version
+    return ""
 
 
 def _worth_asking(choices: Sequence[Choice]) -> bool:
@@ -339,27 +365,19 @@ def _worth_asking(choices: Sequence[Choice]) -> bool:
     return len(choices) >= 2
 
 
-def _value_of(label: str, choices: Sequence[Choice]) -> str:
-    """标签 → 取值。
+def _choice_of(choices: Sequence[Choice], label: str, dimension: str) -> Choice:
+    """标签 → 候选。两处都从这里走：模型判出来的游戏，与用户点的那一个。
 
-    走得到「取不到」那一支说明接线错了：标签是 `ragamer.query._pick` 从这份候选里
-    选出来才留下的，两处的候选来自同一次读取。真取不到时宁可当场报出来，
-    也不退回空串——空串意味着换一个游戏去检索，查出来的是别的游戏的资料，且不报错。
+    取不到时宁可当场报出来，也不退回空串——空串意味着换一个游戏去检索，
+    查出来的是别的游戏的资料，而且不报错。
     """
     for choice in choices:
         if choice.label == label:
-            return choice.value
-    raise NotACandidate(label, GAME)
-
-
-def _chosen(pending: Pending, label: str) -> Choice:
-    for choice in pending.choices:
-        if choice.label == label:
             return choice
-    raise NotACandidate(label, pending.dimension)
+    raise NotACandidate(label, dimension)
 
 
-def _pending(pending_id: str, payload: Mapping[str, Any]) -> Pending:
+def _from_payload(pending_id: str, payload: Mapping[str, Any]) -> Pending:
     """库里那份文档 → 这个对象。"""
     return Pending(
         pending_id=pending_id,

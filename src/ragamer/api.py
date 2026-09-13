@@ -4,8 +4,8 @@
 
 - `POST /api/kb/{game_id}/import`——批量提交、**逐文件独立**：某个文件失败时其余照常入库，
   失败的那个在结果里带文件名与失败阶段。
-- `POST /api/ask`——提一个问题，拿回一段带引用的答案，**或者一次反问**（`kind` 区分两者）。
-- `POST /api/ask/{pending_id}`——用户点完反问里的候选，从那个暂停点继续，拿回答案。
+- `POST /api/chat`——提一个问题，拿回一段带引用的答案，**或者一次反问**（`kind` 区分两者）。
+- `POST /api/chat/{pending_id}`——用户点完反问里的候选，从那个暂停点继续，拿回答案。
 
 知识库元数据从 MongoDB 读（`knowledge_bases` 集合，id 就是游戏 id）：打标要用的词表
 ——启用了哪些主体类型、这个游戏的术语映射——就在它里面（docs/ARCHITECTURE.md §2.3）。
@@ -60,7 +60,7 @@ def create_app(container: Container) -> FastAPI:
         ),
     )
 
-    @app.post("/api/ask")
+    @app.post("/api/chat")
     async def ask_question(
         question: Annotated[str, Form(description="用户的问题")],
         game_id: Annotated[
@@ -77,7 +77,7 @@ def create_app(container: Container) -> FastAPI:
         """
         return _turn(lambda: clarifier.start(question, game_id=game_id, version=version))
 
-    @app.post("/api/ask/{pending_id}")
+    @app.post("/api/chat/{pending_id}")
     async def resolve_clarification(
         pending_id: str,
         label: Annotated[str, Form(description="用户点的那个候选，原样回传")],
