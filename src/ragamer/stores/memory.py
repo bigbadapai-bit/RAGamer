@@ -14,6 +14,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from ragamer.stores.base import (
+    UNVERSIONED,
     Chunk,
     ChunkFilter,
     ChunkHit,
@@ -73,6 +74,18 @@ class InMemoryChunkStore:
         # 分数相同时按 chunk_id 定序，结果与写入顺序无关
         hits.sort(key=lambda hit: (-hit.score, hit.chunk.chunk_id))
         return hits[:limit]
+
+    def versions(self, game_id: str) -> tuple[str, ...]:
+        """与真实适配器同一套口径：未标注版本不算一个可选的版本，去重后按字面升序。"""
+        return tuple(
+            sorted(
+                {
+                    chunk.version
+                    for chunk in self._collection(collection_name(game_id)).values()
+                    if chunk.version != UNVERSIONED
+                }
+            )
+        )
 
     def fetch_document(self, game_id: str, doc_title: str, *, version: str) -> list[Chunk]:
         where = ChunkFilter(doc_title=doc_title, version=version)

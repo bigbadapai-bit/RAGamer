@@ -120,6 +120,37 @@ def test_版本过滤一并纳入未标注版本(memory_container):
     assert sorted(hit.chunk.chunk_id for hit in hits) == [1, 3]
 
 
+def test_列出一个库里真实存在过的版本(memory_container):
+    """澄清反问的版本候选只能来自这里（§3.4）：模型自己编的版本号，用户选了也检索不到。"""
+    store = memory_container.chunks
+    store.ensure_collection("black_myth")
+    store.upsert(
+        "black_myth",
+        [
+            make_chunk(1, version="2.0"),
+            make_chunk(2, version="1.0"),
+            make_chunk(3, version="2.0"),
+            make_chunk(4, version=UNVERSIONED),
+        ],
+    )
+
+    assert store.versions("black_myth") == ("1.0", "2.0")
+
+
+def test_还没有切片的游戏列不出任何版本(memory_container):
+    """建了库、一份资料都没导：这是正常状态，不是错误——空列表就是「没有可选的历史版本」。"""
+    assert memory_container.chunks.versions("black_myth") == ()
+
+
+def test_版本只按这个游戏列(memory_container):
+    """一个游戏一个 collection（ADR-0002）：别的游戏的版本不该出现在候选里。"""
+    store = memory_container.chunks
+    store.upsert("black_myth", [make_chunk(1, version="1.0")])
+    store.upsert("yanyun", [make_chunk(2, version="3.0", game_id="yanyun")])
+
+    assert store.versions("black_myth") == ("1.0",)
+
+
 def test_取一份文档的全部切片按顺序且不混版本(memory_container):
     """聚合父块靠它：命中并截断之后回查同文档的兄弟切片。"""
     store = memory_container.chunks

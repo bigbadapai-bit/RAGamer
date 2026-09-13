@@ -125,6 +125,49 @@ def test_未标注版本的切片在版本过滤下也取得到(settings: Settin
         container.chunks.drop(PROBE_GAME)
 
 
+def test_列版本扫得完整且不漏未标注版本(settings: Settings, probe_chunks: list[Chunk]):
+    """列版本扫的是整个 collection，服务端那条 `version != ""` 的表达式只有真库验得了。
+
+    两个版本 + 一批未标注版本的切片：列出来的是两个版本，未标注版本不在其中
+    （它在库里的取值是空串，与「没判出来」共用同一个字面）。
+    """
+    container = build_container(settings)
+    container.chunks.check()
+    other_version = make_chunk(
+        3,
+        game_id=PROBE_GAME,
+        doc_title="探针文档",
+        chunk_index=2,
+        version="2.0",
+        dense_vector=fake_vector(3, DENSE_DIM),
+        sparse_vector={3: 0.5},
+    )
+    unversioned = make_chunk(
+        4,
+        game_id=PROBE_GAME,
+        doc_title="探针文档",
+        chunk_index=3,
+        version="",
+        dense_vector=fake_vector(4, DENSE_DIM),
+        sparse_vector={4: 0.5},
+    )
+    try:
+        container.chunks.ensure_collection(PROBE_GAME)
+        container.chunks.upsert(PROBE_GAME, [*probe_chunks, other_version, unversioned])
+
+        assert container.chunks.versions(PROBE_GAME) == ("1.0", "2.0")
+    finally:
+        container.chunks.drop(PROBE_GAME)
+
+
+def test_列一个还没有切片的库的版本得到空(settings: Settings):
+    """建了库、一份资料都没导。这里要的是不报错——扫一个不存在的 collection 会炸。"""
+    container = build_container(settings)
+    container.chunks.check()
+
+    assert container.chunks.versions(PROBE_GAME) == ()
+
+
 def test_对象存储能存能取能清(settings: Settings):
     container = build_container(settings)
     container.objects.check()

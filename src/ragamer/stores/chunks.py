@@ -64,6 +64,9 @@ SPARSE_INDEX_ALGO = "DAAT_MAXSCORE"
 #: 建索引的标量字段。聚合父块要靠它们回查同文档的兄弟切片。
 INDEXED_SCALARS = ("doc_title", "version")
 
+#: 列版本时一趟取回多少行。列版本要扫过整库，这个数只是分页的粒度，不影响结果。
+VERSION_SCAN_BATCH = 1000
+
 #: 一致性级别。不能用默认的 Bounded：写入的数据先落在增长段上，此时做混合检索
 #: 服务端会直接报 `service internal error: unsupported ID type`（Milvus 3.0 实测），
 #: 而"导入完立刻提问"正是本项目的主流程。Strong 让检索等到最新时间戳，
@@ -354,6 +357,34 @@ class MilvusChunkStore:
             timeout=self._timeout,
         )[0]
         return [_hit(row) for row in rows]
+
+    def versions(self, game_id: str) -> tuple[str, ...]:
+        """这个游戏里真实出现过的版本。**扫的是整个 collection**（见协议里的说明）。
+
+        用迭代器分页扫，不用 `query` 的 offset + limit：Milvus 把 `offset + limit` 卡在
+        16384 以内，库大过这个数时后半截的版本会**静默漏掉**——候选少一个，用户就选不到
+        那一个版本，而界面上看起来一切正常。
+
+        库还不存在时返回空元组：建了库、一份资料都没导，这是正常状态，不是错误。
+        """
+        client = self._client()
+        name = collection_name(game_id)
+        if not client.has_collection(name, timeout=self._timeout):
+            return ()
+        iterator = client.query_iterator(
+            collection_name=name,
+            batch_size=VERSION_SCAN_BATCH,
+            filter=f"version != {_quote(UNVERSIONED)}",
+            output_fields=["version"],
+            timeout=self._timeout,
+        )
+        found: set[str] = set()
+        try:
+            while batch := iterator.next():
+                found.update(str(row["version"]) for row in batch)
+        finally:
+            iterator.close()
+        return tuple(sorted(found))
 
     def fetch_document(self, game_id: str, doc_title: str, *, version: str) -> list[Chunk]:
         rows = self._client().query(
