@@ -18,7 +18,7 @@
     {% for row in result.rows %}
     <li class="border-t border-slate-200 pt-3 first:border-0 first:pt-0">
       <div class="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
-        <span class="text-sm font-medium">{{ row.filename }}</span>
+        <span class="text-sm font-medium">{{ row.source }}</span>
         {% if row.ok %}
         <span class="text-sm text-slate-500">
           《{{ row.doc_title }}》· 入库 {{ row.chunk_count }} 条{% if row.skipped %}，跳过 {{ row.skipped }} 条{% endif %}

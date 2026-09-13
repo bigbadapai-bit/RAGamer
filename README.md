@@ -75,17 +75,26 @@ uv run pytest -m integration     # 跑真模型的集成测试（首次会下载
 
 ## 导入
 
-写入侧的入口是 `POST /api/kb/{game_id}/import`——上传若干份资料、每个文件独立处理。
-四个来源先归一为 Markdown（`ragamer.sources`），之后串起补图、切分、打标、向量化与入库
-（`ragamer.importing`）。按扩展名挑适配器：md／txt 直接读，**PDF 与图片走 MinerU 云端解析**
-（`ragamer.mineru`），网页爬虫在后面一张票里接。
+写入侧两个端点，对应界面上的两处输入：
 
-- **一批里某个文件失败不牵连其余**：响应的 `results` 逐文件给结果，失败的那个带
-  `filename`、`stage`（卡在哪一步）与 `error`。整批都失败也是 200，不是 500。
+| 端点 | 收什么 |
+| --- | --- |
+| `POST /api/kb/{game_id}/import` | 上传若干份资料（multipart） |
+| `POST /api/kb/{game_id}/import/urls` | 若干网页地址（JSON：`{"urls": [...], "version": ""}`） |
+
+四个来源先归一为 Markdown（`ragamer.sources`），之后串起补图、切分、打标、向量化与入库
+（`ragamer.importing`）。两条端点**在归一化那一步就合流**：此后切分与打标不感知来源。
+归一化按扩展名挑适配器：md／txt 直接读、**PDF 与图片走 MinerU 云端解析**（`ragamer.mineru`）、
+**网页走爬虫**（`ragamer.crawl`，见下面的「网页抓取」）。
+
+- **一批里某一条失败不牵连其余**：响应的 `results` 逐条给结果，失败的那条带
+  `source`（文件那一路是文件名，网址那一路是地址）、`stage`（卡在哪一步）与 `error`。
+  整批都失败也是 200，不是 500。
 - **重复导入不产生重复切片**：切片主键由导入侧按「游戏 + 文档标题 + 版本 + 切片序号」算出来，
   重导覆盖同一批 id；入库时再按文档整体替换，新切出来的片数变少也不会留下旧的那一截。
 - **同一份资料的另一个版本并存**：新版本作为新文档导入，删除只作用于它自己那个版本（ADR-0004）。
 - **入库的字段与建表时的显式声明一一对应**，不开动态字段。
+- **抓回来的切片带来源地址**（`source_url`）：本地文件是空串。答案是带引用给的，引用的落点就是它。
 - 打标用的词表来自知识库元数据（MongoDB 的 `knowledge_bases` 集合，id 即游戏 id）。
   库不存在时 404，不静默按默认词表建内容。
 
@@ -138,6 +147,28 @@ HTML 折叠块、对每个图片条目做二次 OCR 并回填到正文、给空�
   [`docs/experiments/second-pass-ocr.md`](docs/experiments/second-pass-ocr.md)，
   重跑用 `uv run python tools/second_pass_ocr.py <截图目录> --out …`。
 
+## 网页抓取
+
+`ragamer.crawl` 一个网址进、一份归一化文档出，两条路（`docs/ARCHITECTURE.md` §1.1）：
+
+- **MediaWiki 类站点**走它的开放接口（`api.php`）拿 **wikitext 原文**，由 `ragamer.wikitext`
+  转成 Markdown。选原文而不是渲染后的 HTML，是因为下游读的正是 wiki 标记：切分器靠
+  `[[内链]]`／`Category:`／`{{模板}}` 认词条页，打标器靠 `[[Category:角色]]` 与 Infobox 字段
+  读主体类型。走哪条路由页面自己说了算——认 head 里的 RSD（`rel="EditURI"`）与
+  `generator` 声明。
+- **普通网页**走正文抽取（trafilatura）：导航、页脚、侧边栏丢掉，正文转成 Markdown。
+
+**合规的三件事落在出网的那一条路上**（`HttpCrawler._get` 查 robots、`_fetch` 限频与标明
+身份，而这条路只有一条）：先读该主机的 `robots.txt`、同一主机两次请求之间留足间隔、请求头里
+标明身份。**重定向也不例外**——每一跳都重新过一遍 robots 与限频，跟着 `httpx` 一次跳到底会
+绕过这一层（`robots.txt` 只写了入口那个地址）。**没有关掉 robots 的开关。**
+参数在 `.env.example` 的「网页抓取」一节，失败分三类各有各的异常：站点不可达、页面不存在、
+被拒绝访问（robots 挡下的算后者的子类）。
+
+⚠️ **不拦内网地址**：这个端点收的是用户给的网址，多用户部署时它是一个 SSRF 面
+（`http://169.254.169.254/…` 这类）。本项目现在是自己给自己导资料的单机工具，
+上多用户之前必须补上——拦内网要连 DNS 解析一起做，否则域名解析到内网就绕过去了。
+
 ## 界面
 
 **FastAPI + Jinja2 + htmx，零构建步骤**——没有 npm、没有打包产物（[ADR-0005](docs/adr/0005-htmx-frontend.md)）。
@@ -183,8 +214,9 @@ HTML 折叠块、对每个图片条目做二次 OCR 并回填到正文、给空�
 ```
 src/ragamer/          应用代码（config 配置装载、logging 日志、llm 语言模型适配器、sources 归一化、
                       mineru PDF 与图片的云端解析、enriching 补图、ocr 二次 OCR 引擎、lazy 懒加载、
-                      chunking 切分器、tagging 打标、importing 导入编排器、knowledge 知识库元数据、
-                      api JSON 端点、web 页面、app 应用装配与起服务、container 组合根、__main__ 启动自检）
+                      crawl 网页抓取、wikitext 维基语法转 Markdown、chunking 切分器、tagging 打标、
+                      importing 导入编排器、knowledge 知识库元数据、api JSON 端点、web 页面、
+                      app 应用装配与起服务、container 组合根、__main__ 启动自检）
 src/ragamer/stores/   存储适配器：base 协议与共享类型、chunks Milvus、documents Mongo、objects MinIO、memory 内存假件
 src/ragamer/vectors/  向量化与精排：base 协议与共享类型、bge 真实模型、fake 确定性假件
 src/ragamer/web/      页面与模板（templates/ 跟着包走，装成 wheel 也在）

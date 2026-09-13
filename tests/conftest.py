@@ -10,8 +10,9 @@ import pytest
 
 from ragamer.config import get_settings
 from ragamer.container import Container
+from ragamer.crawl import CrawlError
 from ragamer.llm import FakeLlm
-from ragamer.sources import MarkdownParser, ParserRouter
+from ragamer.sources import MarkdownParser, NormalizedDoc, ParserRouter
 from ragamer.stores.base import Chunk, StoreUnavailableError
 from ragamer.stores.memory import InMemoryChunkStore, InMemoryDocStore, InMemoryObjectStore
 from ragamer.vectors.fake import FakeEmbedder, FakeReranker
@@ -59,6 +60,10 @@ COMPLETE_ENV: dict[str, str] = {
     "RAGAMER_RERANK_MODEL": "test-rerank-model",
     "RAGAMER_RERANK_BATCH_SIZE": "32",
     "RAGAMER_RERANK_MAX_LENGTH": "2048",
+    "RAGAMER_CRAWL_USER_AGENT": "RAGamerTest/0.1 (+https://crawl.test/bot)",
+    "RAGAMER_CRAWL_TIMEOUT": "7.5",
+    "RAGAMER_CRAWL_MIN_INTERVAL": "0.25",
+    "RAGAMER_CRAWL_MAX_BYTES": "1048576",
 }
 
 
@@ -77,6 +82,24 @@ def settings_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[di
     get_settings.cache_clear()
 
 
+class FakeCrawler:
+    """不发请求的抓取器：地址 → 事先排好的正文。
+
+    没排过的地址当场炸，而不是返回一份空文档——静默返回会把「链路走通了」与
+    「假件其实什么都没做」混成同一件事。
+    """
+
+    def __init__(self, **pages: str) -> None:
+        self._pages = pages
+        self.requested: list[str] = []
+
+    def crawl(self, url: str) -> NormalizedDoc:
+        self.requested.append(url)
+        if url not in self._pages:
+            raise CrawlError(f"{url}：假件里没有排这一页")
+        return NormalizedDoc(markdown=self._pages[url], source_url=url)
+
+
 def make_container(
     chunks=None,
     docs=None,
@@ -87,6 +110,7 @@ def make_container(
     parser=None,
     vision=None,
     ocr=None,
+    crawler=None,
 ) -> Container:
     """造一个容器：依赖默认都是假件，测试只覆盖自己关心的那几个。
 
@@ -107,6 +131,7 @@ def make_container(
         # 默认的 OCR 引擎一被调用就炸——排了脚本的测试才该走到它
         ocr=ocr if ocr is not None else FailingOcr(),
         parser=parser if parser is not None else ParserRouter((MarkdownParser(),)),
+        crawler=crawler if crawler is not None else FakeCrawler(),
     )
 
 

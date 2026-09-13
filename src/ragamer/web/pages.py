@@ -650,7 +650,7 @@ def _import_result(
     """一次导入的逐文件结果。**失败也是结果**，和成功的一起列出来。"""
     rows = [
         {
-            "filename": result.filename,
+            "source": result.source,
             "doc_title": result.doc_title,
             "ok": result.ok,
             "chunk_count": result.chunk_count,

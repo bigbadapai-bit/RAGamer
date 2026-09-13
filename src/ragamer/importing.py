@@ -1,5 +1,10 @@
 """导入编排器：写入侧的唯一入口。
 
+**两个入口，一条链路**：`import_one` 收本地文件（或界面上传的字节），`import_url` 收网址，
+两条在归一化那一步合流（`import_url` 只是换了个取正文的方式），此后切分、打标、
+向量化、入库完全不区分来源——验收要求的「抓取结果与本地文件走完全相同的后续链路」，
+与其靠两处代码长得一样来保证，不如让它们本来就是同一处。
+
 一份资料从归一化一路送到库里，中间串起补图、切分、打标、向量化。链路上每一段都自己
 有模块，这里不重做其中任何一件，只负责把线接对——而接错的代价恰恰最大，
 所以编排层自己扛三件事：
@@ -31,6 +36,7 @@ from ragamer.sources import (
     Enricher,
     MarkdownParser,
     NormalizedDoc,
+    PageCrawler,
     SourceDocument,
     SourceError,
     SourceParser,
@@ -72,7 +78,8 @@ STAGE_LABELS: dict[ImportStage, str] = {
 class ProgressEvent:
     """一次阶段推进。每进入一个阶段发一条，阶段本身是「将要开始做」而不是「已经做完」。"""
 
-    filename: str
+    #: 这一条是从哪来的：文件名，或网址。
+    source: str
     stage: ImportStage
     #: 这一批里的第几个文件，从 1 起。
     file_number: int
@@ -93,7 +100,7 @@ def log_progress(event: ProgressEvent) -> None:
     """
     logger.info(
         "导入 %s：[%d/%d] %s",
-        event.filename,
+        event.source,
         event.file_number,
         event.file_total,
         STAGE_LABELS[event.stage],
@@ -118,7 +125,8 @@ class CoveredTags:
 class ImportResult:
     """一个文件的导入结果。**失败也是结果**——一批里它失败了，其余照跑。"""
 
-    filename: str
+    #: 这一条是从哪来的：文件名，或网址。
+    source: str
     #: 存进库里叫什么。同时是「重导时替换掉哪一批切片」的依据。
     doc_title: str
     #: 入库的切片数。
@@ -200,6 +208,8 @@ class Importer:
     #: 对象存储。解析产物里的原图存进它，正文里的引用改指对象 key。
     #: 不传时 md／txt 照跑；真来了附件还没有它，那一步会当场报错而不是把图丢掉。
     objects: ObjectStore | None = None
+    #: 网页来源。组合根总会接上；留成可空只是为了让不碰网址的测试不必造一个假件。
+    crawler: PageCrawler | None = None
     #: 补图。没接上时这一步不做、也不上报——报了就是假进度。
     enricher: Enricher | None = None
     #: 切分参数。不传用 `ChunkRules` 的默认值。
@@ -231,6 +241,34 @@ class Importer:
         _warn_on_repeated_documents(results, version=version)
         return results
 
+    def batch_urls(
+        self,
+        urls: Sequence[str],
+        *,
+        game_id: str,
+        version: str = UNVERSIONED,
+        vocabulary: TagVocabulary | None = None,
+    ) -> tuple[ImportResult, ...]:
+        """一批网址，顺序即提交顺序。**逐个独立**：某个地址失败时其余照常入库。
+
+        与 :meth:`batch` 分成两个方法而不是合成一个收「文件或网址」的入口：
+        两者的差别只在归一化那一步，那就不该让类型判断扩散到这一层。
+        """
+        total = len(urls)
+        results = tuple(
+            self.import_url(
+                url,
+                game_id=game_id,
+                version=version,
+                vocabulary=vocabulary,
+                file_number=number,
+                file_total=total,
+            )
+            for number, url in enumerate(urls, start=1)
+        )
+        _warn_on_repeated_documents(results, version=version)
+        return results
+
     def import_one(
         self,
         source: SourceDocument,
@@ -247,13 +285,68 @@ class Importer:
         :param version: 这次导入标注的版本；空串即「未标注版本」。
         :param vocabulary: 该知识库的词表。不传则全部主体类型、映射为空。
         """
+        return self._run(
+            source.filename,
+            # 解析产物里的原图在这里进对象存储；抓回来的网页没有附件，不走这一步
+            lambda: self._publish(self.parser.parse(source), source, game_id),
+            game_id=game_id,
+            version=version,
+            vocabulary=vocabulary,
+            file_number=file_number,
+            file_total=file_total,
+        )
+
+    def import_url(
+        self,
+        url: str,
+        *,
+        game_id: str,
+        version: str = UNVERSIONED,
+        vocabulary: TagVocabulary | None = None,
+        file_number: int = 1,
+        file_total: int = 1,
+    ) -> ImportResult:
+        """抓一个网址再导入。**抓完之后走的是同一条链路**：切分与打标不知道这份资料从哪来。
+
+        结果与进度事件里的 `source` 报的是这个地址——网页没有文件名，
+        而「这一批里是哪一条失败了」总得有个能指认的东西。
+        """
+        crawler = self.crawler
+        if crawler is None:
+            raise ValueError("这个导入器没有接上抓取器，导入不了网址（组合根里接）")
+        return self._run(
+            url,
+            lambda: crawler.crawl(url),
+            game_id=game_id,
+            version=version,
+            vocabulary=vocabulary,
+            file_number=file_number,
+            file_total=file_total,
+        )
+
+    def _run(
+        self,
+        source: str,
+        normalize: Callable[[], NormalizedDoc],
+        *,
+        game_id: str,
+        version: str,
+        vocabulary: TagVocabulary | None,
+        file_number: int,
+        file_total: int,
+    ) -> ImportResult:
+        """六个阶段走一遍。`normalize` 是这里唯一的变量：本地资料读字节、网址去抓。
+
+        两条入口合流得这么早是有意的——「抓回来的与本地文件走完全相同的后续链路」
+        这条验收要求，与其靠两处代码长得一样来保证，不如让它们本来就是同一处。
+        """
         reported: list[ProgressEvent] = []
         current = ImportStage.NORMALIZE
 
         def enter(stage: ImportStage) -> None:
             nonlocal current
             current = stage
-            event = ProgressEvent(source.filename, stage, file_number, file_total)
+            event = ProgressEvent(source, stage, file_number, file_total)
             reported.append(event)
             if self.on_progress is not None:
                 self.on_progress(event)
@@ -261,8 +354,8 @@ class Importer:
         doc_title = ""
         try:
             enter(ImportStage.NORMALIZE)
-            doc = self._publish(self.parser.parse(source), source, game_id)
-            doc_title = document_title(doc.markdown, source.filename)
+            doc = normalize()
+            doc_title = document_title(doc.markdown, source)
             if self.enricher is not None:
                 enter(ImportStage.ENRICH)
                 doc = self.enricher.enrich(doc)
@@ -272,23 +365,27 @@ class Importer:
             tagged = tag_document(doc.markdown, chunks, vocabulary=vocabulary, llm=self.llm)
             enter(ImportStage.EMBED)
             rows, skipped = self._vectorize(
-                tagged, game_id=game_id, version=version, doc_title=doc_title
+                tagged,
+                game_id=game_id,
+                version=version,
+                doc_title=doc_title,
+                source_url=doc.source_url,
             )
             enter(ImportStage.STORE)
             self._store(game_id, doc_title, version, rows)
-        # 兜住全部异常是「一个文件失败不牵连其余」要求的：读文件、调模型、写库
+        # 兜住全部异常是「一个文件失败不牵连其余」要求的：读文件、抓网页、调模型、写库
         # 都可能以各自的异常类型挂掉，而这一批的其余文件不该跟着陪葬。兜住不等于吞掉
         # ——错误原文进结果、带调用栈进日志，两处都留痕。
         except Exception as exc:
             logger.error(
                 "导入失败：%s · %s：%s",
-                source.filename,
+                source,
                 STAGE_LABELS[current],
                 exc,
                 exc_info=True,
             )
             return ImportResult(
-                filename=source.filename,
+                source=source,
                 doc_title=doc_title,
                 chunk_count=0,
                 skipped=0,
@@ -298,7 +395,7 @@ class Importer:
                 progress=tuple(reported),
             )
         return ImportResult(
-            filename=source.filename,
+            source=source,
             doc_title=doc_title,
             chunk_count=len(rows),
             skipped=skipped,
@@ -325,7 +422,13 @@ class Importer:
         )
 
     def _vectorize(
-        self, tagged: Sequence[TaggedChunk], *, game_id: str, version: str, doc_title: str
+        self,
+        tagged: Sequence[TaggedChunk],
+        *,
+        game_id: str,
+        version: str,
+        doc_title: str,
+        source_url: str,
     ) -> tuple[list[Chunk], int]:
         """打标后的切片 → 可入库的切片，并报出被丢掉的条数。
 
@@ -364,6 +467,7 @@ class Importer:
                     doc_title=doc_title,
                     chunk_type=item.chunk.chunk_type,
                     content_hash=content_hash(content),
+                    source_url=source_url,
                 )
             )
         if not rows:
@@ -415,12 +519,12 @@ def _warn_on_repeated_documents(results: Sequence[ImportResult], *, version: str
     for result in results:
         if not result.ok:
             continue
-        first = claimed.setdefault(result.doc_title, result.filename)
-        if first != result.filename:
+        first = claimed.setdefault(result.doc_title, result.source)
+        if first != result.source:
             logger.warning(
                 "同一批里 %s 与 %s 切出了同一个文档标题 %r（版本 %r）：后写的覆盖了前一份",
                 first,
-                result.filename,
+                result.source,
                 result.doc_title,
                 version,
             )

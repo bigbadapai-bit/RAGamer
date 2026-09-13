@@ -31,6 +31,7 @@ from pydantic import BaseModel, Field
 from ragamer.chunking import PATH_SEPARATOR, Chunk
 from ragamer.llm import LlmClient, LlmError, LlmRequest, Message
 from ragamer.logging import get_logger
+from ragamer.wikitext import CATEGORY_NAMESPACES
 
 logger = get_logger(__name__)
 
@@ -125,10 +126,14 @@ _NATURE_KEYWORDS: tuple[tuple[ContentNature, str], ...] = (
     (ContentNature.INTRO, "介绍 简介 概述 背景 故事 设定 说明 是什么 档案 资料 图鉴 词条"),
 )
 
-#: MediaWiki 分类：`[[Category:角色]]` / `[[分类:角色|排序键]]`。
-_CATEGORY_LINK = re.compile(r"\[\[\s*(?:Category|分类)\s*:\s*([^\]|]+)")
+#: 分类命名空间的清单只留一处（`ragamer.wikitext`）：转换器与这里各写一份的话，
+#: 漂掉的那一边不报错，只是那一类写法的分类读不出主体类型。
+_NAMESPACES = "|".join(re.escape(name) for name in CATEGORY_NAMESPACES)
+
+#: MediaWiki 分类：`[[Category:角色]]` / `[[分类:角色|排序键]]` / `[[分類:角色]]`。
+_CATEGORY_LINK = re.compile(rf"\[\[\s*(?:{_NAMESPACES})\s*:\s*([^\]|]+)")
 #: 裸写一行的分类，架构文档 §1.4 把它列为结构信号之一。
-_CATEGORY_LINE = re.compile(r"^\s*(?:Category|分类)\s*:\s*(.+?)\s*$")
+_CATEGORY_LINE = re.compile(rf"^\s*(?:{_NAMESPACES})\s*:\s*(.+?)\s*$")
 
 #: 模板块里的一项 `| 键 = 值`。值到行尾或下一个竖线为止。
 _TEMPLATE_FIELD = re.compile(r"\|\s*([^|=\n]+?)\s*=\s*([^|\n]*)")

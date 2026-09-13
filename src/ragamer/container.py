@@ -15,11 +15,12 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from ragamer.config import Settings
+from ragamer.crawl import HttpCrawler
 from ragamer.llm import LlmClient, OpenAiLlm
 from ragamer.logging import get_logger
 from ragamer.mineru import MineruParser
 from ragamer.ocr import OcrEngine, RapidOcrEngine
-from ragamer.sources import MarkdownParser, ParserRouter, SourceParser
+from ragamer.sources import MarkdownParser, PageCrawler, ParserRouter, SourceParser
 from ragamer.stores.base import (
     ChunkStore,
     DocStore,
@@ -56,6 +57,8 @@ class Container:
     ocr: OcrEngine
     #: 解析适配器，按扩展名把一份资料交给唯一的那个（`ragamer.sources.ParserRouter`）。
     parser: SourceParser
+    #: 网页抓取。唯一一个往**外网**去的外部依赖，同样只在这里构造一次。
+    crawler: PageCrawler
 
     def stores(self) -> tuple[Store, ...]:
         """三个存储服务，自检按这个顺序走。"""
@@ -112,4 +115,5 @@ def build_container(settings: Settings) -> Container:
                 MineruParser(settings.mineru),
             )
         ),
+        crawler=HttpCrawler(settings.crawl),
     )

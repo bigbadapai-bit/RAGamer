@@ -33,6 +33,7 @@ _ADAPTERS = {
     "OpenAiLlm",
     "MineruParser",
     "RapidOcrEngine",
+    "HttpCrawler",
 }
 
 #: 只扫 `src/ragamer`：`tools/` 下是一次性运维脚本，不进包、没有测试缝可言，
@@ -51,6 +52,8 @@ _VENDOR_MODULES = {
     "FlagEmbedding": _PACKAGE / "vectors" / "bge.py",
     # 二次 OCR 是可选的 ocr 组，ocr 里同样是懒导入
     "rapidocr": _PACKAGE / "ocr.py",
+    # 网页正文抽取只发生在抓取适配器里：wikitext 那条路自己写，不碰它
+    "trafilatura": _PACKAGE / "crawl.py",
 }
 
 
@@ -73,6 +76,8 @@ def test_守则扫到了源码():
         "tagging.py",
         "sources.py",
         "mineru.py",
+        "crawl.py",
+        "wikitext.py",
         "importing.py",
         "enriching.py",
         "ocr.py",

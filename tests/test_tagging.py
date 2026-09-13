@@ -19,6 +19,7 @@ from ragamer.tagging import (
     read_document_structure,
     tag_document,
 )
+from ragamer.wikitext import CATEGORY_NAMESPACES
 
 RULES = ChunkRules(max_chars=200, min_chars=40, heading_density=0.02)
 
@@ -151,6 +152,17 @@ def test_认不出的分类被丢掉而不是猜():
     structure = read_document_structure("[[Category:需要整理的页面]]", TagVocabulary())
 
     assert structure.subject_types == ()
+
+
+def test_转换器认得的每一种分类写法这里都读得出来():
+    """两份清单会漂，漂掉的那一边不报错：转换器把 `[[分類:角色]]` 原样留着，
+    打标器却不认它，繁体站的词条页标签就悄无声息地空了。
+    """
+    vocabulary = TagVocabulary(term_mapping={"角色": SubjectType.CHARACTER})
+
+    for namespace in CATEGORY_NAMESPACES:
+        structure = read_document_structure(f"[[{namespace}:角色]]", vocabulary)
+        assert structure.subject_types == (SubjectType.CHARACTER,), namespace
 
 
 def test_归不出来时连它的名称字段也不当主体名():

@@ -3,7 +3,7 @@
 **来源差异只在这一层存在。** PDF 与图片走 MinerU（`ragamer.mineru`）、md／txt 直接读
 （`MarkdownParser`）、网页走爬虫，出了这一层只剩 `NormalizedDoc` 一种形态——
 切分与打标不必知道内容从哪来，新增一种来源也只动它自己的适配器。适配器由
-`ParserRouter` 按扩展名挑，爬虫那条在后面的票里接上。
+`ParserRouter` 按扩展名挑；网页没有扩展名可挑，它走另一个入口（`PageCrawler`）。
 
 归一化的**最后一步是发布附件**（`publish_assets`）：解析产物里的原图进对象存储，
 正文里的引用改指对象 key。出了这一层，图片地址只有对象 key 一种形态。
@@ -84,6 +84,9 @@ class NormalizedDoc:
     #: 解析产物里附带的二进制附件，还没进对象存储。`publish_assets` 把它们发出去，
     #: 之后这里就空了——归一化那条路上只有它一处拿得到这些字节。
     assets: tuple[SourceAsset, ...] = ()
+    #: 这份资料从哪来的地址。**只有网页来源有**：本地文件没有地址可填。
+    #: 它一路跟着切片进库，答案的引用里显示的就是它。
+    source_url: str = ""
 
 
 class SourceError(Exception):
@@ -104,6 +107,19 @@ class SourceParser(Protocol):
 
     def parse(self, source: SourceDocument) -> NormalizedDoc:
         """读不了时抛 :class:`SourceError`。"""
+        ...
+
+
+@runtime_checkable
+class PageCrawler(Protocol):
+    """一个网址 → 归一后的文档。与解析适配器同一个位置、同一种产物。
+
+    它自己不碰切分与打标：抓回来的东西和本地文件在 `NormalizedDoc` 这一层汇合，
+    下游那条链路分不出手上这份资料是从哪来的（验收要求「走完全相同的后续链路」）。
+    """
+
+    def crawl(self, url: str) -> NormalizedDoc:
+        """抓不了时抛 :class:`SourceError`。"""
         ...
 
 
@@ -180,7 +196,7 @@ def _unsupported(source: SourceDocument, suffixes: Sequence[str]) -> Unsupported
     return UnsupportedSourceError(
         f"{source.filename}：这个格式还没有对应的解析适配器"
         f"（现在只认 {'、'.join(suffixes)}）。"
-        "PDF 与图片走 MinerU、网页走爬虫；后者还没接上"
+        "PDF 与图片走 MinerU、网页走爬虫那一条入口"
     )
 
 

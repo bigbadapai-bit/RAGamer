@@ -45,6 +45,7 @@ FIELDS = (
     "game_id",
     "version",
     "doc_title",
+    "source_url",
     "chunk_type",
     "content_hash",
     "subject_type",
