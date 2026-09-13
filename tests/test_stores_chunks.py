@@ -15,7 +15,12 @@ from pymilvus import MilvusClient as RealMilvusClient
 
 from ragamer.config import MilvusSettings, load_settings
 from ragamer.stores import chunks
-from ragamer.stores.base import ChunkFilter, StoreError, StoreUnavailableError
+from ragamer.stores.base import (
+    UNVERSIONED,
+    ChunkFilter,
+    StoreError,
+    StoreUnavailableError,
+)
 from ragamer.stores.chunks import (
     DENSE_DIM,
     DENSE_WEIGHT,
@@ -126,6 +131,10 @@ class FakeMilvusClient:
     def query(self, **kwargs: Any) -> list[dict[str, Any]]:
         self._record("query", **kwargs)
         return list(self.rows)
+
+    def delete(self, **kwargs: Any) -> dict[str, int]:
+        self._record("delete", **kwargs)
+        return {"delete_count": len(kwargs.get("ids") or ())}
 
     def drop_collection(self, collection_name: str, **kwargs: Any) -> None:
         self._record("drop_collection", collection_name=collection_name)
@@ -450,6 +459,33 @@ def test_取一份文档的切片按顺序返回(store, milvus):
     assert [chunk.chunk_index for chunk in chunks_] == [0, 1, 2]
     call = _client(milvus).called("query")[0]
     assert call["filter"] == 'version in ["1.0", ""] and doc_title == "二郎神"'
+
+
+def test_按文档删只删这个版本的切片(store, milvus):
+    """重导 1.0 版不该连带删掉未标注版本——那是「新版本与旧版本并存」要留的（ADR-0004）。"""
+    milvus.rows = [
+        _row_of(make_chunk(1, chunk_index=0, version="1.0")),
+        _row_of(make_chunk(2, chunk_index=1, version="1.0")),
+        _row_of(make_chunk(3, chunk_index=0, version=UNVERSIONED)),
+        _row_of(make_chunk(4, chunk_index=0, version="2.0")),
+    ]
+
+    store.delete_document("black_myth", "二郎神", version="1.0")
+
+    assert _client(milvus).called("delete") == [
+        {"collection_name": "black_myth", "ids": [1, 2], "timeout": 2.5}
+    ]
+
+
+def test_按文档删时查回来的一批不带版本过滤之外的口径(store, milvus):
+    """查询那一趟仍走既有的表达式生成，删除不另开一个转义点。"""
+    milvus.rows = []
+
+    store.delete_document("black_myth", "二郎神", version="1.0")
+
+    call = _client(milvus).called("query")[0]
+    assert call["filter"] == 'version in ["1.0", ""] and doc_title == "二郎神"'
+    assert _client(milvus).called("delete") == []
 
 
 def test_删库是幂等的(store, milvus):

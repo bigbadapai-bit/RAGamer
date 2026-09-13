@@ -22,7 +22,7 @@ _CONTAINER_MODULE = _PACKAGE / "container.py"
 #: 读环境变量的名字。`from os import getenv` 之后是裸名字，只认属性会漏掉。
 _ENV_NAMES = {"environ", "environb", "getenv", "putenv", "load_dotenv"}
 
-#: 三个存储客户端与两个模型适配器的实现类。它们在组合根构造一次然后注入——
+#: 三个存储客户端、两个本地模型与语言模型的实现类。它们在组合根构造一次然后注入——
 #: 模块级单例换不掉，测试缝也就没了。
 _ADAPTERS = {
     "MilvusChunkStore",
@@ -30,6 +30,7 @@ _ADAPTERS = {
     "MinioObjectStore",
     "BgeM3Embedder",
     "BgeReranker",
+    "OpenAiLlm",
 }
 
 #: 供应商库只允许出现在各自的适配器模块里：其余模块只认 ragamer.stores 与
@@ -62,6 +63,9 @@ def test_守则扫到了源码():
         "llm.py",
         "chunking.py",
         "tagging.py",
+        "sources.py",
+        "importing.py",
+        "api.py",
         "logging.py",
         "memory.py",
         "chunks.py",

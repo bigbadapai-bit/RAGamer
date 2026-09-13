@@ -69,11 +69,27 @@ uv sync --extra models           # 装真实模型
 uv run pytest -m integration     # 跑真模型的集成测试（首次会下载几个 G 的权重）
 ```
 
+## 导入
+
+写入侧的入口是 `POST /api/kb/{game_id}/import`——上传若干份资料、每个文件独立处理。
+四个来源先归一为 Markdown（`ragamer.sources`），之后串起补图、切分、打标、向量化与入库
+（`ragamer.importing`）。现在只接上了 md／txt 一条来源，MinerU 与网页爬虫在后面两张票里接。
+
+- **一批里某个文件失败不牵连其余**：响应的 `results` 逐文件给结果，失败的那个带
+  `filename`、`stage`（卡在哪一步）与 `error`。整批都失败也是 200，不是 500。
+- **重复导入不产生重复切片**：切片主键由导入侧按「游戏 + 文档标题 + 版本 + 切片序号」算出来，
+  重导覆盖同一批 id；入库时再按文档整体替换，新切出来的片数变少也不会留下旧的那一截。
+- **同一份资料的另一个版本并存**：新版本作为新文档导入，删除只作用于它自己那个版本（ADR-0004）。
+- **入库的字段与建表时的显式声明一一对应**，不开动态字段。
+- 打标用的词表来自知识库元数据（MongoDB 的 `knowledge_bases` 集合，id 即游戏 id）。
+  库不存在时 404，不静默按默认词表建内容。
+
 ## 目录
 
 ```
-src/ragamer/          应用代码（config 配置装载、logging 日志、llm 语言模型适配器、chunking 切分器、
-                      tagging 打标、container 组合根、__main__ 启动自检）
+src/ragamer/          应用代码（config 配置装载、logging 日志、llm 语言模型适配器、sources 归一化、
+                      chunking 切分器、tagging 打标、importing 导入编排器、api HTTP 端点、
+                      container 组合根、__main__ 启动自检）
 src/ragamer/stores/   存储适配器：base 协议与共享类型、chunks Milvus、documents Mongo、objects MinIO、memory 内存假件
 src/ragamer/vectors/  向量化与精排：base 协议与共享类型、bge 真实模型、fake 确定性假件
 tests/                测试：行为测试 + 结构约束 + 集成测试

@@ -83,6 +83,13 @@ class InMemoryChunkStore:
         ]
         return sorted(chunks, key=lambda chunk: chunk.chunk_index)
 
+    def delete_document(self, game_id: str, doc_title: str, *, version: str) -> None:
+        """与真实适配器同一套走法：先按文档查，再只删版本精确对上的那些。"""
+        rows = self._collection(collection_name(game_id))
+        for chunk in self.fetch_document(game_id, doc_title, version=version):
+            if chunk.version == version:
+                del rows[chunk.chunk_id]
+
     def drop(self, game_id: str) -> None:
         self._collections.pop(collection_name(game_id), None)
 

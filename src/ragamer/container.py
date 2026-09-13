@@ -4,8 +4,9 @@
 `build_container` 每次都新建一套：调用两次得到两套互不相干的客户端。
 
 启动自检也在这里：`Container.check` 一次报出全部不通的服务。
-**两个模型不进自检**——它们的权重是几个 G，加载要等到第一次真的用到时；
-自检卡在这上面，`ragamer` 这条命令就没法当"配置对不对"的快速检查用了。
+**三个模型都不进自检**——两个本地模型的权重是几个 G，要等第一次真的用到时才加载；
+语言模型则要发一次网络请求，那是运行期的事。自检卡在这些上面，
+`ragamer` 这条命令就没法当"配置对不对"的快速检查用了。
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from ragamer.config import Settings
+from ragamer.llm import LlmClient, OpenAiLlm
 from ragamer.logging import get_logger
 from ragamer.stores.base import (
     ChunkStore,
@@ -41,6 +43,8 @@ class Container:
     objects: ObjectStore
     embedder: Embedder
     reranker: Reranker
+    #: 语言模型。打标兜底、查询路由、多查询改写、生成都走它。
+    llm: LlmClient
 
     def stores(self) -> tuple[Store, ...]:
         """三个存储服务，自检按这个顺序走。"""
@@ -75,7 +79,8 @@ def _collect(failures: list[StoreUnavailableError], probe: Callable[[], None]) -
 def build_container(settings: Settings) -> Container:
     """按配置构造全部外部依赖。构造只发生在这里。
 
-    两个模型在这里只是被造出来，权重等第一次真的要用时才加载（见 `ragamer.vectors.bge`）。
+    三个模型在这里只是被造出来：两个本地模型的权重等第一次真的要用时才加载
+    （见 `ragamer.vectors.bge`），语言模型则要等第一次调用才连。
     """
     timeout = settings.store_timeout_seconds
     return Container(
@@ -84,4 +89,5 @@ def build_container(settings: Settings) -> Container:
         objects=MinioObjectStore(settings.minio, timeout=timeout),
         embedder=BgeM3Embedder(settings.embed, settings.models),
         reranker=BgeReranker(settings.rerank, settings.models),
+        llm=OpenAiLlm(settings.llm),
     )

@@ -17,6 +17,10 @@ dependencies = [
     "pydantic-settings>=2.15",
     # 直接读 .env 做「未知键 / 取值被 ${…} 改写」这两项检查，pydantic-settings 不汇报
     "python-dotenv>=1.0",
+    # HTTP 层。界面是服务端渲染 + 局部刷新（ADR-0005），所以只要路由不要前端框架
+    "fastapi>=0.115",
+    # 上面那个的 multipart 解析：导入端点收的是上传的文件
+    "python-multipart>=0.0.20",
     # minio 的传输层就是 urllib3；要自定义 PoolManager 才能设连接超时并关掉重试
     "urllib3>=2.0",
 ]

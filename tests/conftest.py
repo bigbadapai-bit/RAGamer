@@ -9,6 +9,7 @@ import pytest
 
 from ragamer.config import get_settings
 from ragamer.container import Container
+from ragamer.llm import FakeLlm
 from ragamer.stores.base import Chunk, StoreUnavailableError
 from ragamer.stores.memory import InMemoryChunkStore, InMemoryDocStore, InMemoryObjectStore
 from ragamer.vectors.fake import FakeEmbedder, FakeReranker
@@ -61,10 +62,13 @@ def settings_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[di
     get_settings.cache_clear()
 
 
-def make_container(chunks=None, docs=None, objects=None, embedder=None, reranker=None) -> Container:
-    """造一个容器：五个依赖默认都是假件，测试只覆盖自己关心的那几个。
+def make_container(
+    chunks=None, docs=None, objects=None, embedder=None, reranker=None, llm=None
+) -> Container:
+    """造一个容器：六个依赖默认都是假件，测试只覆盖自己关心的那几个。
 
     内存假件与真实实现实现的是同一组协议，所以"应用跑起来"的测试都可以从它起步。
+    默认的语言模型一条脚本都没排：真被调用到就会当场炸，而不是静默返回空串。
     """
     return Container(
         chunks=chunks if chunks is not None else InMemoryChunkStore(),
@@ -72,6 +76,7 @@ def make_container(chunks=None, docs=None, objects=None, embedder=None, reranker
         objects=objects if objects is not None else InMemoryObjectStore(),
         embedder=embedder if embedder is not None else FakeEmbedder(),
         reranker=reranker if reranker is not None else FakeReranker(),
+        llm=llm if llm is not None else FakeLlm(),
     )
 
 

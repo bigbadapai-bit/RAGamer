@@ -140,6 +140,52 @@ def test_取一份文档的全部切片按顺序且不混版本(memory_container
     assert [chunk.chunk_index for chunk in chunks] == [0, 1]
 
 
+def test_按文档删只删这个版本的切片(memory_container):
+    """重导 1.0 版不该连带删掉未标注版本——那是「新版本与旧版本并存」要留的（ADR-0004）。"""
+    store = memory_container.chunks
+    store.ensure_collection("black_myth")
+    store.upsert(
+        "black_myth",
+        [
+            make_chunk(1, doc_title="二郎神", chunk_index=0, version="1.0"),
+            make_chunk(2, doc_title="二郎神", chunk_index=1, version="1.0"),
+            make_chunk(3, doc_title="二郎神", chunk_index=0, version=UNVERSIONED),
+            make_chunk(4, doc_title="寒江雪", chunk_index=0, version="1.0"),
+        ],
+    )
+
+    store.delete_document("black_myth", "二郎神", version="1.0")
+
+    assert [
+        chunk.chunk_id for chunk in store.fetch_document("black_myth", "二郎神", version="1.0")
+    ] == [3]
+    assert [
+        chunk.chunk_id for chunk in store.fetch_document("black_myth", "寒江雪", version="1.0")
+    ] == [4]
+
+
+def test_同一份文档的另一个版本不受影响(memory_container):
+    store = memory_container.chunks
+    store.ensure_collection("black_myth")
+    store.upsert(
+        "black_myth",
+        [
+            make_chunk(1, doc_title="二郎神", chunk_index=0, version="2.0"),
+            make_chunk(2, doc_title="二郎神", chunk_index=0, version="1.0"),
+        ],
+    )
+
+    store.delete_document("black_myth", "二郎神", version="1.0")
+
+    assert [
+        chunk.chunk_id for chunk in store.fetch_document("black_myth", "二郎神", version="2.0")
+    ] == [1]
+
+
+def test_删不存在的文档不报错(memory_container):
+    memory_container.chunks.delete_document("black_myth", "查无此页", version="1.0")
+
+
 def test_同一个切片_id_重复写入是覆盖不是追加(memory_container):
     """重导一份文档就是覆盖同一批 id，不产生重复切片。"""
     store = memory_container.chunks

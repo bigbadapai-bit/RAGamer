@@ -364,6 +364,25 @@ class MilvusChunkStore:
         )
         return sorted((_chunk(row) for row in rows), key=lambda chunk: chunk.chunk_index)
 
+    def delete_document(self, game_id: str, doc_title: str, *, version: str) -> None:
+        """先按文档查回主键，再只删版本精确对上的那些（见协议里的说明）。
+
+        `fetch_document` 的版本过滤是「该版本或未标注版本」，比删除要宽一档，
+        所以查回来的行还要自己再筛一遍。按主键删而不是按表达式删：取值的转义
+        因此只有 `filter_expression` 一处，删除这条路不会长出第二个转义点。
+        """
+        stale = [
+            chunk.chunk_id
+            for chunk in self.fetch_document(game_id, doc_title, version=version)
+            if chunk.version == version
+        ]
+        if not stale:
+            return
+        self._client().delete(
+            collection_name=collection_name(game_id), ids=stale, timeout=self._timeout
+        )
+        logger.info("删除 %s 在版本 %r 下的 %d 个旧切片", doc_title, version, len(stale))
+
     def drop(self, game_id: str) -> None:
         client = self._client()
         name = collection_name(game_id)

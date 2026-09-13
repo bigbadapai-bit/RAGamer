@@ -236,6 +236,18 @@ class ChunkStore(Store, Protocol):
         """
         ...
 
+    def delete_document(self, game_id: str, doc_title: str, *, version: str) -> None:
+        """删掉一份文档在**这个版本**下的全部切片。
+
+        重导一份资料时先清后写（见 `ragamer.importing`）：新一次切出来的片数变少时，
+        只靠覆盖写入会留下一截旧切片——查得出来、还会进聚合父块，而且不报错。
+
+        `version` 是**精确匹配**，不含「或未标注版本」那半句：那是检索的规则，不是删除的
+        规则。照检索的口径删，重导 1.0 版会连带删掉同一份文档的未标注版本——而那正是
+        「新版本与旧版本并存」（ADR-0004）要求留下来的东西。
+        """
+        ...
+
     def drop(self, game_id: str) -> None:
         """删掉该游戏的 collection。删库要清四处，这是其中一处。"""
         ...
