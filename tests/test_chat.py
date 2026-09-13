@@ -17,6 +17,7 @@ from fastapi.testclient import TestClient
 
 from ragamer.api import KB_COLLECTION, create_app
 from ragamer.llm import FakeLlm
+from ragamer.websearch import FakeWebSearch, WebResult
 
 from .conftest import (
     HalfwayLlm,
@@ -237,6 +238,31 @@ def test_没配路由表时走默认组合():
     ask(client, session_id, QUESTION)
 
     assert len(store.searches) == 2
+
+
+def test_时效型问题走联网兜底并在引用里标出来():
+    """一条链路的验收：知识库里没有的东西去外部搜回来，并且**标明这是搜来的**。
+
+    本地库是空的——这一路的意义就在这里，别按「没找到」处理。
+    """
+    result = WebResult(
+        "1.1 版本更新公告", "https://example.com/patch", "金箍棒改了。", "2026-01-02"
+    )
+    container = make_container(
+        llm=FakeLlm(said("这版本改了什么", route="时效型"), "金箍棒的基础伤害下调了[1]。"),
+        search=FakeWebSearch([result]),
+    )
+    container.docs.put(KB_COLLECTION, GAME, KB)
+    client = TestClient(create_app(container))
+    session_id = start(client)
+
+    parsed = parse_sse(ask(client, session_id, "这版本改了什么"))
+
+    events = [name for name, _ in parsed]
+    citations = parsed[events.index("citations")][1]["citations"]
+    assert [(item["index"], item["origin"]) for item in citations] == [(1, "web")]
+    assert citations[0]["url"] == result.url
+    assert events[-1] == "done"
 
 
 def test_路由表配坏了当场422():

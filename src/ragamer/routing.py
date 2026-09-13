@@ -88,8 +88,20 @@ class RecallPath(StrEnum):
     WEB = "web"
 
 
-#: 已经接上的路。其余四条在后面的票里补——选中了没接上的那条会跳过并留痕。
-WIRED_PATHS: frozenset[RecallPath] = frozenset({RecallPath.MAIN, RecallPath.METADATA})
+#: 已经接上的路。**逐条列出来，不写成 `frozenset(RecallPath)`**：它与
+#: `ragamer.retrieval` 里真正实现的那几支对齐，新加一条路时两处要一起改。写成「全部」
+#: 就少了一道提醒，而漏掉的表现是「路由表里配了那条路，却一条候选都没多出来」——
+#: 不报错。选中了没接上的那条会跳过并留痕。
+WIRED_PATHS: frozenset[RecallPath] = frozenset(
+    {
+        RecallPath.MAIN,
+        RecallPath.METADATA,
+        RecallPath.MULTI_QUERY,
+        RecallPath.HYDE,
+        RecallPath.TABLE,
+        RecallPath.WEB,
+    }
+)
 
 #: 默认路由表（§3.1 的那张表）：查询类型 → 走哪几路。
 #:

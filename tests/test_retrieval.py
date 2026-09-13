@@ -12,26 +12,41 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
 import pytest
 
+from ragamer import retrieval
+from ragamer.llm import FakeLlm, LlmTimeout
 from ragamer.retrieval import (
     CANDIDATE_LIMIT,
     MAX_CHUNKS,
     MAX_PARENT_CHARS,
     RRF_K,
+    WEB_RESULTS,
     aggregate_parents,
     cliff_cut,
     retrieve,
     rrf,
 )
 from ragamer.routing import RecallPath, Route
-from ragamer.stores.base import UNVERSIONED, ChunkFilter, ChunkHit
+from ragamer.stores.base import (
+    UNVERSIONED,
+    ChunkFilter,
+    ChunkHit,
+    StoreError,
+    StoreUnavailableError,
+)
 from ragamer.stores.memory import InMemoryChunkStore
 from ragamer.tagging import ContentNature, SubjectType
 from ragamer.vectors.base import Embedding, ModelOutputError
 from ragamer.vectors.fake import FakeEmbedder
+from ragamer.websearch import (
+    FakeWebSearch,
+    WebResult,
+    WebSearchRejected,
+    WebSearchUnavailable,
+)
 
 from .conftest import RecordingChunkStore, ScriptedReranker, chunk_store, make_chunk
 
@@ -63,6 +78,40 @@ class SilentEmbedder:
 
     def embed(self, texts: Sequence[str]) -> Embedding:
         return Embedding(dense=(), sparse=())
+
+
+class BrokenStore(InMemoryChunkStore):
+    """前几次检索失败、之后照常的切片存储。
+
+    用来摆出「某一路失败、另一路照常」的局面。路是按路由表里的先后依次检索的，
+    所以「第几次」就对得上「哪一路」——存储那边看不见是第几路在调它，
+    而那正是这一层要证的：它不挑是哪一路挂的。
+    """
+
+    def __init__(self, *, failing_times: int) -> None:
+        super().__init__()
+        self._failing = failing_times
+        self.attempts = 0
+
+    def search(
+        self,
+        game_id: str,
+        *,
+        dense: Sequence[float],
+        sparse: Mapping[int, float] | None = None,
+        where: ChunkFilter | None = None,
+        limit: int = 10,
+    ) -> list[ChunkHit]:
+        self.attempts += 1
+        if self.attempts <= self._failing:
+            raise StoreUnavailableError("Milvus", "milvus.test:19530", 2.5, "连接被拒绝")
+        return super().search(game_id, dense=dense, sparse=sparse, where=where, limit=limit)
+
+
+def broken_store(*, failing_times: int) -> BrokenStore:
+    store = BrokenStore(failing_times=failing_times)
+    store.upsert(GAME, [make_chunk(1)])
+    return store
 
 
 # --- 断崖截断 ---
@@ -185,7 +234,7 @@ def test_精排按分数排出顺序():
         reranker=ScriptedReranker({"正文1": 0.5, "正文2": 0.9, "正文3": 0.7}),
     )
 
-    assert [item.chunk.chunk_id for item in found] == [2, 3, 1]
+    assert [item.chunk.chunk_id for item in found.hits] == [2, 3, 1]
 
 
 def test_同分时按切片序号定序():
@@ -200,7 +249,7 @@ def test_同分时按切片序号定序():
         reranker=ScriptedReranker({"正文7": 0.5, "正文3": 0.5}),
     )
 
-    assert [item.chunk.chunk_id for item in found] == [3, 7]
+    assert [item.chunk.chunk_id for item in found.hits] == [3, 7]
 
 
 def test_过滤条件透传给存储():
@@ -233,7 +282,7 @@ def test_没有候选时不调精排():
         reranker=reranker,
     )
 
-    assert found == ()
+    assert found.hits == ()
     assert reranker.calls == []
 
 
@@ -358,7 +407,7 @@ def test_元数据过滤路按主体类型与内容性质取回候选():
     assert where.subject_types == (SubjectType.CHARACTER,)
     assert where.content_natures == (ContentNature.STATS,)
     # 三条都在库里，过滤之后只剩一条——透传对了才有的结果
-    assert [item.chunk.chunk_id for item in found] == [1]
+    assert [item.chunk.chunk_id for item in found.hits] == [1]
 
 
 def test_元数据过滤路的过滤条件不影响主检索路():
@@ -416,12 +465,36 @@ def test_两路都取到的切片只精排一次():
     )
 
     assert reranker.calls[0][1] == ["正文1"]
-    assert [item.chunk.chunk_id for item in found] == [1]
+    assert [item.chunk.chunk_id for item in found.hits] == [1]
 
 
-def test_还没接上的路跳过并留痕(caplog):
-    """静默跳过会让「这条路还没做」与「路由表配错了」在日志里长得一模一样，
-    而两者的处理方式完全相反（等下一张票 / 现在去改配置）。"""
+def test_没配依赖的路跳过并留痕(caplog):
+    """静默跳过会让「这条路这次跑不了」与「路由表配错了」在日志里长得一模一样，
+    而两者的处理方式相反（去补配置 / 现在去改路由表）。"""
+    store = chunk_store(GAME, make_chunk(1))
+
+    with caplog.at_level(logging.WARNING, logger="ragamer.retrieval"):
+        found = retrieve(
+            "二郎神怎么打",
+            game_id=GAME,
+            chunks=store,
+            embedder=FakeEmbedder(),
+            reranker=ScriptedReranker({"正文1": 0.9}),
+            # 没给语言模型：多查询改写与 HyDE 这两路这次跑不了
+            route=Route((RecallPath.MAIN, RecallPath.HYDE)),
+        )
+
+    assert [item.chunk.chunk_id for item in found.hits] == [1]
+    warnings = [
+        record.getMessage() for record in caplog.records if record.levelno == logging.WARNING
+    ]
+    assert any("hyde" in message for message in warnings)
+
+
+def test_还没接上的路跳过并留痕(caplog, monkeypatch):
+    """六条现在全接上了，这条拦截拦的是**新加的那条**：往词表里添一条路、却忘了在
+    检索层实现它，这时该跳过并说清楚，而不是落进默认那一支偷偷用原问检索一遍。"""
+    monkeypatch.setattr(retrieval, "WIRED_PATHS", frozenset({RecallPath.MAIN}))
     store = chunk_store(GAME, make_chunk(1))
 
     with caplog.at_level(logging.WARNING, logger="ragamer.retrieval"):
@@ -432,16 +505,17 @@ def test_还没接上的路跳过并留痕(caplog):
             embedder=FakeEmbedder(),
             reranker=ScriptedReranker({"正文1": 0.9}),
             route=Route((RecallPath.MAIN, RecallPath.HYDE)),
+            llm=FakeLlm({"queries": ["二郎神 打法"]}),
         )
 
-    assert [item.chunk.chunk_id for item in found] == [1]
+    assert [item.chunk.chunk_id for item in found.hits] == [1]
     warnings = [
         record.getMessage() for record in caplog.records if record.levelno == logging.WARNING
     ]
-    assert any("hyde" in message for message in warnings)
+    assert any("还没接上" in message for message in warnings)
 
 
-def test_选中的路一条都没接上时退回主检索(caplog):
+def test_选中的路一条都跑不了时退回主检索(caplog):
     """真按空组合跑，这一类问题会一条候选都取不到，对外只说一句「知识库里没有找到
     相关资料」——把一次配置事故说成了语料问题。"""
     store = chunk_store(GAME, make_chunk(1))
@@ -453,14 +527,349 @@ def test_选中的路一条都没接上时退回主检索(caplog):
             chunks=store,
             embedder=FakeEmbedder(),
             reranker=ScriptedReranker({"正文1": 0.9}),
-            route=Route((RecallPath.TABLE,)),
+            # 只选了 HyDE 却没给语言模型：这一条路跑不了，退回主检索
+            route=Route((RecallPath.HYDE,)),
         )
 
-    assert [item.chunk.chunk_id for item in found] == [1]
+    assert [item.chunk.chunk_id for item in found.hits] == [1]
     warnings = [
         record.getMessage() for record in caplog.records if record.levelno == logging.WARNING
     ]
     assert any("退回主检索" in message for message in warnings)
+
+
+# --- 多查询改写路 ---
+
+
+def test_多查询改写把扩出来的每一条各检索一遍():
+    """这一路的意义就在「各检索一遍」：合并成一次检索，扩出来的说法就白扩了。"""
+    store = RecordingChunkStore()
+    store.upsert(GAME, [make_chunk(1)])
+    embedder = FakeEmbedder()
+
+    found = retrieve(
+        "二郎神怎么打",
+        game_id=GAME,
+        chunks=store,
+        embedder=embedder,
+        reranker=ScriptedReranker({"正文1": 0.9}),
+        route=Route((RecallPath.MULTI_QUERY,)),
+        llm=FakeLlm({"queries": ["二郎神 打法", "二郎神 怎么打"]}),
+    )
+
+    assert embedder.calls == [["二郎神 打法", "二郎神 怎么打"]]
+    assert len(store.searches) == 2
+    assert [item.chunk.chunk_id for item in found.hits] == [1]
+
+
+def test_多查询改写只检索扩出来的问法():
+    """**原问由主检索路负责**——默认表里这两路总是成对出现，扩写那边也照这个前提去重
+    （与原问同形的会被丢掉）。所以这里断言的是：它自己不再查一遍原问。"""
+    store = RecordingChunkStore()
+    store.upsert(GAME, [make_chunk(1)])
+    embedder = FakeEmbedder()
+
+    retrieve(
+        "二郎神怎么打",
+        game_id=GAME,
+        chunks=store,
+        embedder=embedder,
+        reranker=ScriptedReranker({"正文1": 0.9}),
+        route=Route((RecallPath.MULTI_QUERY,)),
+        llm=FakeLlm({"queries": ["二郎神 打法"]}),
+    )
+
+    assert embedder.calls == [["二郎神 打法"]]
+
+
+def test_主检索与多查询改写之间也去重():
+    """模型偶尔会把原问原样吐回来。去重之后它不会变成两次一模一样的检索——
+    那不只是白跑一趟，还会让原问在 RRF 里投出两票。"""
+    store = RecordingChunkStore()
+    store.upsert(GAME, [make_chunk(1)])
+    embedder = FakeEmbedder()
+
+    retrieve(
+        "二郎神怎么打",
+        game_id=GAME,
+        chunks=store,
+        embedder=embedder,
+        reranker=ScriptedReranker({"正文1": 0.9}),
+        route=Route((RecallPath.MAIN, RecallPath.MULTI_QUERY)),
+        llm=FakeLlm({"queries": ["二郎神怎么打", "二郎神 打法"]}),
+    )
+
+    assert embedder.calls == [["二郎神怎么打", "二郎神 打法"]]
+    assert len(store.searches) == 2
+
+
+# --- HyDE 路 ---
+
+
+def test_HyDE拿假想答案去检索():
+    """这一路的全部要点：检索用的不是原问，是模型写的那段假想资料。"""
+    store = RecordingChunkStore()
+    store.upsert(GAME, [make_chunk(1)])
+    embedder = FakeEmbedder()
+    written = "二郎神是隐藏 BOSS，血量 8000，二阶段会分身。"
+
+    retrieve(
+        "那个很难的 BOSS 怎么过",
+        game_id=GAME,
+        chunks=store,
+        embedder=embedder,
+        reranker=ScriptedReranker({"正文1": 0.9}),
+        route=Route((RecallPath.HYDE,)),
+        llm=FakeLlm(written),
+    )
+
+    assert embedder.calls == [[written]]
+
+
+def test_HyDE的假想答案是模型编的不进交给生成的内容():
+    """把它当资料交出去，就是让模型照着自己编的东西回答——而且看起来与真答案一样。
+    所以进精排、进上下文的只能是检索回来的切片。"""
+    store = chunk_store(GAME, make_chunk(1))
+    reranker = ScriptedReranker({"正文1": 0.9})
+
+    found = retrieve(
+        "那个很难的 BOSS 怎么过",
+        game_id=GAME,
+        chunks=store,
+        embedder=FakeEmbedder(),
+        reranker=reranker,
+        route=Route((RecallPath.HYDE,)),
+        llm=FakeLlm("二郎神是隐藏 BOSS，血量 8000。"),
+    )
+
+    assert reranker.calls[0][1] == ["正文1"]
+    assert [item.chunk.chunk_id for item in found.hits] == [1]
+
+
+def test_假想答案一个字都没写出来时这一路不检索():
+    """空串拿去向量化会查出任意一批切片，与空问题的毛病是同一个。"""
+    store = RecordingChunkStore()
+    store.upsert(GAME, [make_chunk(1)])
+    embedder = FakeEmbedder()
+
+    found = retrieve(
+        "那个很难的 BOSS 怎么过",
+        game_id=GAME,
+        chunks=store,
+        embedder=embedder,
+        reranker=ScriptedReranker({}),
+        route=Route((RecallPath.HYDE,)),
+        llm=FakeLlm("   "),
+    )
+
+    assert embedder.calls == []
+    assert store.searches == []
+    assert found.hits == ()
+
+
+# --- 结构化表格路 ---
+
+
+def test_表格路只取表格切片():
+    """数值类问题的答案常在表里，而表格正文是排版过的行（`| 属性 | 值 |`），
+    与问句的字面重合度低，靠向量相似度排不上来——所以要单独去取它。"""
+    store = RecordingChunkStore()
+    store.upsert(GAME, [make_chunk(1), make_chunk(2, chunk_type="table")])
+
+    found = retrieve(
+        "寒江雪的属性",
+        game_id=GAME,
+        chunks=store,
+        embedder=FakeEmbedder(),
+        reranker=ScriptedReranker({"正文2": 0.9}),
+        route=Route((RecallPath.TABLE,)),
+    )
+
+    assert store.searches[0]["where"].chunk_type == "table"
+    assert [item.chunk.chunk_id for item in found.hits] == [2]
+
+
+def test_表格路也带上版本条件():
+    """版本那一条沿用检索的：这一路另立一套口径等于把版本判错两次（ADR-0004）。"""
+    store = RecordingChunkStore()
+    store.upsert(GAME, [make_chunk(1, chunk_type="table")])
+
+    retrieve(
+        "寒江雪的属性",
+        game_id=GAME,
+        chunks=store,
+        embedder=FakeEmbedder(),
+        reranker=ScriptedReranker({"正文1": 0.9}),
+        where=ChunkFilter(version="1.0"),
+        route=Route((RecallPath.TABLE,)),
+    )
+
+    assert store.searches[0]["where"].version == "1.0"
+
+
+# --- 联网兜底路 ---
+
+
+def web(*results: WebResult) -> FakeWebSearch:
+    """**一次**检索的脚本：这次搜回来这几条。要排「这一路失败」用 `FakeWebSearch(异常)`。"""
+    return FakeWebSearch(list(results))
+
+
+def test_联网那批单独给不进融合也不精排():
+    """它不是语料里的切片：没有父块可回查，也不该被当成语料参与精排与断崖。
+    合成的「切片」硬塞进候选池，只会在那两处各留一个特例。"""
+    store = RecordingChunkStore()
+    store.upsert(GAME, [make_chunk(1)])
+    reranker = ScriptedReranker({"正文1": 0.9})
+    result = WebResult("1.1 版本更新公告", "https://example.com/p", "金箍棒改了。", "2026-01-01")
+
+    found = retrieve(
+        "这版本改了什么",
+        game_id=GAME,
+        chunks=store,
+        embedder=FakeEmbedder(),
+        reranker=reranker,
+        route=Route((RecallPath.MAIN, RecallPath.WEB)),
+        search=web(result),
+    )
+
+    assert [item.chunk.chunk_id for item in found.hits] == [1]
+    assert found.web == (result,)
+    assert reranker.calls[0][1] == ["正文1"]  # 网络那批没进精排
+
+
+def test_联网按原问去搜():
+    """扩展那两路是给本地检索扩的；联网这一路问的就是用户那一句——
+    拿假想答案去搜外面，搜回来的东西与问题隔了一层。"""
+    store = chunk_store(GAME, make_chunk(1))
+    search = web(WebResult("公告", "https://example.com/p", "正文"))
+
+    retrieve(
+        "这版本改了什么",
+        game_id=GAME,
+        chunks=store,
+        embedder=FakeEmbedder(),
+        reranker=ScriptedReranker({"正文1": 0.9}),
+        route=Route((RecallPath.WEB,)),
+        search=search,
+    )
+
+    assert search.calls == [("这版本改了什么", WEB_RESULTS)]
+
+
+def test_只有网络来源时也算检索到了内容():
+    """本地一条都没有、网上有：这一路的意义就在这里，别按「没找到」处理。"""
+    found = retrieve(
+        "这版本改了什么",
+        game_id=GAME,
+        chunks=InMemoryChunkStore(),
+        embedder=FakeEmbedder(),
+        reranker=ScriptedReranker({}),
+        route=Route((RecallPath.WEB,)),
+        search=web(WebResult("公告", "https://example.com/p", "正文")),
+    )
+
+    assert found.hits == ()
+    assert bool(found)
+
+
+# --- 任一路失败不拖垮整体 ---
+
+
+def test_多查询改写失败不拖垮主检索(caplog):
+    """扩展那一路挂了是它自己的事：已经取回来的候选照常交出去。"""
+    store = chunk_store(GAME, make_chunk(1))
+
+    with caplog.at_level(logging.WARNING, logger="ragamer.retrieval"):
+        found = retrieve(
+            "二郎神怎么打",
+            game_id=GAME,
+            chunks=store,
+            embedder=FakeEmbedder(),
+            reranker=ScriptedReranker({"正文1": 0.9}),
+            route=Route((RecallPath.MAIN, RecallPath.MULTI_QUERY)),
+            llm=FakeLlm(LlmTimeout("模型超时")),
+        )
+
+    assert [item.chunk.chunk_id for item in found.hits] == [1]
+    warnings = [
+        record.getMessage() for record in caplog.records if record.levelno == logging.WARNING
+    ]
+    assert any("multi_query" in message for message in warnings)
+
+
+def test_联网失败不拖垮本地那几路(caplog):
+    """兜底那一路连不上，不该让本地语料的结果一起没了。"""
+    store = chunk_store(GAME, make_chunk(1))
+
+    with caplog.at_level(logging.WARNING, logger="ragamer.retrieval"):
+        found = retrieve(
+            "这版本改了什么",
+            game_id=GAME,
+            chunks=store,
+            embedder=FakeEmbedder(),
+            reranker=ScriptedReranker({"正文1": 0.9}),
+            route=Route((RecallPath.MAIN, RecallPath.WEB)),
+            search=FakeWebSearch(WebSearchUnavailable("连不上")),
+        )
+
+    assert [item.chunk.chunk_id for item in found.hits] == [1]
+    assert found.web == ()
+    warnings = [
+        record.getMessage() for record in caplog.records if record.levelno == logging.WARNING
+    ]
+    assert any("web" in message for message in warnings)
+
+
+def test_密钥或余额被拒按_ERROR_留痕(caplog):
+    """那之后每一次提问都会栽在这一路，只留一条 WARNING 会让人以为是偶发。"""
+    store = chunk_store(GAME, make_chunk(1))
+
+    with caplog.at_level(logging.ERROR, logger="ragamer.retrieval"):
+        retrieve(
+            "这版本改了什么",
+            game_id=GAME,
+            chunks=store,
+            embedder=FakeEmbedder(),
+            reranker=ScriptedReranker({"正文1": 0.9}),
+            route=Route((RecallPath.MAIN, RecallPath.WEB)),
+            search=FakeWebSearch(WebSearchRejected("HTTP 401")),
+        )
+
+    assert any(record.levelno == logging.ERROR for record in caplog.records)
+
+
+def test_所有选中的路都失败时把失败抛出去():
+    """一条路都没跑成不是「某一路的问题」：报成「知识库里没有找到相关资料」
+    等于把一次故障说成了语料问题（与空候选是两回事）。"""
+    store = broken_store(failing_times=2)
+
+    with pytest.raises(StoreError):
+        retrieve(
+            "二郎神怎么打",
+            game_id=GAME,
+            chunks=store,
+            embedder=FakeEmbedder(),
+            reranker=ScriptedReranker({}),
+            route=Route((RecallPath.MAIN, RecallPath.METADATA)),
+        )
+
+
+def test_有一路跑成了就不抛(caplog):
+    """主检索挂了但元数据路成了：有东西可用就继续答，失败的那一路留在日志里。"""
+    store = broken_store(failing_times=1)
+
+    with caplog.at_level(logging.WARNING, logger="ragamer.retrieval"):
+        found = retrieve(
+            "二郎神怎么打",
+            game_id=GAME,
+            chunks=store,
+            embedder=FakeEmbedder(),
+            reranker=ScriptedReranker({"正文1": 0.9}),
+            route=Route((RecallPath.MAIN, RecallPath.METADATA)),
+        )
+
+    assert [item.chunk.chunk_id for item in found.hits] == [1]
 
 
 # --- RRF 融合 ---

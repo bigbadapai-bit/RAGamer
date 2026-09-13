@@ -31,6 +31,7 @@ _ADAPTERS = {
     "BgeM3Embedder",
     "BgeReranker",
     "OpenAiLlm",
+    "BochaWebSearch",
 }
 
 #: 供应商库只允许出现在各自的适配器模块里：其余模块只认 ragamer.stores 与
@@ -66,8 +67,10 @@ def test_守则扫到了源码():
         "sources.py",
         "importing.py",
         "query.py",
+        "expanding.py",
         "routing.py",
         "retrieval.py",
+        "websearch.py",
         "answering.py",
         "conversations.py",
         "api.py",

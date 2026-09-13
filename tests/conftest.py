@@ -46,6 +46,9 @@ COMPLETE_ENV: dict[str, str] = {
     "RAGAMER_RERANK_MODEL": "test-rerank-model",
     "RAGAMER_RERANK_BATCH_SIZE": "32",
     "RAGAMER_RERANK_MAX_LENGTH": "2048",
+    "RAGAMER_SEARCH_BASE_URL": "https://search.test/v1/web-search",
+    "RAGAMER_SEARCH_API_KEY": "test-search-api-key",
+    "RAGAMER_SEARCH_TIMEOUT": "7.5",
 }
 
 
@@ -65,12 +68,13 @@ def settings_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[di
 
 
 def make_container(
-    chunks=None, docs=None, objects=None, embedder=None, reranker=None, llm=None
+    chunks=None, docs=None, objects=None, embedder=None, reranker=None, llm=None, search=None
 ) -> Container:
     """造一个容器：六个依赖默认都是假件，测试只覆盖自己关心的那几个。
 
     内存假件与真实实现实现的是同一组协议，所以"应用跑起来"的测试都可以从它起步。
     默认的语言模型一条脚本都没排：真被调用到就会当场炸，而不是静默返回空串。
+    `search` 默认是 `None`——与「没配检索服务」同一个状态，联网那一类用例自己传假件。
     """
     return Container(
         chunks=chunks if chunks is not None else InMemoryChunkStore(),
@@ -79,6 +83,7 @@ def make_container(
         embedder=embedder if embedder is not None else FakeEmbedder(),
         reranker=reranker if reranker is not None else FakeReranker(),
         llm=llm if llm is not None else FakeLlm(),
+        search=search,
     )
 
 
@@ -105,6 +110,7 @@ def make_chat(container: Container) -> Chat:
             embedder=container.embedder,
             reranker=container.reranker,
             llm=container.llm,
+            search=container.search,
         ),
         llm=container.llm,
     )

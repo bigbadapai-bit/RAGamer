@@ -105,10 +105,18 @@ def test_默认表里不按主体类型收窄():
     assert DEFAULT_TABLE.route_for(QueryType.FACTUAL).content_natures  # 另一维是默认就有的
 
 
-def test_接上的路只有两条():
-    """其余四条在后面的票里补。这张清单与 `ragamer.retrieval` 里真正实现的那些对齐，
-    对不上的表现是「配了那条路却一条候选都没多出来」。"""
-    assert WIRED_PATHS == {RecallPath.MAIN, RecallPath.METADATA}
+def test_接上的路逐条列出来():
+    """这张清单与 `ragamer.retrieval` 里真正实现的那些对齐，对不上的表现是
+    「配了那条路却一条候选都没多出来」。**新加一条路时它必须跟着改**——用例在这里
+    兜住，免得有人顺手把它改成 `frozenset(RecallPath)` 图省事。"""
+    assert WIRED_PATHS == {
+        RecallPath.MAIN,
+        RecallPath.METADATA,
+        RecallPath.MULTI_QUERY,
+        RecallPath.HYDE,
+        RecallPath.TABLE,
+        RecallPath.WEB,
+    }
 
 
 # --- 覆盖 ---

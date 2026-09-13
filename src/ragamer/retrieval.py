@@ -4,22 +4,33 @@
 精排重新打分 → 断崖截断决定交多少条给生成 → 按文档聚合父块决定每条交出去多少内容**。
 走哪几路由 `ragamer.routing` 决定，这一层只负责把选中的路跑出来。
 
-现在接了两路召回：
+六路召回都在这里：
 
 - **主混合检索路**：稠密与稀疏向量在同一批数据上融合（§3.2 的混合检索）。
 - **元数据过滤路**：按主体类型、内容性质、版本直接取候选，单路稠密检索。
   它要的是「按标签取」，再叠一路稀疏会把标签之外的近义内容也捞进来，正好抵消过滤。
+- **多查询改写路**：把问题扩成若干等价问法各自检索一遍（`ragamer.expanding`）。
+  每种说法各是一条独立的候选列表，一起进融合——换个说法就查得到，是这一路的全部意义。
+- **HyDE 路**：先生成一段假想答案，拿它去检索。假想答案是**模型编的，只用于检索**，
+  绝不进交给生成的上下文（否则就是让模型照着自己编的东西回答）。
+- **结构化表格路**：只取表格切片（`chunk_type=table`）。数值类问题的答案常在表里，
+  而表格切片的正文是排版过的行，与问句的字面重合度低，靠向量相似度排不上来。
+- **联网兜底路**：去外部检索（`ragamer.websearch`）。它**不进融合那一段**——外部结果
+  不是语料里的切片，没法精排也没法回查父块，硬塞进候选池只会让两种来路的内容混成
+  一批。它单独成一批交给生成，并且在引用上标出来源（这是「兜底」该有的样子：
+  本地查得到就轮不到它，本地不够时它补上，而且读的人知道这是网上搜来的）。
 
-其余四条（多查询改写、HyDE、结构化表格路、联网兜底）在后面几张票里接，复用的正是
-这一层的融合与截断两段——所以它们各自切开，不与取候选揉在一起。
+四处容易做错、做错了又不报错的：
 
-五处容易做错、做错了又不报错的：
-
-- **两路必须同一次产出**。稠密与稀疏出自同一个模型、同一批文本，所以向量化只调一次
-  （`:meth:`~ragamer.vectors.base.Embedder.embed``），融合交给存储适配器做——那是
-  「同一批数据上融合两路」（§3.2 的混合检索），不是多路召回。分两次调向量化，
-  两批文本对不上号既不报错也查不出来。多条召回路径同理：它们共用这一次向量化的结果，
-  各调一次向量化等于让各路检索的不是同一个问题。
+- **向量化只调一次**。稠密与稀疏出自同一个模型、同一批文本，融合交给存储适配器做
+  ——那是「同一批数据上融合两路」（§3.2 的混合检索），不是多路召回。分两次调向量化，
+  两批文本对不上号既不报错也查不出来。多条召回路径同理：它们共用这一次向量化的结果
+  （多查询改写与 HyDE 的那几段检索文本也一起进去），各调一次等于让各路问的不是同一个
+  问题。文本去重之后才送进模型——元数据路与主检索路问的是同一句，没有理由算两遍。
+- **任一路失败不拖垮整体**。多查询改写与 HyDE 要调模型、联网要发外部请求，都是会
+  单独失败的一路：失败的那一路记下来，其余路的结果照常作答。但**所有选中的路都失败**
+  时要把失败抛出去——那不是「某一路的问题」，报成「知识库里没有找到相关资料」等于把
+  一次故障说成了语料问题。
 - **多路之间比名次，不比分数**。主检索路的分数是稠密与稀疏加权之后的，元数据路的是
   单路稠密的，两者量纲不可比。直接比大小等于让量纲决定谁进上下文（§3.3 的 RRF）。
 - **精排吃正文，不吃 `content_meta`**。后者按设计不参与向量化（§2.2），打分同理：
@@ -36,14 +47,17 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 
 from ragamer.chunking import DEFAULT_MAX_CHARS
+from ragamer.expanding import hypothetical, rewrite
+from ragamer.llm import LlmClient, LlmError
 from ragamer.logging import get_logger
 from ragamer.routing import WIRED_PATHS, RecallPath, Route
-from ragamer.stores.base import Chunk, ChunkFilter, ChunkHit, ChunkStore
-from ragamer.vectors.base import Embedder, Embedding, ModelOutputError, Reranker
+from ragamer.stores.base import Chunk, ChunkFilter, ChunkHit, ChunkStore, StoreError
+from ragamer.vectors.base import Embedder, ModelOutputError, Reranker
+from ragamer.websearch import WebResult, WebSearch, WebSearchError, WebSearchRejected
 
 logger = get_logger(__name__)
 
@@ -71,6 +85,11 @@ CANDIDATE_LIMIT = MAX_CHUNKS * CANDIDATE_FACTOR
 #: 调它等于改「头部名次值多少」，与调断崖阈值是同一类事，都要先有评测集。
 RRF_K = 60
 
+#: 联网兜底一次要几条。**不参与融合，所以它不按 `CANDIDATE_LIMIT` 给**：那个数是
+#: 精排的候选池，而这一批直接交给生成。数值同样是**没有评测集时的占位**（§11）；
+#: 能讲清的只有它不该盖过本地语料——这一路是兜底，不是主力。
+WEB_RESULTS = 5
+
 #: 父块的长度上限（字符数）。整篇文档超过它就按命中切片所在的小节收敛（§2.5）。
 #:
 #: 量级由截断上界与单片上界乘出来：截断最多交 :data:`MAX_CHUNKS` 条，切分器单片正文
@@ -78,6 +97,27 @@ RRF_K = 60
 #: （§11）——模板块不受单片上限约束，这条乘法只是"一页"的大致边界，
 #: 真章是超长文档不该整页喂进去。
 MAX_PARENT_CHARS = MAX_CHUNKS * DEFAULT_MAX_CHARS
+
+
+@dataclass(frozen=True)
+class Retrieval:
+    """一次检索的全部结果，**两类来路分开给**。
+
+    语料里命中并截断的那一批（`hits`）是知识库里真有的东西，带精排分、能回查父块；
+    联网那批（`web`）是外部搜来的，既没进融合也没精排，只有搜索服务给的标题、地址与
+    摘要。两者在 `ragamer.answering` 里合成一份编号的资料清单，并且**标出来路**——
+    读答案的人要分得清哪句是查到的、哪句是搜来的。
+
+    分开放而不是塞进同一个序列：合成的「切片」既没有父块可回查、也不该被当成语料
+    参与精排与断崖，硬凑成一种会在这两处各留一个特例。
+    """
+
+    hits: tuple[ChunkHit, ...] = ()
+    web: tuple[WebResult, ...] = ()
+
+    def __bool__(self) -> bool:
+        """有没有东西可交给生成。调用方判「没找到」看的是它。"""
+        return bool(self.hits or self.web)
 
 
 def retrieve(
@@ -89,13 +129,15 @@ def retrieve(
     reranker: Reranker,
     where: ChunkFilter | None = None,
     route: Route | None = None,
-) -> tuple[ChunkHit, ...]:
+    llm: LlmClient | None = None,
+    search: WebSearch | None = None,
+) -> Retrieval:
     """按 `route` 选中的那几路取候选，融合、精排、截断后交给生成。
 
-    返回的分数是**精排分**，顺序即交出去的顺序。一条都没检索到时返回空元组——
-    由调用方决定没有内容时怎么办，这一层不编造内容。
+    `hits` 的分数是**精排分**，顺序即交出去的顺序。一条都没检索到时返回空的
+    :class:`Retrieval`——由调用方决定没有内容时怎么办，这一层不编造内容。
 
-    候选池固定取 :data:`CANDIDATE_LIMIT`（每路），不做成入参：池子一旦可以被调小到
+    候选池固定取 :data:`CANDIDATE_LIMIT`（每一次检索），不做成入参：池子一旦可以被调小到
     上界以内，上界就会把候选全保下来，断崖等于没生效，而两个参数看上去都还写在那里。
 
     :param query: 用来向量化与精排的文本。改写（`ragamer.query`）在外面做完再进来。
@@ -103,65 +145,204 @@ def retrieve(
         多路共用同一份——各路各自过滤，融合之后就分不清哪条候选是按哪套条件取的了。
     :param route: 这次走哪几路，由 `ragamer.routing` 按查询类型给出。**不给就只走
         主检索路**：这一层不替调用方选路。选中了还没接上的路会跳过并留痕。
+    :param llm: 多查询改写与 HyDE 要用的模型客户端。不给就用不了这两路，选中的话跳过。
+    :param search: 联网兜底要用的外部检索。不给就用不了这一路，选中的话跳过。
     :raises ModelOutputError: 向量化或精排的条数与候选对不上。宁可当场炸：
         按短的一边截齐会得到一个静默错位的排序，查不出、也不报错。
+    :raises ragamer.llm.LlmError: **所有选中的路都失败了**，且失败里有它。
+        只一路失败是记下来继续，见模块说明。
+    :raises ragamer.stores.base.StoreError: 同上。
+    :raises ragamer.websearch.WebSearchError: 同上。
     """
-    embedding = embedder.embed([query])
-    if len(embedding) != 1:
-        raise ModelOutputError(f"向量化返回了 {len(embedding)} 条，喂进去的是一个问题")
-    found = rrf(
-        [
-            _recall(path, embedding, game_id=game_id, chunks=chunks, where=where, route=route)
-            for path in _paths_to_run(route)
-        ]
+    paths = _paths_to_run(route, llm=llm, search=search)
+    failures: list[Exception] = []
+    plans = _plans(query, paths, llm=llm, failures=failures)
+    lists = _recall(
+        plans,
+        game_id=game_id,
+        chunks=chunks,
+        embedder=embedder,
+        where=where,
+        route=route,
+        failures=failures,
     )
+    web: list[WebResult] = []
+    if RecallPath.WEB in paths:
+        web = _web(query, search=search, failures=failures)
+    if not lists and not web and failures:
+        # 一条路都没跑成。这不是「某一路的问题」，不能退化成「没找到资料」
+        raise failures[0]
+    found = rrf(lists)
     if not found:
-        return ()  # 空候选上白调一次精排
-    return cliff_cut(_reranked(query, found, reranker))
+        return Retrieval(web=tuple(web))  # 空候选上白调一次精排
+    return Retrieval(cliff_cut(_reranked(query, found, reranker)), tuple(web))
 
 
-def _paths_to_run(route: Route | None) -> tuple[RecallPath, ...]:
-    """这次真正要跑的路。**没接上的跳过，一条都不剩时退回主检索路。**
+def _paths_to_run(
+    route: Route | None, *, llm: LlmClient | None, search: WebSearch | None
+) -> tuple[RecallPath, ...]:
+    """这次真正要跑的路。**没接上的、依赖没配的都跳过，一条都不剩时退回主检索路。**
 
     不给 `route` 就是只走主检索——选路是 `ragamer.routing` 的事，这一层不替调用方决定。
 
-    跳过要留痕：静默跳过会让「这条路还没做」与「路由表配错了」在日志里长得一模一样，
-    而两者的处理方式完全相反（等下一张票 / 现在去改配置）。**一条都不剩时退回主检索**
-    则是兜底：真按空组合跑，这一类问题会一条候选都取不到，对外只说一句「知识库里没有
-    找到相关资料」——把一次配置事故说成了语料问题。
+    「依赖没配」与「还没接上」是同一类事：这一路这次跑不了。两者都跳过并留痕——
+    静默跳过会让「这条路还没做」与「路由表配错了」在日志里长得一模一样，而处置方式
+    完全相反（等下一张票 / 现在去改配置）。**一条都不剩时退回主检索**则是兜底：真按空
+    组合跑，这一类问题会一条候选都取不到，对外只说一句「知识库里没有找到相关资料」
+    ——把一次配置事故说成了语料问题。
     """
     wanted = (RecallPath.MAIN,) if route is None else route.paths
-    wired = tuple(path for path in wanted if path in WIRED_PATHS)
-    skipped = [path.value for path in wanted if path not in WIRED_PATHS]
-    if skipped:
-        logger.warning("这些召回路径还没接上，本次跳过：%s", "、".join(skipped))
-    if not wired:
-        logger.warning("选中的路一条都没接上，退回主检索路")
+    missing = {
+        RecallPath.MULTI_QUERY: (llm is None, "没给语言模型"),
+        RecallPath.HYDE: (llm is None, "没给语言模型"),
+        RecallPath.WEB: (search is None, "没配外部检索服务"),
+    }
+    runnable: list[RecallPath] = []
+    for path in wanted:
+        unconfigured, why = missing.get(path, (False, ""))
+        if path not in WIRED_PATHS:
+            logger.warning("召回路径 %s 还没接上，本次跳过", path.value)
+        elif unconfigured:
+            logger.warning("召回路径 %s 用不了（%s），本次跳过", path.value, why)
+        else:
+            runnable.append(path)
+    if not runnable:
+        logger.warning("选中的路一条都跑不了，退回主检索路")
         return (RecallPath.MAIN,)
-    return wired
+    return tuple(runnable)
+
+
+def _plans(
+    query: str,
+    paths: Sequence[RecallPath],
+    *,
+    llm: LlmClient | None,
+    failures: list[Exception],
+) -> list[tuple[RecallPath, tuple[str, ...]]]:
+    """每一路各自拿哪几段文本去检索。生成类的两路在这里花掉一次模型调用。
+
+    失败记进 `failures` 并跳过这一路，不打断其余各路——多查询改写挂了不该让主检索
+    也跟着不跑。**HyDE 那段假想答案只留在这个列表里**：它是模型编的，交给生成就是
+    让模型照着自己编的东西回答（见模块说明）。
+    """
+    plans: list[tuple[RecallPath, tuple[str, ...]]] = []
+    for path in paths:
+        if path is RecallPath.WEB:
+            continue  # 联网不走向量化这一套，它有自己的取法
+        try:
+            if path is RecallPath.MULTI_QUERY:
+                texts = rewrite(query, llm=llm)
+            elif path is RecallPath.HYDE:
+                written = hypothetical(query, llm=llm)
+                texts = (written,) if written else ()
+            else:
+                texts = (query,)
+        except LlmError as exc:
+            _record(failures, path, exc)
+            continue
+        if texts:
+            plans.append((path, texts))
+    return plans
 
 
 def _recall(
+    plans: Sequence[tuple[RecallPath, tuple[str, ...]]],
+    *,
+    game_id: str,
+    chunks: ChunkStore,
+    embedder: Embedder,
+    where: ChunkFilter | None,
+    route: Route | None,
+    failures: list[Exception],
+) -> list[list[ChunkHit]]:
+    """把各路要检索的文本**一次向量化**，再各查各的。
+
+    返回的是一个「每次检索一个列表」的序列，直接喂给 :func:`rrf`——多查询改写扩出来
+    的每一条问法各是一次独立检索，各算各的名次，合成一条会让后一次的第一名排在前一次
+    的第三十名后面。
+
+    文本去重之后才送进模型：元数据路与主检索路问的是同一句，没有理由算两遍。
+    """
+    unique = list(dict.fromkeys(text for _, texts in plans for text in texts))
+    if not unique:
+        return []
+    embedding = embedder.embed(unique)
+    if len(embedding) != len(unique):
+        raise ModelOutputError(f"向量化返回了 {len(embedding)} 条，喂进去的是 {len(unique)} 段文本")
+    at = {text: index for index, text in enumerate(unique)}
+    found: list[list[ChunkHit]] = []
+    for path, texts in plans:
+        vectors = [(embedding.dense[at[text]], embedding.sparse[at[text]]) for text in texts]
+        try:
+            found.extend(
+                _search(path, vectors, game_id=game_id, chunks=chunks, where=where, route=route)
+            )
+        except StoreError as exc:
+            _record(failures, path, exc)
+    return found
+
+
+def _search(
     path: RecallPath,
-    embedding: Embedding,
+    vectors: Sequence[tuple[Sequence[float], Mapping[int, float]]],
     *,
     game_id: str,
     chunks: ChunkStore,
     where: ChunkFilter | None,
     route: Route | None,
-) -> list[ChunkHit]:
-    """跑一路召回。**向量化在调用方做过一次，这里只取用**——各路检索的必须是同一个问题。
+) -> list[list[ChunkHit]]:
+    """跑一路召回，**每段文本各出一个列表**。
 
-    只有两条路会走到这里（`_paths_to_run` 已经把没接上的滤掉了）。
+    向量化在调用方做过一次，这里只取用——各路检索的必须是同一个问题。
     """
-    metadata = path is RecallPath.METADATA
-    return chunks.search(
-        game_id,
-        dense=embedding.dense[0],
-        sparse=None if metadata else embedding.sparse[0],
-        where=_metadata_filter(where, route) if metadata else where,
-        limit=CANDIDATE_LIMIT,
-    )
+    if path is RecallPath.METADATA:
+        return [
+            chunks.search(
+                game_id,
+                dense=vectors[0][0],
+                sparse=None,  # 单路：理由见模块说明
+                where=_metadata_filter(where, route),
+                limit=CANDIDATE_LIMIT,
+            )
+        ]
+    if path is RecallPath.TABLE:
+        return [
+            chunks.search(
+                game_id,
+                dense=vectors[0][0],
+                sparse=vectors[0][1],
+                where=_table_filter(where),
+                limit=CANDIDATE_LIMIT,
+            )
+        ]
+    return [
+        chunks.search(game_id, dense=dense, sparse=sparse, where=where, limit=CANDIDATE_LIMIT)
+        for dense, sparse in vectors
+    ]
+
+
+def _web(query: str, *, search: WebSearch | None, failures: list[Exception]) -> list[WebResult]:
+    """联网兜底：去外部检索一趟。失败记进 `failures` 并当作这一路没贡献。"""
+    if search is None:  # `_paths_to_run` 已经把没配的滤掉了，这里只是类型上的收口
+        return []
+    try:
+        return search.search(query, limit=WEB_RESULTS)
+    except WebSearchError as exc:
+        _record(failures, RecallPath.WEB, exc)
+        return []
+
+
+def _record(failures: list[Exception], path: RecallPath, exc: Exception) -> None:
+    """记下失败的那一路，继续跑其余的。
+
+    密钥、余额这类**重试无用**的失败按 ERROR：之后每一次提问都会栽在这里，只留一条
+    WARNING 会让人以为是偶发（与 `ragamer.query` 对「被模型服务拒绝」的处置同一个理由）。
+    """
+    failures.append(exc)
+    if isinstance(exc, WebSearchRejected):
+        logger.error("召回路径 %s 被服务拒绝，之后的提问也会一直失败：%s", path.value, exc)
+    else:
+        logger.warning("召回路径 %s 失败，本次用其余路继续：%s", path.value, exc)
 
 
 def _metadata_filter(where: ChunkFilter | None, route: Route | None) -> ChunkFilter:
@@ -179,6 +360,15 @@ def _metadata_filter(where: ChunkFilter | None, route: Route | None) -> ChunkFil
         subject_types=route.subject_types or base.subject_types,
         content_natures=route.content_natures or base.content_natures,
     )
+
+
+def _table_filter(where: ChunkFilter | None) -> ChunkFilter:
+    """表格路的过滤条件：只留表格切片，**版本那一条沿用检索的**，理由同上。
+
+    表格切片的正文是排版过的行（`| 属性 | 值 |`），与问句的字面重合度低，靠向量相似度
+    排不上来——所以要单独去取它，而不是指望主检索路顺手捞回来。
+    """
+    return replace(where or ChunkFilter(), chunk_type="table")
 
 
 def rrf(lists: Sequence[Sequence[ChunkHit]]) -> list[ChunkHit]:

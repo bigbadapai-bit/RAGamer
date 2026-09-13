@@ -15,12 +15,14 @@ import logging
 
 import pytest
 
-from ragamer.answering import NOT_FOUND, TEMPERATURE, Answerer, Citation
+from ragamer.answering import NOT_FOUND, TEMPERATURE, Answer, Answerer, Citation
 from ragamer.llm import FakeLlm, LlmTimeout, Message
 from ragamer.retrieval import MAX_PARENT_CHARS
+from ragamer.routing import RecallPath, Route
 from ragamer.stores.base import UNVERSIONED
 from ragamer.stores.memory import InMemoryChunkStore
 from ragamer.vectors.fake import FakeEmbedder, FakeReranker
+from ragamer.websearch import FakeWebSearch, WebResult
 
 from .conftest import RecordingChunkStore, ScriptedReranker, chunk_store, make_chunk
 
@@ -58,13 +60,18 @@ BOSS_CHUNKS = (
 )
 
 
-def answerer(store: InMemoryChunkStore, llm, reranker=None) -> Answerer:
+def answerer(store: InMemoryChunkStore, llm, reranker=None, search=None) -> Answerer:
     """整条读取链的内存版：假向量、假精排、假模型，一行云端代码都不碰。
 
     默认的精排按词重合度打分；要摆出**指定的分数落差**（断崖）时换个 `ScriptedReranker`。
+    `search` 不给就是没配联网那一路，与「整组配置没填」同一个状态。
     """
     return Answerer(
-        chunks=store, embedder=FakeEmbedder(), reranker=reranker or FakeReranker(), llm=llm
+        chunks=store,
+        embedder=FakeEmbedder(),
+        reranker=reranker or FakeReranker(),
+        llm=llm,
+        search=search,
     )
 
 
@@ -127,6 +134,107 @@ def test_生成温度钉零():
     answerer(chunk_store(GAME, *BOSS_CHUNKS), llm).answer(QUESTION, game_id=GAME, version="1.0")
 
     assert llm.calls[0].temperature == TEMPERATURE == 0.0
+
+
+# --- 网络来源 ---
+
+#: 联网那条路搜回来的一条。时效型问题本地语料答不上来，靠的就是它。
+WEB_RESULT = WebResult(
+    "1.1 版本更新公告",
+    "https://example.com/patch",
+    "金箍棒的基础伤害下调，新增两件套装。",
+    "2026-01-02",
+)
+
+#: 只有联网那一路时的一次提问：本地库是空的。
+WEB_ONLY = Route((RecallPath.WEB,))
+
+
+def web(llm, *results: WebResult) -> Answerer:
+    """只接上联网那一路的读取链。"""
+    return answerer(InMemoryChunkStore(), llm, search=FakeWebSearch(list(results) or [WEB_RESULT]))
+
+
+def test_网络来源在提示词里带前缀():
+    """网络内容与语料混在一份答案里而不标出来，等于把「这是我们语料里写的」与
+    「这是网上说的」说成同一件事。"""
+    llm = FakeLlm("金箍棒的基础伤害下调了[1]。")
+
+    web(llm).answer(QUESTION, game_id=GAME, route=WEB_ONLY)
+
+    system = llm.calls[0].messages[0].content
+    assert "【网络】" in system
+    assert WEB_RESULT.url in system
+    assert WEB_RESULT.text in system
+
+
+def test_提示词交代了网络内容要说明出处():
+    """模型不交代出处，读的人就分不清哪句是查到的、哪句是搜来的。"""
+    llm = FakeLlm("金箍棒改了[1]。")
+
+    web(llm).answer(QUESTION, game_id=GAME, route=WEB_ONLY)
+
+    assert "说明这是网络上的说法" in llm.calls[0].messages[0].content
+
+
+def test_引用带上地址与来路():
+    """`url` 非空即网络来源——界面据此标出来，读的人据此判断可信度。"""
+    llm = FakeLlm("金箍棒的基础伤害下调了[1]。")
+
+    answer = web(llm).answer(QUESTION, game_id=GAME, route=WEB_ONLY)
+
+    citation = answer.citations[0]
+    assert (citation.index, citation.origin, citation.url) == (1, "web", WEB_RESULT.url)
+    assert citation.label == f"{WEB_RESULT.title}（{WEB_RESULT.url}，{WEB_RESULT.published_at}）"
+
+
+def test_只有网络来源时也作答():
+    """本地一条都没有、网上有：这一路的意义就在这里，别按「没找到」处理。"""
+    reply = "金箍棒的基础伤害下调了[1]。"
+    llm = FakeLlm(reply)
+
+    answer = web(llm).answer(QUESTION, game_id=GAME, route=WEB_ONLY)
+
+    assert answer.text == reply
+    assert answer.text != NOT_FOUND
+    assert [citation.origin for citation in answer.citations] == ["web"]
+
+
+def test_本地没配联网时按没找到处理():
+    """没配那一组配置时这一路直接跳过——不是「搜了但没有结果」，是根本没有这一路。"""
+    llm = FakeLlm()
+
+    answer = answerer(InMemoryChunkStore(), llm).answer(QUESTION, game_id=GAME, route=WEB_ONLY)
+
+    assert answer == Answer(NOT_FOUND, ())
+    assert llm.calls == []
+
+
+def test_语料在前网络在后且编号连续():
+    """模型看到的是一份资料清单：断号会让它以为中间还有没给它的东西。"""
+    store = chunk_store(GAME, make_chunk(1, content="二郎神怎么打：先定身", doc_title="二郎神"))
+    llm = FakeLlm("先定身[1]，另外公告说改了[2]。")
+
+    answer = answerer(store, llm, search=FakeWebSearch([WEB_RESULT])).answer(
+        QUESTION, game_id=GAME, route=Route((RecallPath.MAIN, RecallPath.WEB))
+    )
+
+    assert [(citation.index, citation.origin) for citation in answer.citations] == [
+        (1, "local"),
+        (2, "web"),
+    ]
+
+
+def test_语料里的引用没有地址():
+    """语料是导进来的资料，没有「原文地址」可给——编一个出来比留空更糟。"""
+    store = chunk_store(GAME, make_chunk(1, content="二郎神怎么打：先定身", doc_title="二郎神"))
+    llm = FakeLlm("先定身[1]。")
+
+    answer = answerer(store, llm).answer(QUESTION, game_id=GAME)
+
+    citation = answer.citations[0]
+    assert (citation.origin, citation.url) == ("local", "")
+    assert citation.label == "二郎神"
 
 
 # --- 聚合父块 ---

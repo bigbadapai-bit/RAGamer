@@ -83,6 +83,7 @@ def create_app(container: Container) -> FastAPI:
             embedder=container.embedder,
             reranker=container.reranker,
             llm=container.llm,
+            search=container.search,
         ),
         llm=container.llm,
     )
@@ -361,7 +362,13 @@ def _conversation_payload(conversation: Conversation) -> dict[str, Any]:
 
 
 def _citation_payload(citation: Citation) -> dict[str, Any]:
-    return {**asdict(citation), "label": citation.label}
+    """引用对外的样子。
+
+    `label` 与 `origin` 在这里补上：前者是显示用的那一行（怎么拼由 `Citation.label`
+    定，界面照抄就行），后者是「这条是知识库里查到的还是网上搜来的」。**`origin`
+    是个属性、`asdict` 带不出来**，而界面判它不该靠「url 是不是空串」去猜。
+    """
+    return {**asdict(citation), "label": citation.label, "origin": citation.origin}
 
 
 def _result_payload(result: ImportResult) -> dict[str, Any]:

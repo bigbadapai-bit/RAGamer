@@ -109,6 +109,22 @@ class ModelSettings(BaseModel):
     fp16: bool = False
 
 
+class SearchSettings(BaseModel):
+    """联网兜底路用的外部检索服务。
+
+    **整组都可以不配**，与三个存储不一样：存储不配就没得可查，而这一路只是六路召回
+    里的一路兜底——没配就跳过它、留一条痕，其余照跑（见 `ragamer.retrieval`）。
+    所以 `api_key` 是这一组里唯一没有默认值的语义项，用空表示「没配」。
+    """
+
+    #: 检索服务的地址。默认博查的 Web Search 接口——换别家就是改这一行加一个适配器。
+    base_url: NonEmptyStr = "https://api.bocha.cn/v1/web-search"
+    #: 密钥。留空即没配，这一路跳过。
+    api_key: SecretStr | None = None
+    #: 单次请求超时（秒）。比语言模型那一侧短：这一路是兜底，等不到就该让其余路先出答案。
+    timeout: float = Field(default=10.0, gt=0, le=60)
+
+
 class EmbedSettings(BaseModel):
     """向量化模型。**一个模型同时产出稠密与稀疏两路**，这是混合检索的基础。"""
 
@@ -164,6 +180,8 @@ class Settings(BaseSettings):
     llm: LlmSettings
     # 三个模型配置组都有完整默认值：不配也能跑，配了才落进 .env
     models: ModelSettings = Field(default_factory=ModelSettings)
+    # 联网兜底那一路的外部检索。整组可不配，理由见 SearchSettings
+    search: SearchSettings = Field(default_factory=SearchSettings)
     embed: EmbedSettings = Field(default_factory=EmbedSettings)
     rerank: RerankSettings = Field(default_factory=RerankSettings)
 
