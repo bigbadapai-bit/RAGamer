@@ -13,7 +13,9 @@
   与澄清反问「候选必须来自语料中真实存在的选项」是同一条约束。
 
 **这一步失败有降级路径**：模型挂了就按原问法继续，游戏与版本留空交回给调用方
-（会话里已经选定的那两个）。整个提问不该因为第一道处理失败而失败。
+（会话里已经选定的那两个）。整个提问不该因为第一道处理失败而失败。唯一按 ERROR
+报出来的是被服务端拒绝（密钥、模型名配错）——那种情况下之后每条提问都会这样降级，
+只留一条 WARNING 会让人看不出根因。
 """
 
 from __future__ import annotations
@@ -23,7 +25,7 @@ from dataclasses import dataclass
 
 from pydantic import BaseModel, Field
 
-from ragamer.llm import LlmClient, LlmError, LlmRequest, Message
+from ragamer.llm import LlmClient, LlmError, LlmRejected, LlmRequest, Message
 from ragamer.logging import get_logger
 from ragamer.stores.base import ChunkFilter
 
@@ -37,8 +39,9 @@ TEMPERATURE = 0.0
 class Understanding:
     """一次联合输出的结果。
 
-    游戏与版本判不出来时是空串，由调用方回落到会话里已选定的那一个；
-    空串的版本就是「未标注版本」，与库里 `version` 字段的取值同义。
+    游戏与版本判不出来时是空串，由调用方回落到会话里已选定的那一个。
+    **空串是「没判出来」，与库里 `version` 字段的「未标注版本」不是一回事**：
+    后者是一个必须被一并检索到的真实取值，前者只说明这一步没得出结论。
     """
 
     #: 问的是哪款游戏。判不出、或模型给的不在候选里，都是空串。
@@ -71,6 +74,11 @@ def understand(
         return degraded  # 空问题没有可理解的，也别白调一次模型
     try:
         guess = llm.complete_structured(_request(question, games, versions, history), _JointOutput)
+    except LlmRejected as exc:
+        # 密钥、模型名、参数配错这类问题重试无用，之后每一条提问都会栽在这里。
+        # 按 ERROR 报出来：降级成本身是对的，但根因不该只留一条 WARNING 让人去猜
+        logger.error("提问理解被模型服务拒绝，之后的提问也会一直降级：%s", exc)
+        return degraded
     except LlmError as exc:
         logger.warning("提问理解失败（%s），按原问法继续：%s", type(exc).__name__, exc)
         return degraded
@@ -86,30 +94,39 @@ def normalize_query(text: str) -> str:
 
     只压平空白，不动字面：同一个问法多打几个空格仍要命中同一条缓存，
     而「怎么打」与「打法」合并成一件事就得先标定阈值，v1 不做语义缓存。
+
+    模型给的取值对候选也是按它比的（见 `_pick`）：同一个归一形式因此有两个用处，
+    要收紧规则时得两处一起想清楚——收紧缓存那边会顺带收紧候选的比对。
     """
     return " ".join(text.split())
 
 
 def version_filter(version: str, *, current_version: str) -> ChunkFilter:
-    """检索用的版本过滤条件。**恒为「所选版本或未标注版本」**（ADR-0004）。
+    """检索用的版本过滤条件：「**所选版本或未标注版本**」（ADR-0004）。
 
-    版本按序从两处取第一个判得出来的：问题里点名的那个，其次是知识库的当前生效版本
+    版本按序取第一个判得出来的：问题里点名的那个，其次是知识库的现行版本
     ——`knowledge_bases` 是「当前该用哪个版本」的唯一真相来源，检索不自己维护一份。
+    两个参数的空串都表示「没判出来」。
 
-    两处都判不出来时**不做版本过滤**：过滤成「只留未标注版本」会把标了版本的资料整批
-    漏掉，而那是静默的；近重复之间互相稀释分数是看得见的代价，比漏内容轻。
+    **这里对 ADR-0004 的「版本过滤必须默认开启」有一处有意收窄**：两处都判不出来时
+    不做过滤。过滤成「只留未标注版本」会把标了版本的资料整批漏掉，而漏是静默的；
+    不过滤的代价只是近重复之间互相稀释分数，看得见。这条在日志里留痕，
+    不静默——知识库没标现行版本是该被修掉的配置问题。
     """
     chosen = version or current_version
+    if not chosen:
+        logger.warning("问题与知识库都给不出版本，本次检索不按版本过滤")
     return ChunkFilter(version=chosen or None)
 
 
 def _pick(value: str, candidates: Sequence[str], *, what: str) -> str:
     """把模型给的取值对到候选表里的那一个，对不上就留空。
 
-    候选为空即无解：宁可不判，也不接受一个库里不存在的取值。
+    候选为空即无解：宁可不判，也不接受一个库里不存在的取值——这时连提醒都不发，
+    提示词已经交代过「一律留空串」，是调用方没给候选，不是模型判错了。
     """
     wanted = normalize_query(value)
-    if not wanted:
+    if not wanted or not candidates:
         return ""
     for candidate in candidates:
         if normalize_query(candidate) == wanted:

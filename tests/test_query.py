@@ -9,8 +9,16 @@
 
 from __future__ import annotations
 
-from ragamer.llm import FakeLlm, LlmTimeout, Message
-from ragamer.query import Understanding, normalize_query, understand, version_filter
+import logging
+
+from ragamer.llm import FakeLlm, LlmRejected, LlmTimeout, Message
+from ragamer.query import (
+    TEMPERATURE,
+    Understanding,
+    normalize_query,
+    understand,
+    version_filter,
+)
 from ragamer.stores.base import UNVERSIONED, ChunkFilter, matches
 from ragamer.stores.memory import InMemoryChunkStore
 
@@ -28,13 +36,13 @@ JOINT_OUTPUT = {
 }
 
 
-def reply(**overrides: object) -> dict[str, object]:
+def _reply(**overrides: object) -> dict[str, object]:
     return {**JOINT_OUTPUT, **overrides}
 
 
 def test_一次调用同时拿回游戏版本与规范问法():
     """三个结果出自同一次调用。脚本只排了一条——真调第二次会当场炸（FakeLlm）。"""
-    llm = FakeLlm(reply())
+    llm = FakeLlm(_reply())
 
     result = understand(
         "那它怎么打",
@@ -49,8 +57,13 @@ def test_一次调用同时拿回游戏版本与规范问法():
 
 
 def test_指代被改写成带主体的规范问法():
-    """「那它怎么打」这类指代要补成带主体的问法，上一轮的话得一并喂进去。"""
-    llm = FakeLlm(reply(rewritten_query="二郎神怎么打"))
+    """**接线**的断言：模型吐回来的规范问法要原样带走，指代要补成主体名得靠上一轮的话。
+
+    改写本身做不做得对是模型的事，假件证不了——那一条在
+    `tests/test_query_integration.py` 里拿真模型问，默认不跑。这里只钉住
+    「历史带上了、改写结果没被丢掉」这两件接线上的事。
+    """
+    llm = FakeLlm(_reply(rewritten_query="二郎神怎么打"))
 
     result = understand(
         "那它怎么打",
@@ -69,21 +82,24 @@ def test_指代被改写成带主体的规范问法():
 def test_问法与改写结果都稳定可复现():
     """改写结果要能当缓存 key 用：同一个问法每次归一成形同一个样子。
 
-    温度钉死 0 是这件事的一半——温度没钉住，同一个问题每次问出来的改写都不一样，
-    缓存就永远命不中。另一半是归一化只压平空白，不做同义合并。
+    真正被断言的是归一化只压平空白、不做同义合并（后两行）——那是纯函数，
+    钉得住。温度那一行钉的是本模块的取值，**挡不住把参数删掉**：
+    `LlmRequest.temperature` 的默认值也是 0，删了照样过；它挡的是将来有人
+    把 `TEMPERATURE` 调高。同一个问法两次问出同一个改写要真模型才算数，
+    在 `tests/test_query_integration.py` 里。
     """
-    llm = FakeLlm(reply(rewritten_query="  二郎神   怎么打  "))
+    llm = FakeLlm(_reply(rewritten_query="  二郎神   怎么打  "))
 
     result = understand("那它怎么打", llm=llm, games=GAMES, versions=VERSIONS)
 
     assert result.rewritten_query == "二郎神 怎么打"
-    assert llm.calls[0].temperature == 0.0
+    assert llm.calls[0].temperature == TEMPERATURE == 0.0
     assert normalize_query(" 二郎神 怎么打") == normalize_query("二郎神   怎么打  ")
 
 
 def test_模型给出了候选里没有的游戏时丢掉():
     """模型自己编的游戏名在库里不存在，照它检索只会查空——留空交回给调用方。"""
-    llm = FakeLlm(reply(game="塞尔达传说"))
+    llm = FakeLlm(_reply(game="塞尔达传说"))
 
     result = understand("那个 BOSS 怎么打", llm=llm, games=GAMES, versions=VERSIONS)
 
@@ -93,7 +109,7 @@ def test_模型给出了候选里没有的游戏时丢掉():
 
 def test_没有任何候选时两个字段都留空():
     """调用方拿不出真实候选时不许模型自己编——候选为空即无解。"""
-    llm = FakeLlm(reply())
+    llm = FakeLlm(_reply())
 
     result = understand("二郎神怎么打", llm=llm)
 
@@ -104,7 +120,7 @@ def test_没有任何候选时两个字段都留空():
 
 def test_改写为空时退回原问法():
     """模型只吐了游戏与版本、没吐改写：拿原问法继续，别把空串传下去。"""
-    llm = FakeLlm(reply(rewritten_query=""))
+    llm = FakeLlm(_reply(rewritten_query=""))
 
     result = understand("二郎神怎么打", llm=llm, games=GAMES, versions=VERSIONS)
 
@@ -121,8 +137,23 @@ def test_模型失败时按原问法降级():
     assert result == Understanding("", "", "二郎神 怎么打")
 
 
+def test_模型被拒时按_ERROR_留痕(caplog):
+    """密钥或模型名配错，之后每条提问都会这样降级——只留 WARNING 会看不出根因。"""
+    llm = FakeLlm(LlmRejected("模型服务拒绝了请求（HTTP 401）"))
+
+    with caplog.at_level(logging.ERROR, logger="ragamer.query"):
+        understand("二郎神怎么打", llm=llm, games=GAMES, versions=VERSIONS)
+
+    assert any(record.levelno == logging.ERROR for record in caplog.records)
+
+
 def test_版本过滤恒包含未标注版本():
-    """ADR-0004：过滤条件必须是「所选版本**或**未标注版本」。"""
+    """ADR-0004：过滤条件必须是「所选版本**或**未标注版本」。
+
+    这一层能做的只是保证不把条件构造歪——「或未标注版本」那半句是
+    `stores/base.py` 的 `matches` 与 Milvus 适配器的表达式共有的语义，
+    它们各自有自己的测试。这里钉的是：经过 `version_filter` 之后那半句还在。
+    """
     where = version_filter("2.0", current_version="1.0")
 
     assert matches(make_chunk(1, version="2.0"), where)
@@ -130,21 +161,28 @@ def test_版本过滤恒包含未标注版本():
     assert not matches(make_chunk(3, version="1.0"), where)
 
 
-def test_问题没点名版本时用知识库的当前生效版本():
+def test_问题没点名版本时用知识库的现行版本():
     """问题里没提版本，就用知识库标着的那一个——它是「当前该用哪个版本」的唯一真相来源。"""
-    where = version_filter(UNVERSIONED, current_version="1.0")
+    where = version_filter("", current_version="1.0")
 
     assert matches(make_chunk(1, version="1.0"), where)
     assert matches(make_chunk(2, version=UNVERSIONED), where)
     assert not matches(make_chunk(3, version="2.0"), where)
 
 
-def test_两处都判不出时不按版本过滤():
-    """没有版本可依据时不做过滤：宁可近重复互相稀释，也不能静默漏掉整批内容。"""
-    where = version_filter(UNVERSIONED, current_version=UNVERSIONED)
+def test_两处都判不出时不按版本过滤并留痕(caplog):
+    """没有版本可依据时不做过滤，但要留痕（ADR-0004 的「默认开启」在这里有意收窄）。
+
+    过滤成「只留未标注版本」会把标了版本的资料整批漏掉，那是静默的；
+    不过滤只是近重复互相稀释，看得见。知识库没标现行版本是该被修掉的配置问题，
+    所以这件事不能悄悄发生。
+    """
+    with caplog.at_level(logging.WARNING, logger="ragamer.query"):
+        where = version_filter("", current_version="")
 
     assert where == ChunkFilter(version=None)
     assert matches(make_chunk(1, version="2.0"), where)
+    assert "不按版本过滤" in caplog.text
 
 
 def test_标注版本的资料与未标注版本的资料都能被检索到():

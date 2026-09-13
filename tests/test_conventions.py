@@ -65,6 +65,7 @@ def test_守则扫到了源码():
         "tagging.py",
         "sources.py",
         "importing.py",
+        "query.py",
         "api.py",
         "logging.py",
         "memory.py",
