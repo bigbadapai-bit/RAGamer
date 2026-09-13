@@ -57,6 +57,8 @@ packages = ["src/ragamer"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# tools/ 下的实验脚本不进包，但它的口径（哪种图片条目算「有图无字」）要能测
+pythonpath = ["tools"]
 markers = [
     "integration: 需要真实云端与真实模型，默认不跑",
 ]

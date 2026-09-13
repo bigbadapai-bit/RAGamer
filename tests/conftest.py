@@ -10,6 +10,7 @@ import pytest
 from ragamer.config import get_settings
 from ragamer.container import Container
 from ragamer.llm import FakeLlm
+from ragamer.sources import MarkdownParser, ParserRouter
 from ragamer.stores.base import Chunk, StoreUnavailableError
 from ragamer.stores.memory import InMemoryChunkStore, InMemoryDocStore, InMemoryObjectStore
 from ragamer.vectors.fake import FakeEmbedder, FakeReranker
@@ -36,6 +37,12 @@ COMPLETE_ENV: dict[str, str] = {
     "RAGAMER_LLM_MAX_ATTEMPTS": "5",
     "RAGAMER_LLM_BACKOFF_BASE": "0.25",
     "RAGAMER_LLM_BACKOFF_MAX": "4",
+    "RAGAMER_MINERU_BASE_URL": "https://mineru.test",
+    "RAGAMER_MINERU_API_KEY": "test-mineru-api-key",
+    "RAGAMER_MINERU_MODEL_VERSION": "pipeline",
+    "RAGAMER_MINERU_POLL_INTERVAL_SECONDS": "0.5",
+    "RAGAMER_MINERU_POLL_TIMEOUT_SECONDS": "30",
+    "RAGAMER_MINERU_REQUEST_TIMEOUT_SECONDS": "12.5",
     "RAGAMER_MODELS_DEVICE": "cuda:1",
     "RAGAMER_MODELS_FP16": "true",
     "RAGAMER_EMBED_MODEL": "test-embed-model",
@@ -63,12 +70,14 @@ def settings_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[di
 
 
 def make_container(
-    chunks=None, docs=None, objects=None, embedder=None, reranker=None, llm=None
+    chunks=None, docs=None, objects=None, embedder=None, reranker=None, llm=None, parser=None
 ) -> Container:
-    """造一个容器：六个依赖默认都是假件，测试只覆盖自己关心的那几个。
+    """造一个容器：依赖默认都是假件，测试只覆盖自己关心的那几个。
 
     内存假件与真实实现实现的是同一组协议，所以"应用跑起来"的测试都可以从它起步。
     默认的语言模型一条脚本都没排：真被调用到就会当场炸，而不是静默返回空串。
+    默认的解析器也只有 md／txt 那条路——真正接上 MinerU 的是组合根，
+    这里换掉就等于把那份资料交给假件。
     """
     return Container(
         chunks=chunks if chunks is not None else InMemoryChunkStore(),
@@ -77,6 +86,7 @@ def make_container(
         embedder=embedder if embedder is not None else FakeEmbedder(),
         reranker=reranker if reranker is not None else FakeReranker(),
         llm=llm if llm is not None else FakeLlm(),
+        parser=parser if parser is not None else ParserRouter((MarkdownParser(),)),
     )
 
 

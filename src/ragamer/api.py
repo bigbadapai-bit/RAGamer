@@ -34,6 +34,8 @@ def create_app(container: Container) -> FastAPI:
         chunks=container.chunks,
         embedder=container.embedder,
         llm=container.llm,
+        parser=container.parser,
+        objects=container.objects,
     )
 
     @app.post("/api/kb/{game_id}/import")

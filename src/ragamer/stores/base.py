@@ -314,3 +314,33 @@ def normalize_prefix(prefix: str) -> str:
     静默失效。列表与按前缀删共用这一个函数，前缀对不上的可能就不存在了。
     """
     return prefix.lstrip("/")
+
+
+#: 原图在对象存储里的顶层前缀。删库清原图按它下面那一级走。
+IMAGE_PREFIX = "images"
+
+
+def image_prefix(game_id: str, digest: str = "") -> str:
+    """一个游戏的原图前缀；给了 `digest` 就再收窄到这一份来源文件。
+
+    对象名分两级：游戏一级、来源文件一级。**写入与清理共用这一个函数**——
+    原项目那处坑是 list 与 put 各拼一遍前缀、两处对不上，于是清旧图静默失效；
+    这里只要两处都调它，前缀就没有对不上的余地。
+
+    删库时按 `image_prefix(game_id)` 清一次就够，不必知道当初导过哪些文件。
+    """
+    return "/".join(part for part in (IMAGE_PREFIX, game_id, digest) if part)
+
+
+def image_key(game_id: str, digest: str, name: str) -> str:
+    """一个附件的对象 key。
+
+    `digest` 取自来源文件的字节：同一份文件重导算出的 key 完全一致，图片原地覆盖，
+    与切片主键由导入侧分配（`ragamer.importing.chunk_id`）是同一套幂等思路；
+    不同文件即使同名也各有各的一层，不会互相覆盖。
+
+    **代价**：同一份资料改了内容再导，算出的 digest 变了，上一版的图片会留在旧的
+    那一层——它按游戏一级清理时一并收走（`image_prefix(game_id)`）。比按文件名分层强：
+    那样两份同名不同内容的截图会互相覆盖，答案是配错图，而且不报错。
+    """
+    return f"{image_prefix(game_id, digest)}/{name}"
