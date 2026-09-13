@@ -240,13 +240,14 @@ def test_正文里找不到引用的文字接到文末():
 
 
 def test_视觉摘要写进空的_alt():
-    vision = FakeLlm("二郎神立绘，全身正面")
+    vision = FakeLlm("二郎神立绘，全身正面", "物品图标")
 
     enriched = make_enricher(vision=vision).enrich(make_doc())
 
     assert f"![二郎神立绘，全身正面]({A})" in enriched.markdown
+    assert f'<img src="{B}" alt="物品图标" />' in enriched.markdown
     # 一次调用一张图，图跟着消息发出去
-    assert len(vision.calls) == 1
+    assert len(vision.calls) == 2
     assert vision.calls[0].messages[-1].images[0].data == b"png-a"
 
 
@@ -261,14 +262,28 @@ def test_已有_alt_的图不覆盖也不调模型():
     assert vision.calls == []
 
 
-def test_HTML_引用的图不写摘要():
-    """`<img>` 没有可写摘要的位置——硬塞一个 alt 属性会把原来的标签改得残缺。"""
+def test_HTML_引用的图把摘要写进_alt_属性():
+    """表格内嵌的图正是「图里没有文字」概率最高的一类，不补就一点可检索的文本都没有。
+
+    标签的其余部分不动：自闭合的斜杠要留在最后。
+    """
     vision = FakeLlm("不该被用到")
     doc = make_doc(markdown=f'<table><tr><td><img src="{B}"/></td></tr></table>\n')
 
     enriched = make_enricher(vision=vision).enrich(doc)
 
-    assert f'<img src="{B}"/>' in enriched.markdown
+    assert f'<img src="{B}" alt="不该被用到" />' in enriched.markdown
+
+
+def test_HTML_引用已有_alt_属性时不覆盖():
+    vision = FakeLlm("不该被用到")
+    doc = make_doc(markdown=f'<img src="{B}" alt="物品图标" width="32">\n')
+
+    enriched = make_enricher(vision=vision).enrich(doc)
+
+    assert '<img src="' in enriched.markdown
+    assert 'alt="物品图标"' in enriched.markdown
+    assert 'width="32"' in enriched.markdown
     assert vision.calls == []
 
 

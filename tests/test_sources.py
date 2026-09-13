@@ -9,7 +9,7 @@ from __future__ import annotations
 import pytest
 
 from ragamer.sources import (
-    ImageEnricher,
+    Enricher,
     MarkdownParser,
     NormalizedDoc,
     ParserRouter,
@@ -19,8 +19,10 @@ from ragamer.sources import (
     SourceParser,
     UnsupportedSourceError,
     image_refs,
+    image_refs_in,
     publish_assets,
     rewrite_image_refs,
+    set_image_alt,
 )
 from ragamer.stores.base import image_key, image_prefix
 from ragamer.stores.memory import InMemoryObjectStore
@@ -106,13 +108,13 @@ def test_不是_UTF8_时点名文件而不是读成乱码():
 
 
 def test_补图的协议进出都是归一化文档():
-    """真实实现要等二次 OCR 那一票；这里的假件钉住缝的形状。"""
+    """实现是 `ragamer.enriching.ImageEnricher`；这里的假件钉住缝的形状。"""
 
     class Passthrough:
         def enrich(self, doc: NormalizedDoc) -> NormalizedDoc:
             return doc
 
-    assert isinstance(Passthrough(), ImageEnricher)
+    assert isinstance(Passthrough(), Enricher)
 
 
 # --- 图片引用的两种形式 ---
@@ -133,6 +135,52 @@ def test_两种形式的引用按出现顺序排():
 
 def test_没有_src_的_img_不算引用():
     assert image_refs('<img class="icon" alt="图">') == ()
+
+
+def test_两种形式的替代文本都读得出来():
+    refs = image_refs_in('![甲](a.png)\n\n<img src="b.png" alt="乙">\n\n![](c.png)\n')
+
+    assert [(item.ref, item.alt) for item in refs] == [
+        ("a.png", "甲"),
+        ("b.png", "乙"),
+        ("c.png", ""),
+    ]
+
+
+def test_alt_在_src_前面也读得出来():
+    """属性顺序不固定，只截到 `src` 结尾就看不到写在它前面的 `alt`。"""
+    refs = image_refs_in('<img alt="甲" class="icon" src="a.png">')
+
+    assert [(item.ref, item.alt) for item in refs] == [("a.png", "甲")]
+
+
+# --- 写替代文本 ---
+
+
+def test_给替代文本空着的引用写摘要():
+    text = '![](a.png)\n\n<img src="b.png">\n'
+
+    written = set_image_alt(text, {"a.png": "甲", "b.png": "乙"})
+
+    assert written == '![甲](a.png)\n\n<img src="b.png" alt="乙">\n'
+
+
+def test_已经写好的替代文本不动():
+    """作者或解析器给的说明比模型现补的一段准，覆盖等于拿更差的换掉能用的。"""
+    text = '![甲](a.png)\n\n<img src="b.png" alt="乙">\n'
+
+    assert set_image_alt(text, {"a.png": "新甲", "b.png": "新乙"}) == text
+
+
+def test_补_alt_时保留标签的其余部分():
+    """宽高之类的属性不动；自闭合的斜杠要留在最后。"""
+    text = '<img src="a.png" width="32" />'
+
+    assert set_image_alt(text, {"a.png": "甲"}) == '<img src="a.png" width="32" alt="甲" />'
+
+
+def test_没有摘要的引用原样留着():
+    assert set_image_alt("![](a.png)", {}) == "![](a.png)"
 
 
 def test_换掉两种形式的引用():

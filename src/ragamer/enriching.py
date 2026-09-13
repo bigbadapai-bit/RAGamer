@@ -85,7 +85,10 @@ class ImageEnricher:
     def enrich(self, doc: NormalizedDoc) -> NormalizedDoc:
         """展开折叠块、补二次 OCR 的文字、给空 alt 写摘要。
 
-        没有条目级结构的产物原样返回：那不是 MinerU 那条路的产物（见模块文档）。
+        没有条目级结构的产物原样返回。**这道门是有意的**：T10 说的「见到就展开」指的是
+        别的 MinerU 输入形态（那场实验只覆盖了截图），那些产物同样带 `content_list`，
+        这道门拦不住它们；它拦的是 md／txt 与网页——那几种来源里 `<details>` 可能是作者
+        真的在讲这个元素，而且没有条目级结构就没法按图取原图做 OCR（见模块文档）。
         """
         if not doc.content_list:
             return doc
@@ -147,14 +150,17 @@ class ImageEnricher:
         return texts
 
     def _alt_texts(self, markdown: str, assets: Mapping[str, bytes]) -> dict[str, str]:
-        """给替代文本空着的图配一段摘要。没接视觉模型时一个都不做。"""
+        """给替代文本空着的图配一段摘要。没接视觉模型时一个都不做。
+
+        Markdown 与 HTML 两种引用都做：表格内嵌的图是 HTML 那种，而它恰恰是
+        「图里没有文字」概率最高的一类（图标、示意图），不补就一点可检索的文本都没有。
+        """
         vision = self.vision
         if vision is None:
             return {}
         alt_by_ref: dict[str, str] = {}
         for item in image_refs_in(markdown):
-            # `alt is None` 是 HTML 的 `<img>`：那里没有写摘要的位置
-            if item.alt is None or item.alt.strip() or item.ref in alt_by_ref:
+            if item.alt.strip() or item.ref in alt_by_ref:
                 continue
             data = assets.get(item.ref)
             if data is None:
@@ -271,12 +277,12 @@ def _line_end(markdown: str, position: int) -> int:
 
 
 def _alt_text(answer: str) -> str:
-    """把模型给的一句话压成一行、去掉方括号。
+    """把模型给的一句话压成一行，并去掉会撑破容器的字符。
 
-    替代文本夹在 `![` 与 `]` 之间，里面再出现方括号会把这一段 Markdown 拆掉——
-    那之后整段引用认不出来，图也就跟着丢了。
+    替代文本有两个落点：Markdown 的 `![…]` 里出现方括号会把这一段引用拆掉，
+    HTML 的 `alt="…"` 里出现引号同理——两处都得清，清多了只是少两个字。
     """
-    return re.sub(r"[\[\]]", "", " ".join(answer.split())).strip()
+    return re.sub(r"[\[\]\"]", "", " ".join(answer.split())).strip()
 
 
 def _media_type(data: bytes) -> str:

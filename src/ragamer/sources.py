@@ -8,9 +8,11 @@
 归一化的**最后一步是发布附件**（`publish_assets`）：解析产物里的原图进对象存储，
 正文里的引用改指对象 key。出了这一层，图片地址只有对象 key 一种形态。
 
-`ImageEnricher` 的缝也开在这里：补图吃一份 `NormalizedDoc`、吐一份 `NormalizedDoc`，
+`Enricher` 的缝也开在这里：补图吃一份 `NormalizedDoc`、吐一份 `NormalizedDoc`，
 位置在归一化与切分之间。它要处理的三件事（VLM 摘要进 alt、展开 MinerU 的 `<details>`
-折叠块、二次 OCR 回填）见 docs/ARCHITECTURE.md §1.2 与 §1.3，真实实现由那一票接上。
+折叠块、二次 OCR 回填）见 docs/ARCHITECTURE.md §1.2 与 §1.3，实现是
+`ragamer.enriching.ImageEnricher`。**协议与实现刻意不同名**，与本仓别处一致
+（`SourceParser` 对 `MarkdownParser`、`LlmClient` 对 `OpenAiLlm`）。
 """
 
 from __future__ import annotations
@@ -29,10 +31,14 @@ logger = get_logger(__name__)
 #: 图片引用的两种形式。取地址，供补图那一层去取原图。
 #: **两种都要认**：MinerU 把表格内嵌的图片导成 HTML 的 `<img>`，只认 Markdown 那种
 #: 会把它们静默漏掉——补图那一层于是取不到这些原图，而且不报错。
-#: Markdown 那种分三段是因为补图要往替代文本里写摘要（见 `set_image_alt`）：
+#: 两种都分出了替代文本那一段，因为补图要往那里写摘要（见 `set_image_alt`）：
 #: 空着才写，作者已经写好的不动。
 _MD_IMAGE = re.compile(r"!\[([^\]]*)\]\((\s*)([^)\s]+)")
-_HTML_IMAGE = re.compile(r"(<img\b[^>]*?\bsrc=[\"'])([^\"']+)([\"'])", re.IGNORECASE)
+#: HTML 那种取**整个标签**：`alt` 可以在 `src` 前面也可以在后面，只截到 `src` 结尾
+#: 就看不到它了。`src` 与 `alt` 再各自从标签里取。
+_HTML_IMAGE = re.compile(r"<img\b[^>]*>", re.IGNORECASE)
+_HTML_SRC = re.compile(r"\bsrc\s*=\s*[\"']([^\"']+)[\"']", re.IGNORECASE)
+_HTML_ALT = re.compile(r"\balt\s*=\s*[\"']([^\"']*)[\"']", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -102,7 +108,7 @@ class SourceParser(Protocol):
 
 
 @runtime_checkable
-class ImageEnricher(Protocol):
+class Enricher(Protocol):
     """补图：给图片补一段可检索的文字、展开折叠块、二次 OCR 回填。
 
     进出都是 :class:`NormalizedDoc`——它在归一化与切分之间，两侧只认这一种形态。
@@ -186,10 +192,10 @@ class ImageRef:
     ref: str
     #: 这段引用在正文里**结束**的位置。二次 OCR 的文字插在它之后。
     end: int
-    #: 替代文本。Markdown 的 `![alt](…)` 取方括号里那段，可能是空串——
-    #: 空着就是「还没有人说明过这张图」，补图往这里写摘要。
-    #: HTML 的 `<img>` 给 `None`：那里没有可写摘要的位置，这一段不往那写。
-    alt: str | None = None
+    #: 替代文本。Markdown 的 `![alt](…)` 取方括号里那段，HTML 的 `<img>` 取 `alt`
+    #: 属性；两边都可能没有，取不到就是空串。**空着就是「还没有人说明过这张图」**，
+    #: 补图往那里写摘要；已经有内容的不覆盖。
+    alt: str = ""
 
 
 def image_refs_in(markdown: str) -> tuple[ImageRef, ...]:
@@ -198,8 +204,22 @@ def image_refs_in(markdown: str) -> tuple[ImageRef, ...]:
         ImageRef(match.group(3), match.end(), match.group(1))
         for match in _MD_IMAGE.finditer(markdown)
     ]
-    found += [ImageRef(match.group(2), match.end()) for match in _HTML_IMAGE.finditer(markdown)]
+    found += [
+        html
+        for match in _HTML_IMAGE.finditer(markdown)
+        if (html := _html_image_ref(match)) is not None
+    ]
     return tuple(sorted(found, key=lambda item: item.end))
+
+
+def _html_image_ref(match: re.Match[str]) -> ImageRef | None:
+    """一个 `<img>` 标签 → 一处引用。没有 `src` 的不是引用——取不到原图。"""
+    tag = match.group(0)
+    src = _HTML_SRC.search(tag)
+    if src is None:
+        return None
+    alt = _HTML_ALT.search(tag)
+    return ImageRef(src.group(1), match.end(), alt.group(1) if alt is not None else "")
 
 
 def image_refs(markdown: str) -> tuple[str, ...]:
@@ -208,7 +228,7 @@ def image_refs(markdown: str) -> tuple[str, ...]:
 
 
 def set_image_alt(markdown: str, alt_by_ref: Mapping[str, str]) -> str:
-    """给替代文本空着的 Markdown 图片引用写上替代文本。
+    """给替代文本空着的图片引用写上替代文本。两种形式都写。
 
     **不覆盖已经写好的替代文本**：那是作者或解析器给的说明，比模型现补的一段准，
     覆盖掉等于拿一个可能更差的描述换掉一个已经能用的。
@@ -224,7 +244,33 @@ def set_image_alt(markdown: str, alt_by_ref: Mapping[str, str]) -> str:
         # 地址在这一段匹配的末尾之后，`![…](` 与空格原样拼回去
         return f"![{written}]({spaces}{ref}"
 
-    return _MD_IMAGE.sub(markdown_ref, markdown)
+    def html_ref(match: re.Match[str]) -> str:
+        tag = match.group(0)
+        src = _HTML_SRC.search(tag)
+        written = None if src is None else alt_by_ref.get(src.group(1))
+        if written is None:
+            return tag
+        existing = _HTML_ALT.search(tag)
+        if existing is None:
+            return _with_alt_attribute(tag, written)
+        if existing.group(1).strip():
+            return tag
+        return f"{tag[: existing.start(1)]}{written}{tag[existing.end(1) :]}"
+
+    return _HTML_IMAGE.sub(html_ref, _MD_IMAGE.sub(markdown_ref, markdown))
+
+
+def _with_alt_attribute(tag: str, alt: str) -> str:
+    """给一个没有 `alt` 的 `<img>` 标签补上它，位置在标签收尾之前。
+
+    自己拼而不是找库：只多一个属性，为它引一个 HTML 解析器不划算。自闭合的要留一个
+    空格与斜杠收尾，不把原来的标签改成另一种写法。
+    """
+    body = tag[:-1].rstrip()
+    closing = ">"
+    if body.endswith("/"):
+        body, closing = body[:-1].rstrip(), " />"
+    return f'{body} alt="{alt}"{closing}'
 
 
 def rewrite_image_refs(markdown: str, mapping: Mapping[str, str]) -> str:
@@ -243,11 +289,16 @@ def rewrite_image_refs(markdown: str, mapping: Mapping[str, str]) -> str:
         return match.group(0)[: -len(ref)] + key
 
     def html_ref(match: re.Match[str]) -> str:
-        ref = match.group(2)
+        tag = match.group(0)
+        src = _HTML_SRC.search(tag)
+        if src is None:
+            return tag
+        ref = src.group(1)
         key = mapping.get(ref)
         if key is None:
-            return _unmapped(match.group(0), ref)
-        return f"{match.group(1)}{key}{match.group(3)}"
+            return _unmapped(tag, ref)
+        # 只换地址那一段，标签的其余部分（alt、宽高）原样留着
+        return f"{tag[: src.start(1)]}{key}{tag[src.end(1) :]}"
 
     return _HTML_IMAGE.sub(html_ref, _MD_IMAGE.sub(markdown_ref, markdown))
 
