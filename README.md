@@ -99,8 +99,11 @@ uv run pytest -m integration     # 跑真模型的集成测试（首次会下载
   `ragamer.stores.base.image_key` 一个函数**——两处各拼一遍前缀就会对不上，
   清旧图时静默失效（原项目踩过）。摘要取自来源文件的字节，所以重导同一份资料是原地覆盖。
 - **图内文字别指望它**：MinerU 不把图片区域里的文字 OCR 成正文，这是它的产品决策
-  （见 [§1.2](docs/ARCHITECTURE.md)）。二次 OCR 回填在下一张票里接；那之前先跑
-  `tools/mineru_ocr_experiment.py` 量出「必须依赖二次 OCR 的比例」。
+  （见 [§1.2](docs/ARCHITECTURE.md)）。2026-09-13 用 22 张真实截图实测过：
+  **必须依赖二次 OCR 的比例是 100%**（56/56 个图片条目，两个后端完全一致），
+  二次 OCR 回填因此是必需项而不是兜底，在下一张票里接。
+  实验怎么跑的、结论与限制见 [`docs/experiments/mineru-ocr.md`](docs/experiments/mineru-ocr.md)，
+  重跑用 `uv run python tools/mineru_ocr_experiment.py <截图目录> --out …`。
 
 ## 目录
 
@@ -112,5 +115,5 @@ src/ragamer/stores/   存储适配器：base 协议与共享类型、chunks Milv
 src/ragamer/vectors/  向量化与精排：base 协议与共享类型、bge 真实模型、fake 确定性假件
 tests/                测试：行为测试 + 结构约束 + 集成测试
 tools/                一次性脚本：mineru_ocr_experiment 量图内文字提取率（不进包，需真实凭据与截图）
-docs/                 架构文档、ADR、给 agent 的说明
+docs/                 架构文档、ADR、实验记录、给 agent 的说明
 ```

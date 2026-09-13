@@ -46,7 +46,15 @@ flowchart LR
 
 源码层面：`get_res_list_from_layout_res()` 只把 `TEXT_REGION_LABELS` 送进 OCR 队列，`image` 和 `chart` **都不在其中**。`content_list.json` 里 image 条目的 schema 是 `{type, img_path, image_caption, bbox, page_idx}` —— **没有 `text` 字段**。
 
-**转机**：VLM 后端的 `image_analysis` 默认开启，而本项目用的就是 `model_version: vlm`。但有三处必须处理：
+**转机**：VLM 后端的 `image_analysis` 默认开启，而本项目用的就是 `model_version: vlm`。
+
+> ⚠️ **2026-09-13 实测：这条转机在云端没有生效。** 22 张真实截图上，云端 `vlm` 与 `pipeline`
+> 的结果逐张完全一致，图内文字一个字都没出来；产物里没有下面说的 `<details>` 折叠块，
+> `vlm` 只是给 image 条目多了一个 `content` 字段（实测全空串）。
+> 结论与逐张明细见 [`experiments/mineru-ocr.md`](./experiments/mineru-ocr.md)。
+> 下面那三处「必须处理」里的第 1 处，在本批素材上没有对象（但要防着别的输入形态真产出它）。
+
+要是哪天它生效了（或换自建 MinerU），下面这三处仍然得处理：
 
 1. **结果塞在 HTML 折叠块里**，不在正文 —— 切分/清洗若不处理 HTML 就会静默丢失：
    ```html
@@ -74,7 +82,9 @@ flowchart LR
 
 > **上生产前必须做的实验**：拿 20 张真实攻略截图（长图 / Excel 截图 / wiki 截图各若干），分别用 `pipeline` 和 `vlm` 各跑一遍，统计 `type == "image"` 的条目中「有 `img_path` 但无 `content`」的比例 —— **这个比例就是必须依赖二次 OCR 的比例**。这比任何文档调研都准。
 >
-> 运行器已就位：`uv run python tools/mineru_ocr_experiment.py <截图目录> --out docs/experiments/mineru-ocr.md`。口径在脚本里写死成两条（条目自带 `text` / 正文里紧跟的 `<details>` 折叠块），比「无 `content`」严——正文里的图内文字按 §1.2 是落在折叠块里、不进 `content_list` 的，只按字段判会把 vlm 后端算成一条都没提到。**这个数字还没跑出来**（缺真实凭据与截图），T12 的范围因此未定。
+> **2026-09-13 已跑（T10 / #11）：比例 = 100%（56 / 56 个图片条目，pipeline 与 vlm 逐张完全一致）。** 22 张真实截图、44 次解析全部成功，无一张图内文字进得了正文。完整结论与逐张明细见 [`experiments/mineru-ocr.md`](./experiments/mineru-ocr.md)，重跑用 `uv run python tools/mineru_ocr_experiment.py <截图目录> --out …`。
+>
+> 这一跑同时**推翻了 §1.2 的「转机」**：云端 vlm 的产物里根本没有 `<details>` 折叠块，它给 image 条目多一个 `content` 字段（实测全空串）。也就是说 `image_analysis` 在云端没生效——§1.2 第三点列的未确证项，答案是「没开」。**T12 的范围因此是：必须做，且覆盖每一个 image 条目，不挑大小图。**
 
 ⚠️ 另一个未确证项：`MAX_PAGE_ASPECT_RATIO = 10.0` + 200 DPI 重采样对**超长攻略图**的影响，无官方说明，需实测。
 
