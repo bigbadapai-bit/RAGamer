@@ -220,6 +220,25 @@ def test_版本过滤把候选滤空时也给明确回复():
     assert llm.calls == []
 
 
+def test_命中却聚合不出父块时按检索不到处理():
+    """索引与数据对不上：检索命中了，按 `doc_title` 回查却一条都拿不到。
+    这时手里没有任何内容可依据，同样不调模型——让它自由发挥只会得到一段编造的游戏攻略。"""
+
+    class Vanishing(InMemoryChunkStore):
+        def fetch_document(self, game_id: str, doc_title: str, *, version: str | None):
+            return []
+
+    store = Vanishing()
+    store.upsert(GAME, [make_chunk(1, content=QUESTION)])
+    llm = FakeLlm()  # 一条脚本都没排，真被调用会当场炸
+
+    answer = answerer(store, llm).answer(QUESTION, game_id=GAME, version="1.0")
+
+    assert answer.text == NOT_FOUND
+    assert answer.citations == ()
+    assert llm.calls == []
+
+
 # --- 版本过滤 ---
 
 
