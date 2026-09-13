@@ -81,6 +81,22 @@ class ProgressEvent:
 ProgressCallback = Callable[[ProgressEvent], None]
 
 
+def log_progress(event: ProgressEvent) -> None:
+    """进度回调的默认实现：每进入一个阶段落一行日志。
+
+    导入是同步的一整段，日志是它在跑的时候唯一看得见的进度窗口。响应里的 `progress`
+    是跑完之后才拿得到的账单；一批几十份资料时，那之前能看到的只有这几行。
+    界面与 JSON 端点两条写入路径共用这一份——各写一遍的话，换个措辞就是两套进度。
+    """
+    logger.info(
+        "导入 %s：[%d/%d] %s",
+        event.filename,
+        event.file_number,
+        event.file_total,
+        STAGE_LABELS[event.stage],
+    )
+
+
 @dataclass(frozen=True)
 class CoveredTags:
     """这次导入实际落下的标签。界面上的「覆盖到了哪些标签」来自这里。
@@ -172,7 +188,8 @@ class Importer:
     enricher: ImageEnricher | None = None
     #: 切分参数。不传用 `ChunkRules` 的默认值。
     rules: ChunkRules | None = None
-    on_progress: ProgressCallback | None = None
+    #: 进度回调。默认落日志；显式传 `None` 表示这一段完全不出声。
+    on_progress: ProgressCallback | None = log_progress
 
     def batch(
         self,

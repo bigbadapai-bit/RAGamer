@@ -12,7 +12,8 @@ import logging
 import pytest
 from fastapi.testclient import TestClient
 
-from ragamer.api import KB_COLLECTION, create_app
+from ragamer.api import create_app
+from ragamer.knowledge import KB_COLLECTION
 from ragamer.stores.base import UNVERSIONED
 
 from .conftest import make_container
@@ -207,7 +208,7 @@ def test_导入过程中上报了进度(client):
 
 def test_导入在跑的时候就把进度落进日志(client, caplog):
     """响应里的 `progress` 是跑完才拿得到的账单；一批几十份资料时，那之前靠日志。"""
-    with caplog.at_level(logging.INFO, logger="ragamer.api"):
+    with caplog.at_level(logging.INFO, logger="ragamer.importing"):
         import_articles(client, upload("二郎神.md"))
 
     assert "导入 二郎神.md：[1/1] 归一化" in caplog.text
