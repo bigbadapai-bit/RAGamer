@@ -1,7 +1,11 @@
 {% extends "base.html" %}
 {% block content %}
 
-<p class="rounded border border-dashed border-slate-300 bg-white px-5 py-10 text-center text-sm text-slate-500">
+<header class="mb-6">
+  <h1 class="text-xl font-semibold tracking-tight">{{ title }}</h1>
+</header>
+
+<p class="rounded-md border border-dashed border-slate-300 bg-white px-5 py-16 text-center text-sm text-slate-500">
   {{ note }}
 </p>
 

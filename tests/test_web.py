@@ -6,6 +6,8 @@
 
 知识库管理那几条同样只看外部行为：改了配置之后**下一次导入**落下来的标签对不对，
 而不是去翻内存里那个 dict 长什么样——「保存后立即生效」要验的正是这条链路。
+页面是按列排的表格，所以**断言尽量逐行对齐**：正文对上了、标签却串到隔壁去，是这种
+排法最容易出的错。
 """
 
 from __future__ import annotations
@@ -29,7 +31,11 @@ from ragamer.knowledge import (
     vocabulary_of,
 )
 from ragamer.stores.base import UNVERSIONED, image_key, image_prefix
-from ragamer.tagging import SubjectType
+from ragamer.tagging import (
+    CONTENT_NATURE_NAMES,
+    SUBJECT_TYPE_NAMES,
+    SubjectType,
+)
 from ragamer.vectors.fake import FakeEmbedder
 
 from .conftest import BrokenChunkStore, FakeCrawler, make_container
@@ -37,6 +43,41 @@ from .conftest import BrokenChunkStore, FakeCrawler, make_container
 GAME = "black_myth"
 DOC_TITLE = "二郎神"
 IMPORT_URL = "/import"
+
+#: 页面上的表格行。表头那一行只有 `<th>`，据此筛掉。
+_TABLE_ROW = re.compile(r"<tr\b[^>]*>(.*?)</tr>", re.DOTALL)
+
+
+def rows_of(page: str) -> list[str]:
+    """页面里表格的数据行，按渲染顺序。"""
+    return [body for body in _TABLE_ROW.findall(page) if "<td" in body]
+
+
+#: 导入结果里的每一行。结果区是**列表不是表格**（`partials/import_result.html`）：
+#: 每行是一条 `<li data-source=…>`，来源、文档与切片数都在同一行里，按行取才验得了
+#: 「这一条的来源与它的结果对得上」。
+_RESULT_ROW = re.compile(r'<li data-source="[^"]*"[^>]*>(.*?)</li>', re.DOTALL)
+
+
+def result_rows(page: str) -> list[str]:
+    """导入结果区里的数据行，按渲染顺序。"""
+    return _RESULT_ROW.findall(page)
+
+
+def plain_text(page: str) -> str:
+    """页面上的可见文字：标签去掉、空白收拢。断言一整句话时用它。
+
+    数字常被包在 `<span>` 里（好单独上色），于是字面量在源码里是断开的。
+    """
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", page))
+
+
+def tags_of(chunk) -> list[str]:
+    """这个切片在页面上该显示成哪些标签（中文叫法，不是落库的枚举值）。"""
+    return [SUBJECT_TYPE_NAMES.get(kind, kind) for kind in chunk.subject_type] + [
+        CONTENT_NATURE_NAMES.get(nature, nature) for nature in chunk.content_nature
+    ]
+
 
 ARTICLE = """\
 # 二郎神
@@ -303,11 +344,21 @@ def test_同_id_再建一次报错而不是覆盖(client, container):
 
 
 def test_传一份_markdown_就完成导入并给出预览入口(client, container):
+    """导入完**链接真点得进预览页**——不只是那串字在不在。"""
     response = do_import(client)
+    (row,) = result_rows(response.text)
 
-    assert "二郎神.md" in response.text
-    assert f"入库 {len(stored(container))} 条" in response.text
-    assert "看切分结果" in response.text
+    assert "二郎神.md" in row
+    assert DOC_TITLE in row  # 存成了哪个文档
+    # 切了多少片。这一条是整批的账，在结果区顶上那一行，不在某一条上
+    assert f"这批入库 {len(stored(container))} 条切片" in response.text
+
+    (href,) = re.findall(r'href="(/kb/[^"]+)"', row)
+    page = client.get(href.replace("&amp;", "&"))
+
+    assert page.status_code == 200
+    assert DOC_TITLE in page.text
+    assert "祖先标题路径" in page.text
 
 
 def test_一批里某个文件失败时其余照常入库_失败的说清卡在哪一步(client, container):
@@ -316,8 +367,11 @@ def test_一批里某个文件失败时其余照常入库_失败的说清卡在�
         upload("甲.md"),
         ("files", ("攻略.pdf", b"%PDF-1.7", "application/pdf")),
     )
+    ok_row, failed_row = result_rows(response.text)
 
     assert stored(container)  # 成功的那份确实入库了
+    assert "甲.md" in ok_row and "成功" in ok_row
+    assert "攻略.pdf" in failed_row and "卡在「归一化」" in failed_row
     assert "共 2 条，成功 1 条，失败 1 条" in response.text
     assert "卡在「归一化」" in response.text
 
@@ -642,29 +696,48 @@ def test_前端没有本地构建产物(client):
 
 def test_预览页列出该文档的全部切片(client, container):
     page = import_and_preview(client, container).text
+    rows = rows_of(page)
 
-    assert page.count("</li>") > 1
+    assert len(stored(container)) > 1  # 确实切出了多片，这条才验得到东西
+    assert len(rows) == len(stored(container))
     for chunk in stored(container):
         assert chunk.content in page
-    assert len(stored(container)) > 1  # 确实切出了多片，这条才验得到东西
 
 
 def test_每条切片显示祖先标题路径_主体类型与内容性质(client, container):
-    page = import_and_preview(client, container).text
+    """四样东西要在**同一行**上：正文、祖先标题路径、主体类型、内容性质。
 
-    assert f"#0 · {DOC_TITLE}" in page  # 大标题那一段的路径只有标题
-    assert f"{DOC_TITLE} › 获取方式" in page
-    assert "主体类型：角色" in page
-    assert "内容性质：位置与获取" in page
-    assert "内容性质：打法流程" in page
+    分列排的表最容易出的错就是串列。逐行对齐才验得到「每条显示」这四个字。
+    """
+    page = import_and_preview(client, container).text
+    rows = rows_of(page)
+    chunks = stored(container)
+
+    for header in ("祖先标题路径", "正文", "主体类型", "内容性质"):
+        assert header in page
+
+    assert any(chunk.subject_type for chunk in chunks)  # 否则下面那圈空转
+
+    for chunk, row in zip(chunks, rows, strict=True):
+        assert chunk.content in row
+        assert chunk.ancestor_path in row
+        for tag in tags_of(chunk):
+            assert tag in row
 
 
 def test_切片按文档顺序排列(client, container):
+    """第 n 行装的就是第 n 片——不是「页面上有这些片」而已。
+
+    `fetch_document` 返回的是按 `chunk_index` 升序的，所以逐行对上就等于顺序对上了。
+    """
     page = import_and_preview(client, container).text
+    chunks = stored(container)
 
-    rendered = [int(index) for index in re.findall(r"#(\d+) ·", page)]
-
-    assert rendered == [chunk.chunk_index for chunk in stored(container)]
+    assert [chunk.chunk_index for chunk in chunks] == sorted(
+        chunk.chunk_index for chunk in chunks
+    )  # 前置：拿到的本来就是有序的，这条才验得到页面有没有打乱
+    for chunk, row in zip(chunks, rows_of(page), strict=True):
+        assert chunk.content in row
 
 
 def test_预览页是只读的_一个编辑入口都没有(client, container):
@@ -690,12 +763,19 @@ def test_预览一个没导过的文档时说清而不是_500(client):
 
 
 def test_预览里带上版本时未标注版本的内容会一并列出并标出来(client, container):
+    """看 2.0 时未标注版本的内容也被取回（ADR-0004），而且**只给那一批挂徽章**。"""
     do_import(client)  # 未标注版本
     do_import(client, version="2.0")
 
     page = preview(client, version="2.0").text
+    unversioned = stored(container, UNVERSIONED)
+    versioned = [chunk for chunk in stored(container, "2.0") if chunk.version == "2.0"]
 
-    assert "未标注版本，不随版本变化" in page
+    assert unversioned and versioned  # 两边都得真有东西，这条才验得到
+    assert len(rows_of(page)) == len(unversioned) + len(versioned)
+    assert page.count("未标注版本") == len(unversioned)
+    for chunk in versioned:
+        assert chunk.content in page
 
 
 # --- 验收：导航里留出四个位置 ---
@@ -777,7 +857,7 @@ def test_预览页不带版本时按现行版本取切片(client, container):
     page = client.get(f"/kb/{GAME}/preview", params={"doc_title": DOC_TITLE}).text
 
     assert "2.0" in page  # 取的是 2.0 那一批
-    assert "未标注版本，不随版本变化" in page  # 未标注的那批一并带上（ADR-0004）
+    assert "不随版本变化" in page  # 未标注的那批一并带上（ADR-0004）
 
 
 def test_预览页带空版本时按未标注版本看(client, container):
