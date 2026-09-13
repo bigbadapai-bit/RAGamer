@@ -39,6 +39,7 @@ from __future__ import annotations
 import re
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
+from typing import Protocol, runtime_checkable
 
 from ragamer.chunking import PATH_SEPARATOR
 from ragamer.llm import LlmClient, LlmRequest, Message
@@ -116,6 +117,19 @@ class _Source:
     block: ParentBlock
 
 
+def require_question(question: str) -> None:
+    """问题不能是空的。读取侧的入口都从这里过一遍（`Answerer.answer`、`Answerer.stream`、
+    `ragamer.clarifying.Clarifier.start`、`ragamer.conversations.Chat.ask`）——空问题会让
+    检索查出任意一批切片，答案也就是编的，而这几种失败都不会报错。
+
+    提到一个函数里是因为几个入口各自守一遍时，那句话会被抄成几份——文案一旦分岔，
+    同一个毛病在两处就说成两件事了（与 `ragamer.stores.base.require_vectors` 同一个打法）。
+    会话那一步尤其要在调模型**之前**先拦一次：晚一步就白花一次提问理解的调用。
+    """
+    if not question.strip():
+        raise ValueError("问题不能为空：空问题会让检索查出任意一批切片，答案也就是编的")
+
+
 @dataclass(frozen=True)
 class Answer:
     """一次提问的结果。
@@ -130,6 +144,38 @@ class Answer:
     text: str
     citations: tuple[Citation, ...]
     images: tuple[str, ...] = ()
+
+
+@runtime_checkable
+class ReadSide(Protocol):
+    """读取侧对外的那两个动作：一次问全、逐字问。
+
+    :class:`Answerer` 是直接检索生成的那一份，`ragamer.caching.CachedAnswerer` 在它前面
+    挡了一层缓存。**两者实现同一组签名**，所以对话那一层（`ragamer.conversations`）
+    只认这一个协议——接不接缓存是组合根的事，多轮对话那一层不必知道。
+    """
+
+    def answer(
+        self,
+        question: str,
+        *,
+        game_id: str,
+        version: str = "",
+        current_version: str = "",
+    ) -> Answer:
+        """读一个问题，给出答案与它的来源。"""
+        ...
+
+    def stream(
+        self,
+        question: str,
+        *,
+        game_id: str,
+        version: str = "",
+        current_version: str = "",
+    ) -> AnswerStream:
+        """与 :meth:`answer` 同一套检索与提示，只是正文逐字产出。"""
+        ...
 
 
 @dataclass(frozen=True)
@@ -157,16 +203,6 @@ class AnswerStream:
     deltas: Iterator[str]
 
 
-def require_question(question: str) -> None:
-    """空问题会让检索查出任意一批切片，答案也就是编的。
-
-    两条路都在最前面拦它。**对外**是因为会话那一步也得在调模型之前先拦一次
-    （晚一步就白花一次提问理解的调用），而文案只有这一份——`ragamer.conversations`。
-    """
-    if not question.strip():
-        raise ValueError("问题不能为空：空问题会让检索查出任意一批切片，答案也就是编的")
-
-
 def _citations(sources: Sequence[_Source]) -> tuple[Citation, ...]:
     """编号好的父块 → 交回给调用方的引用。顺序就是提示词里的顺序，一一对应。"""
     return tuple(source.citation for source in sources)
@@ -188,11 +224,6 @@ def _chunk_text(chunk: Chunk) -> str:
     """
     meta = chunk.content_meta.strip()
     return f"{chunk.content}\n{meta}" if meta else chunk.content
-
-
-def _citations(sources: Sequence[_Source]) -> tuple[Citation, ...]:
-    """编号好的这批来源，顺序即交给模型的顺序。"""
-    return tuple(source.citation for source in sources)
 
 
 def _image_urls(sources: Sequence[_Source]) -> tuple[str, ...]:
@@ -245,7 +276,7 @@ class Answerer:
         :param version: 这次按哪个版本检索。空串表示没点名（回落 `current_version`）。
         :param current_version: 知识库标着的现行版本。两个都是空串时不做版本过滤，
             并留一条 warning——见 `ragamer.query.version_filter`。
-        :raises ValueError: 问题为空。空问题会让检索查出任意一批切片。
+        :raises ValueError: 问题为空（由 :func:`require_question` 报出来）。
         :raises ragamer.llm.LlmError: 生成失败。没有答案就是没有答案，不降级。
         """
         require_question(question)

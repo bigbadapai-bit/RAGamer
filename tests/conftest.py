@@ -9,6 +9,7 @@ import pytest
 
 from ragamer.answering import Answerer
 from ragamer.caching.memory import InMemoryAnswerCache
+from ragamer.clarifying import Clarifier
 from ragamer.config import get_settings
 from ragamer.container import Container
 from ragamer.conversations import Chat
@@ -115,19 +116,28 @@ def memory_container() -> Container:
 def make_chat(container: Container) -> Chat:
     """对话侧接上容器里那套依赖。
 
-    语言模型用两次：提问理解（`understand`）与生成（`Answerer.stream`）。两处走的是
-    同一个假件，所以脚本要按调用顺序把两边排在一起——少排一条会当场炸，
-    见 `FakeLlm`。读取条数时记住这个顺序：理解、生成、理解、生成……
+    语言模型用两次：提问理解（`Clarifier.decide` 里的 `understand`）与生成
+    （`Answerer.stream`）。两处走的是同一个假件，所以脚本要按调用顺序把两边排在一起
+    ——少排一条会当场炸，见 `FakeLlm`。读取条数时记住这个顺序：理解、生成、理解、生成……
+
+    这里**不挡缓存**：缓存那一层有自己的用例（`tests/test_caching.py`），
+    对话这一层接上它只会让「第二条为什么没调模型」变得难判。
     """
+    answers = Answerer(
+        chunks=container.chunks,
+        embedder=container.embedder,
+        reranker=container.reranker,
+        llm=container.llm,
+    )
     return Chat(
         docs=container.docs,
-        answerer=Answerer(
+        answerer=answers,
+        clarifier=Clarifier(
             chunks=container.chunks,
-            embedder=container.embedder,
-            reranker=container.reranker,
+            docs=container.docs,
             llm=container.llm,
+            answerer=answers,
         ),
-        llm=container.llm,
     )
 
 
@@ -172,6 +182,22 @@ class BrokenChunkStore(InMemoryChunkStore):
     def _refuse(self) -> None:
         if self.broken:
             raise StoreUnavailableError("Milvus", "milvus.test:19530", 2.5, "连接被拒绝")
+
+
+def joint_reply(**overrides: object) -> dict[str, object]:
+    """联合输出节点的一次回复（`ragamer.query._JointOutput` 的那几个字段）。
+
+    读取侧三条链路（理解、澄清、端点）都要按它排 `FakeLlm` 的脚本，摆在这里免得各抄一份
+    ——确定度与取值成对，「取值空 ⇒ 确定度 0」这条不变量抄岔了会变成一条静默失效的用例。
+    """
+    reply: dict[str, object] = {
+        "game": "黑神话·悟空",
+        "game_confidence": 0.9,
+        "version": "1.0",
+        "version_confidence": 0.9,
+        "rewritten_query": "二郎神怎么打",
+    }
+    return {**reply, **overrides}
 
 
 def make_chunk(chunk_id: int, **overrides: object) -> Chunk:

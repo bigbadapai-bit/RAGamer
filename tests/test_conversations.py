@@ -19,7 +19,7 @@ from dataclasses import replace
 import pytest
 
 from ragamer.answering import NOT_FOUND
-from ragamer.api import KB_COLLECTION
+from ragamer.clarifying import CONFIDENT
 from ragamer.conversations import (
     HISTORY_TURNS,
     TITLE_CHARS,
@@ -30,6 +30,7 @@ from ragamer.conversations import (
     Reply,
     Sources,
 )
+from ragamer.knowledge import KB_COLLECTION
 from ragamer.llm import FakeLlm, LlmTimeout
 from ragamer.vectors.fake import FakeReranker
 
@@ -37,6 +38,7 @@ from .conftest import (
     HalfwayLlm,
     RecordingChunkStore,
     chunk_store,
+    joint_reply,
     make_chat,
     make_chunk,
     make_container,
@@ -45,8 +47,6 @@ from .conftest import (
 GAME = "black_myth"
 #: 这个库的元数据。`name` 是显示名——用户问句里出现的是它，不是 id。
 KB = {"name": "黑神话·悟空", "version": "1.0", "subject_types": ["character"]}
-#: 游戏候选：显示名 → 知识库 id。`ragamer.api` 从知识库列表里查出这一对。
-GAMES = (("黑神话·悟空", GAME),)
 
 #: 库里唯一一份资料。追问「掉什么」时它随父块一起进来。
 DOC = make_chunk(
@@ -54,9 +54,20 @@ DOC = make_chunk(
 )
 
 
-def said(rewritten: str, game: str = "", version: str = "") -> dict[str, str]:
-    """提问理解那一步的脚本：一次联合输出。"""
-    return {"game": game, "version": version, "rewritten_query": rewritten}
+def said(rewritten: str, game: str = "", version: str = "") -> dict[str, object]:
+    """提问理解那一步的脚本：一次联合输出。
+
+    **判出来就算确定**：这几个用例关心的是改写与游戏候选，分级本身在
+    `tests/test_clarifying.py` 里单测。少了确定度那两个字段的话，联合输出节点会当场
+    判成「读不出来」，整条理解静默降级回原问法——用例于是测了个寂寞。
+    """
+    return joint_reply(
+        game=game,
+        game_confidence=CONFIDENT if game else 0.0,
+        version=version,
+        version_confidence=CONFIDENT if version else 0.0,
+        rewritten_query=rewritten,
+    )
 
 
 def setup_chat(llm, *chunks, reranker=None) -> Chat:
@@ -132,7 +143,7 @@ def test_判出来的游戏显示名换回知识库_id():
     chat, chunks = recording_chat(llm)
     conversation = chat.start(game_id="another_game")
 
-    asked(chat, conversation, "那它掉什么", games=GAMES)
+    asked(chat, conversation, "那它掉什么")
 
     assert chunks.searches[0]["game_id"] == GAME
 

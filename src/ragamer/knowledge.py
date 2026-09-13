@@ -1,8 +1,8 @@
 """知识库元数据：一个游戏知识库在库里长什么样，以及建它、改它、删干净它。
 
-**写入侧（界面上的「新建知识库」）与读取侧（导入端点要的打标词表）共用这一份定义。**
-两边各自拼一遍字典的话，键名写岔了既不报错也不崩——只会静默少读一个字段，而打标从此
-按默认词表跑，标签稀疏得看不出是配置没读到。
+**写入侧（界面上的「新建知识库」）与读取侧（导入端点要的打标词表、澄清反问要的游戏候选、
+对话页左栏那一份知识库列表）共用这一份定义。** 各方各自拼一遍字典的话，键名写岔了既不
+报错也不崩——只会静默少读一个字段，而打标从此按默认词表跑，标签稀疏得看不出是配置没读到。
 
 元数据存 MongoDB 的 `knowledge_bases` 集合，**文档 id 就是游戏 id**：它同时是 Milvus 的
 collection 名（ADR-0002），所以合法性校验直接复用 `collection_name`，不另立一套规则。
@@ -314,6 +314,19 @@ def knowledge_base_of(docs: DocStore, game_id: str) -> KnowledgeBase:
     if payload is None:
         raise UnknownKnowledgeBase(game_id)
     return KnowledgeBase.from_payload(game_id, payload)
+
+
+def find_knowledge_base(docs: DocStore, game_id: str) -> KnowledgeBase | None:
+    """读一个库；没有这个库、或这个 id 本身不合法时返回 `None`。
+
+    与 :func:`knowledge_base_of` 分开，是因为两种「读不到」在这儿的含义不一样：那个的
+    调用方正要据「没有这个库」报 404，而澄清反问那边只是拿它兜一个现行版本——读不到就
+    按没有版本走，不该让一次提问在判游戏这一步就炸掉（`ragamer.clarifying`）。
+    """
+    try:
+        return knowledge_base_of(docs, game_id)
+    except (KnowledgeBaseError, ValueError):
+        return None
 
 
 def readable_knowledge_base(docs: DocStore, game_id: str) -> KnowledgeBase:

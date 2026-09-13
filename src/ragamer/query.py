@@ -11,6 +11,10 @@
 - **候选必须是库里真有的**。模型自己编的游戏名在库里不存在，照它去检索只会查空，
   而且不报错。候选由调用方从库里读出来传进来，编出来的取值在这里丢掉——
   与澄清反问「候选必须来自语料中真实存在的选项」是同一条约束。
+- **确定度与取值成对回来**。确定不了时要反问而不是猜（§3.4），而「确定不了」不是
+  非黑即白：判得出取值但不太稳，与压根没判出来，是两种不同的处境，得靠确定度分开
+  （`ragamer.clarifying` 那两档阈值就架在它上面）。确定度**来自模型自报**——
+  它是这里唯一拿得到的连续信号，也还是个没有评测集校准的经验值（§11）。
 
 **这一步失败有降级路径**：模型挂了就按原问法继续，游戏与版本留空交回给调用方
 （会话里已经选定的那两个）。整个提问不该因为第一道处理失败而失败。唯一按 ERROR
@@ -50,6 +54,11 @@ class Understanding:
     version: str
     #: 改写后的规范问法。补上了指代的主体名，语义与原问题一致。
     rewritten_query: str
+    #: 这个游戏判断有多稳，0~1，模型自报。**取值是空串时它一定是 0**：
+    #: 没有取值就谈不上对这个取值有多确定。
+    game_confidence: float = 0.0
+    #: 这个版本判断有多稳，0~1，模型自报。同上。
+    version_confidence: float = 0.0
 
 
 def understand(
@@ -82,10 +91,16 @@ def understand(
     except LlmError as exc:
         logger.warning("提问理解失败（%s），按原问法继续：%s", type(exc).__name__, exc)
         return degraded
+    game = _pick(guess.game, games, what="游戏")
+    version = _pick(guess.version, versions, what="版本")
     return Understanding(
-        game=_pick(guess.game, games, what="游戏"),
-        version=_pick(guess.version, versions, what="版本"),
+        game=game,
+        version=version,
         rewritten_query=normalize_query(guess.rewritten_query) or degraded.rewritten_query,
+        # 取值丢掉时确定度一并归零：留着一个高确定度配一个空取值，调用方会照着
+        # 确定度走进「确定」那一支，然后拿着空游戏去检索
+        game_confidence=guess.game_confidence if game else 0.0,
+        version_confidence=guess.version_confidence if version else 0.0,
     )
 
 
@@ -169,7 +184,9 @@ def _instruction(games: Sequence[str], versions: Sequence[str]) -> str:
         "改写时把指代替换成明确的游戏内名称——知道上下文时，「那它怎么打」写成"
         "「二郎神怎么打」——但不要改变原意，不要回答问题，也不要补充问题里没有的限定。\n"
         f"{_candidates('游戏', games)}\n"
-        f"{_candidates('版本', versions)}"
+        f"{_candidates('版本', versions)}\n"
+        "游戏与版本各自还要给一个 0 到 1 的确定度：问题里明确写了、没有第二种可能给 1 附近；"
+        "只是从上下文猜的、也可能不对，给 0.5 附近；判不出来时取值留空串、确定度给 0。"
     )
 
 
@@ -180,13 +197,23 @@ def _candidates(what: str, values: Sequence[str]) -> str:
 
 
 class _JointOutput(BaseModel):
-    """一次联合输出的三个字段。字段描述会随 schema 一起进提示词。"""
+    """一次联合输出的全部字段。字段描述会随 schema 一起进提示词。"""
 
     game: str = Field(
         description="用户问的是哪款游戏，只能从候选里原样取一个；判断不出或候选里没有就留空串"
     )
+    game_confidence: float = Field(
+        ge=0.0,
+        le=1.0,
+        description="上面那个游戏判断的确定度，0 到 1；游戏留空串时给 0",
+    )
     version: str = Field(
         description="用户问的是哪个版本，只能从候选里原样取一个；判断不出或候选里没有就留空串"
+    )
+    version_confidence: float = Field(
+        ge=0.0,
+        le=1.0,
+        description="上面那个版本判断的确定度，0 到 1；版本留空串时给 0",
     )
     rewritten_query: str = Field(
         description="改写后的规范问法：补齐指代的主体名，语义与原问题一致，不回答问题"

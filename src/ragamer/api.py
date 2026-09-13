@@ -1,16 +1,23 @@
 """HTTP 端点：写入侧与读取侧对外的唯一入口。
 
-五个端点分两侧：
+五个端点分三组：
 
 - **写入侧** `POST /api/kb/{game_id}/import`。批量提交、**逐文件独立**：某个文件失败时
   其余照常入库，失败的那个在结果里带文件名与失败阶段。
-- **读取侧** `POST /api/chat/sessions`、`GET /api/chat/sessions`（按库列会话）、
+- **多轮对话** `POST /api/chat/sessions`、`GET /api/chat/sessions`（按库列会话）、
   `GET /api/chat/sessions/{session_id}`、`GET /api/chat/sessions/{session_id}/ask`。
-  开会话、列会话、把历史读回来、逐字问一句（SSE）。对话页那一层在后面的票里接。
+  开会话、列会话、把历史读回来、逐字问一句（SSE）。**澄清反问也在这条流上**：
+  判不准时流里出一个 `clarification` 事件，用户点完带 `pending_id` 再问一次。
 
-对话那几个只做 HTTP 这一层的事：会话不存在翻成 404、问题为空翻成 400、一轮问答翻成
-SSE 事件。**「这一轮算不算问完」「要不要写进历史」在 `ragamer.conversations` 里**，
-这一层不重复判断——判两遍迟早会分岔，而分岔的那一次表现为「刷新之后历史少了一轮」。
+**只有会话这一条提问路径**。曾经另有一个不绑会话的 `POST /api/chat`，接上会话之后
+它被 `/api/chat/sessions` 影子掉了（`/api/chat/{pending_id}` 那条路由先注册，把
+`/api/chat/sessions` 当成了自己的 `pending_id`）——两条入口本来也是同一件事，
+收敛掉的那条不再保留。
+
+这一层只做 HTTP 这一层的事：会话不存在翻成 404、问题为空翻成 400、一轮问答翻成
+SSE 事件、暂停点选错了翻成 422。**「这一轮算不算问完」「要不要写进历史」在
+`ragamer.conversations` 里**，这一层不重复判断——判两遍迟早会分岔，而分岔的那一次
+表现为「刷新之后历史少了一轮」。
 
 知识库元数据从 MongoDB 读（`knowledge_bases` 集合，id 就是游戏 id）：打标要用的词表
 ——启用了哪些主体类型、这个游戏的术语映射——就在它里面（docs/ARCHITECTURE.md §2.3），
@@ -35,20 +42,20 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from ragamer.answering import Answerer, Citation
+from ragamer.caching import CachedAnswerer
+from ragamer.clarifying import Clarification, Clarifier, NotACandidate, UnknownPending
 from ragamer.container import Container
 from ragamer.conversations import (
     Chat,
     Conversation,
     ConversationNotFound,
     ConversationSummary,
-    Game,
     Reply,
     Sources,
     Status,
 )
 from ragamer.importing import STAGE_LABELS, Importer, ImportResult, ProgressEvent
 from ragamer.knowledge import (
-    KB_COLLECTION,
     KnowledgeBase,
     KnowledgeBaseError,
     readable_knowledge_base,
@@ -85,15 +92,22 @@ def create_app(container: Container) -> FastAPI:
         # 导入完成时按游戏前缀清缓存（架构文档 §4）：语料变了，基于旧语料的答案不该再命中
         cache=container.cache,
     )
+    answers = Answerer(
+        chunks=container.chunks,
+        embedder=container.embedder,
+        reranker=container.reranker,
+        llm=container.llm,
+    )
     chat = Chat(
         docs=container.docs,
-        answerer=Answerer(
+        # 缓存挡在检索生成前面：命中就重放，未命中才走完整链路（架构文档 §4）
+        answerer=CachedAnswerer(answers=answers, cache=container.cache),
+        clarifier=Clarifier(
             chunks=container.chunks,
-            embedder=container.embedder,
-            reranker=container.reranker,
+            docs=container.docs,
             llm=container.llm,
+            answerer=answers,
         ),
-        llm=container.llm,
     )
 
     @app.post("/api/kb/{game_id}/import")
@@ -154,7 +168,13 @@ def create_app(container: Container) -> FastAPI:
         return _conversation_payload(_conversation(chat, session_id))
 
     @app.get("/api/chat/sessions/{session_id}/ask")
-    def ask(session_id: str, question: str, version: str = "") -> StreamingResponse:
+    def ask(
+        session_id: str,
+        question: str,
+        version: str = "",
+        pending_id: str = "",
+        label: str = "",
+    ) -> StreamingResponse:
         """问一句，逐字把答案拿回来（SSE）。
 
         走 GET 是给浏览器原生的 `EventSource` 留的路——它只会发 GET（架构文档 §5 允许
@@ -185,7 +205,8 @@ def create_app(container: Container) -> FastAPI:
             question,
             version=version,
             current_version=knowledge.version,
-            games=_games(container),
+            pending_id=pending_id,
+            label=label,
         )
         return StreamingResponse(
             _events(replies), media_type="text/event-stream", headers=SSE_HEADERS
@@ -206,15 +227,19 @@ class SessionRequest(BaseModel):
 def _events(replies: Iterator[Reply]) -> Iterator[str]:
     """一轮问答 → SSE 字节流。
 
-    五种事件，**前四种按发生的先后**：
+    正常那一轮是五种事件，**前四种按发生的先后**：
 
     | 事件 | 几条 | 什么时候 |
     |---|---|---|
     | `status` | 若干 | 理解、检索、生成三步各自开始之前 |
-    | `citations` | 一条 | 检索完、拿到来源 |
+    | `citations` | 一条 | 检索完、拿到来源（引用 + 图片 + 实际版本） |
     | `delta` | 若干 | 正文一片一片来 |
     | `done` | 一条 | 正常收尾 |
     | `error` | 至多一条 | 中途失败，代替 `done` |
+
+    **判不准的那一轮只有两条**：`status`（正在理解问题）加一条 `clarification`
+    （问哪个维度、候选有哪些、回哪个暂停点继续）。它**不发 `done`**——这一轮没走完，
+    也不该让页面以为答完了。用户点完候选带 `pending_id` 再问一次，那一轮才从头走一遍。
 
     `status` 是给「不用干等」用的：提问到第一个字之间隔着两次实打实的等待（一次模型
     往返加一次检索），没有它，界面在那一段里没有任何东西可显示。
@@ -226,31 +251,68 @@ def _events(replies: Iterator[Reply]) -> Iterator[str]:
 
     **兜住「断开不留痕」的不是这里，是落库的时机**：会话只在正文全部收完之后才写，
     所以流在半路停住时它一个字都没写。消费方把生成器丢掉时，这里收到的是
-    `GeneratorExit`——它不是 `Exception`，下面那两个 `except` 接不住它，于是它一路把
+    `GeneratorExit`——它不是 `Exception`，下面那几 个 `except` 接不住它，于是它一路把
     上游那个生成器也关掉，模型那边的请求跟着结束。
 
-    两类失败分得开：**生成挂掉**是模型这一次不行，按 WARNING；**检索或落库挂掉**
-    （`StoreError` / `ModelOutputError`）是系统性的，按 ERROR——排查时看的不是同一个地方。
+    三类失败分得开：**生成挂掉**是模型这一次不行，按 WARNING；**检索或落库挂掉**
+    （`StoreError` / `ModelOutputError`）是系统性的，按 ERROR；**暂停点对不上**
+    （选的不在候选里、暂停点已经不在了）是这一次请求本身的问题，按 WARNING——
+    排查时看的不是同一个地方。
     """
     yield SSE_RETRY
+    stopped = False
     try:
         for reply in replies:
             if isinstance(reply, Status):
                 yield _event("status", {"text": reply.text})
+            elif isinstance(reply, Clarification):
+                # 这一轮没走完：等着用户点。收尾那条 `done` 因此不能发
+                stopped = True
+                yield _event("clarification", _clarification_payload(reply))
             elif isinstance(reply, Sources):
-                payload = {"citations": [_citation_payload(item) for item in reply.citations]}
-                yield _event("citations", payload)
+                yield _event("citations", _sources_payload(reply))
             else:
                 yield _event("delta", {"text": reply.text})
     except LlmError as exc:
         logger.warning("生成中途失败，这一轮不写进会话：%s", exc)
         yield _event("error", {"message": str(exc)})
         return
+    except (NotACandidate, UnknownPending) as exc:
+        logger.warning("暂停点这条路走不通，这一轮不写进会话：%s", exc)
+        yield _event("error", {"message": str(exc)})
+        return
     except (ModelOutputError, StoreError) as exc:
         logger.error("检索或落库失败，这一轮没有答案也不写进会话：%s", exc)
         yield _event("error", {"message": str(exc)})
         return
-    yield _event("done", {})
+    if not stopped:
+        yield _event("done", {})
+
+
+def _clarification_payload(clarification: Clarification) -> dict[str, Any]:
+    """一次反问对外的样子。
+
+    候选连 `value` 一起给：`label` 是摆给人看的字面（游戏是显示名），`value` 是库里的
+    取值（游戏 id）。页面上按钮显示前者、回传后者——回传 label 的话，两个库重名时
+    会被认到另一个库上去。
+    """
+    return {
+        "pending_id": clarification.pending_id,
+        "dimension": clarification.dimension,
+        "prompt": clarification.prompt,
+        "choices": [
+            {"label": choice.label, "value": choice.value} for choice in clarification.choices
+        ],
+    }
+
+
+def _sources_payload(sources: Sources) -> dict[str, Any]:
+    """这一轮的依据与口径。图片与版本跟引用同一批交出去，页面不必再问一次。"""
+    return {
+        "citations": [_citation_payload(item) for item in sources.citations],
+        "images": list(sources.images),
+        "version": sources.version,
+    }
 
 
 def _event(name: str, payload: Mapping[str, Any]) -> str:
@@ -295,21 +357,6 @@ def _vocabulary(container: Container, game_id: str) -> TagVocabulary:
     就是这条降级路径，标签会稀疏但不会漏（docs/ARCHITECTURE.md §2.3）。
     """
     return _knowledge_base(container, game_id).vocabulary
-
-
-def _games(container: Container) -> tuple[Game, ...]:
-    """游戏候选：`(显示名, 知识库 id)`。
-
-    候选值必须是**用户问句里会出现的那种写法**。知识库 id 同时是 Milvus 的 collection 名，
-    只能是英文标识符（`collection_name`），用户不会这么问——拿 id 去当候选，模型只会把
-    「黑神话」判成不在候选里，这一步于是永远判不出东西来。所以给显示名，拿回来再换回 id
-    （`ragamer.conversations._game_id`）。显示名没配就回落 id，与知识库管理页一个口径。
-    """
-    candidates = []
-    for game_id in container.docs.list_ids(KB_COLLECTION):
-        knowledge = container.docs.get(KB_COLLECTION, game_id) or {}
-        candidates.append((str(knowledge.get("name", "")) or game_id, game_id))
-    return tuple(candidates)
 
 
 def _conversation(chat: Chat, session_id: str) -> Conversation:

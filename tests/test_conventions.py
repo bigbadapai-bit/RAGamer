@@ -77,6 +77,8 @@ def test_守则扫到了源码():
         "retrieval.py",
         "answering.py",
         "conversations.py",
+        "clarifying.py",
+        "knowledge.py",
         "redis.py",
         "answer.py",
         "api.py",

@@ -41,10 +41,11 @@ from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from typing import Any, Literal
 
-from ragamer.answering import Answerer, Citation, require_question
-from ragamer.llm import LlmClient, Message
+from ragamer.answering import Citation, ReadSide, require_question
+from ragamer.clarifying import Clarification, Clarifier
+from ragamer.llm import Message
 from ragamer.logging import get_logger
-from ragamer.query import understand
+from ragamer.query import effective_version
 from ragamer.stores.base import DocStore
 
 logger = get_logger(__name__)
@@ -93,14 +94,19 @@ def _title(question: str) -> str:
 class Turn:
     """会话里的一条消息。
 
-    `citations` 只对模型那一侧非空：用户的话没有来源。它是**正文里 [n] 指的那批**，
-    与当次 `ragamer.answering.AnswerStream.citations` 是同一份——刷新之后要靠它把编号
-    对回原文。
+    后三个字段**只对模型那一侧非空**：用户的话没有来源、没有图、也没有版本这一说。
+    三者都随正文一起存下来，刷新之后这一轮的呈现才与刚答完时一模一样——
+    界面上「引用点不开」「图片没了」「版本徽章不见了」都是同一类毛病：落库时少存了一样。
     """
 
     role: TurnRole
     content: str
+    #: **正文里 [n] 指的那批**，与当次 `ragamer.answering.AnswerStream.citations` 同一份。
     citations: tuple[Citation, ...] = ()
+    #: 这次交给生成的内容里出现过的原图地址，见 `ragamer.answering.Answer`。
+    images: tuple[str, ...] = ()
+    #: 这一轮实际按哪个版本检索（`ragamer.query.effective_version`）。徽章照着它显示。
+    version: str = ""
 
 
 @dataclass(frozen=True)
@@ -151,15 +157,20 @@ Game = tuple[str, str]
 
 @dataclass(frozen=True)
 class Sources:
-    """这一轮用到的来源。**流的第一件事**。
+    """这一轮的依据与口径。**流的第一件事**。
 
-    引用在检索那一步就定下来了，比正文早得多。先把它交出去，界面才能一边吐字一边
-    把来源列出来，而不是等正文吐完再闪一下。名字取「来源」而不是「引用」：后者是
-    `ragamer.answering` 里那个 :class:`~ragamer.answering.Citation` 的名字，
-    一个是对外的一批、一个是里面的一条，两个词分开用免得读岔。
+    引用与图片在检索那一步就定下来了，比正文早得多。先把它交出去，界面才能一边吐字
+    一边把来源列出来，而不是等正文吐完再闪一下；版本徽章同理——等正文收完再补，
+    那一行会跳一下。名字取「来源」而不是「引用」：后者是 `ragamer.answering` 里那个
+    :class:`~ragamer.answering.Citation` 的名字，一个是对外的一批、一个是里面的一条，
+    两个词分开用免得读岔。
     """
 
     citations: tuple[Citation, ...]
+    #: 答案相关的原图地址，见 `ragamer.answering.Answer.images`。
+    images: tuple[str, ...] = ()
+    #: 这一轮实际按哪个版本检索。空串表示没定下来（不过滤版本）。
+    version: str = ""
 
 
 @dataclass(frozen=True)
@@ -186,7 +197,11 @@ class Delta:
 #: 一次提问流出来的东西，**按发生的先后**：若干 :class:`Status`、一个 :class:`Sources`、
 #: 若干 :class:`Delta`。三类之间不是随手排的——状态出现在它描述的那一段**之前**，
 #: 来源出现在检索之后、正文之前。
-Reply = Status | Sources | Delta
+#:
+#: :class:`~ragamer.clarifying.Clarification` 是另一条出路：判不准时这一轮**到此为止**，
+#: 交回候选等用户点。它出现时后面不会再有来源与正文，会话里也什么都不写——
+#: 那一轮还没问完（见 `Chat` 的模块说明）。
+Reply = Status | Sources | Delta | Clarification
 
 
 @dataclass(frozen=True)
@@ -199,8 +214,10 @@ class Chat:
     """
 
     docs: DocStore
-    answerer: Answerer
-    llm: LlmClient
+    #: 读取侧入口（`ragamer.answering.Answerer` 或挡了缓存的 `CachedAnswerer`）。
+    answerer: ReadSide
+    #: 澄清反问那一层。判游戏与版本、拿不准时停下来问，都在它里面。
+    clarifier: Clarifier
     #: 取当下时刻。做成可注入的，与 `OpenAiLlm(sleep=…)` 同一个理由：时间一进断言，
     #: 测试就得能摆布它，否则「按最后活跃倒序」那条用例会看机器的脸色。
     clock: Callable[[], str] = _utc_now
@@ -277,7 +294,8 @@ class Chat:
         *,
         version: str = "",
         current_version: str = "",
-        games: Sequence[Game] = (),
+        pending_id: str = "",
+        label: str = "",
     ) -> Iterator[Reply]:
         """问一句，逐字拿回答案：若干条 :class:`Status`，一个 :class:`Sources`，
         然后若干个 :class:`Delta`。
@@ -302,12 +320,15 @@ class Chat:
         :param question: 用户的原话。写进会话的是它，不是改写之后那一句。
         :param version: 这次点名按哪个版本检索。空串即回落会话选定的那一个。
         :param current_version: 知识库标着的现行版本，会话与点名都没有时才轮到它。
-        :param games: 游戏候选（:data:`Game`，显示名与知识库 id 成对）。**显示名是用户
-            问句里会出现的那种写法**——知识库 id 是 collection 名，只能是英文标识符，
-            拿 id 当候选，模型只会把「黑神话」判成不在候选里。判出来的显示名在这里换回
-            id；没有候选、或者判不出来，都回落会话选定的知识库。
+        :param pending_id: 从哪个暂停点继续。给了它就不再判一次——判定上一次就做完了，
+            用户点的那个候选由 :meth:`ragamer.clarifying.Clarifier.resolve` 补进去。
+            这时 `question` 只用来记这一轮的用户原话，检索用的是暂停点里存着的改写问法。
+        :param label: 用户点的那个候选项，原样回传。**必须是他当时看到的那些之一**，
+            按钮之外的值当场报错而不是拿去检索（错的是请求，不是语料）。
         :raises ConversationNotFound: 没有这个会话。
         :raises ValueError: 问题为空。空问题会让检索查出任意一批切片。
+        :raises ragamer.clarifying.UnknownPending: 没有这个暂停点。
+        :raises ragamer.clarifying.NotACandidate: 选的不在那次反问给出的候选里。
         """
         require_question(question)  # 拦在理解那一步之前：空问题没得可理解，别白调一次模型
         conversation = self.open(session_id)
@@ -316,7 +337,8 @@ class Chat:
             question,
             version=version or conversation.version,
             current_version=current_version,
-            games=games,
+            pending_id=pending_id,
+            label=label,
         )
 
     def _replies(
@@ -326,39 +348,59 @@ class Chat:
         *,
         version: str,
         current_version: str,
-        games: Sequence[Game],
+        pending_id: str = "",
+        label: str = "",
     ) -> Iterator[Reply]:
         """把这一轮从头做到尾，**每一步之前先报一条进度**，最后收完正文才落库。
 
-        进度那三条与这一轮真正干的事一一对应，顺序也一致：理解问题 → 检索资料 →
+        进度那两条与这一轮真正干的事一一对应，顺序也一致：理解问题 → 检索资料 →
         生成答案。夹在中间的是来源——它比正文早得多，一拿到就先交出去，界面可以
         先列出来再等字。
+
+        **判不准的那一轮到此为止**：交回一次 :class:`~ragamer.clarifying.Clarification`
+        就结束，不检索、不生成、也不落库。用户点完候选再发一次请求（带 `pending_id`），
+        那一轮才算走完——所以「反问过的提问」在会话里只留下最终那一问一答，
+        不会先留一条等不到回复的提问。
 
         迭代器被丢掉时（客户端断开）最后那一行写不进会话——这正是要的效果：
         已经吐出去的那半句与它那批引用一起消失，历史里不留痕迹。
         """
-        yield Status("正在理解问题")
-        understanding = understand(
-            question,
-            llm=self.llm,
-            games=[name for name, _ in games],
-            history=_history(conversation.turns),
-        )
+        if pending_id:
+            # 判定上一次就做完了，这里只把它取回来；那一步还会核对用户点的是不是候选之一
+            resolved = self.clarifier.resolve(pending_id, label)
+        else:
+            yield Status("正在理解问题")
+            outcome = self.clarifier.decide(
+                question,
+                game_id=conversation.game_id,
+                version=version,
+                history=_history(conversation.turns),
+            )
+            if isinstance(outcome, Clarification):
+                yield outcome
+                return
+            resolved = outcome
         yield Status("正在检索资料")
         stream = self.answerer.stream(
-            understanding.rewritten_query,
-            game_id=_game_id(understanding.game, games) or conversation.game_id,
-            version=version,
+            resolved.rewritten_query,
+            game_id=resolved.game_id,
+            version=resolved.version,
             current_version=current_version,
         )
+        sources = Sources(
+            stream.citations,
+            stream.images,
+            effective_version(resolved.version, current_version=current_version),
+        )
         logger.info(
-            "会话 %s 提问 %r（改写为 %r），用上 %d 条来源",
+            "会话 %s 提问 %r（改写为 %r），版本 %r，用上 %d 条来源",
             conversation.session_id,
             question,
-            understanding.rewritten_query,
-            len(stream.citations),
+            resolved.rewritten_query,
+            sources.version,
+            len(sources.citations),
         )
-        yield Sources(stream.citations)
+        yield sources
         yield Status("正在生成答案")
         produced: list[str] = []
         for piece in stream.deltas:
@@ -366,7 +408,7 @@ class Chat:
             yield Delta(piece)
         _save(
             self.docs,
-            _appended(conversation, question, "".join(produced), stream.citations, self.clock()),
+            _appended(conversation, question, "".join(produced), sources, self.clock()),
         )
 
 
@@ -380,23 +422,11 @@ def _history(turns: Sequence[Turn]) -> tuple[Message, ...]:
     return tuple(Message(turn.role, turn.content) for turn in turns[-HISTORY_TURNS * 2 :])
 
 
-def _game_id(picked: str, games: Sequence[Game]) -> str:
-    """理解那一步判出的显示名换回知识库 id。判不出来就留空，由调用方回落。
-
-    `understand` 已经把候选之外的取值丢掉了，所以这里对不上只剩一种可能：
-    调用方压根没给候选。那种情况下留空是对的——宁可用会话选定的知识库，
-    也不要拿一个换不出 id 的名字去检索。
-    """
-    if not picked:
-        return ""
-    return next((game_id for name, game_id in games if name == picked), "")
-
-
 def _appended(
     conversation: Conversation,
     question: str,
     answer: str,
-    citations: tuple[Citation, ...],
+    sources: Sources,
     now: str,
 ) -> Conversation:
     """把这一问一答接到末尾。**两条一起接**：中途断掉时不会留下一条等不到回复的提问。
@@ -411,7 +441,7 @@ def _appended(
         turns=(
             *conversation.turns,
             Turn("user", question),
-            Turn("assistant", answer, citations),
+            Turn("assistant", answer, sources.citations, sources.images, sources.version),
         ),
     )
 
@@ -441,6 +471,8 @@ def _turn_payload(turn: Turn) -> dict[str, Any]:
         "content": turn.content,
         # 引用原样存下：正文里的 [n] 指的就是它，刷新之后还要对得上号
         "citations": [asdict(citation) for citation in turn.citations],
+        "images": list(turn.images),
+        "version": turn.version,
     }
 
 
@@ -460,4 +492,6 @@ def _read_turn(payload: Mapping[str, Any]) -> Turn:
         role=payload["role"],
         content=str(payload["content"]),
         citations=tuple(Citation(**citation) for citation in payload.get("citations", ())),
+        images=tuple(str(url) for url in payload.get("images", ())),
+        version=str(payload.get("version", "")),
     )

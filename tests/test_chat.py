@@ -15,10 +15,12 @@ import json
 
 from fastapi.testclient import TestClient
 
-from ragamer.api import KB_COLLECTION, create_app
+from ragamer.api import create_app
+from ragamer.clarifying import CONFIDENT
+from ragamer.knowledge import KB_COLLECTION
 from ragamer.llm import FakeLlm
 
-from .conftest import HalfwayLlm, chunk_store, make_chunk, make_container
+from .conftest import HalfwayLlm, chunk_store, joint_reply, make_chunk, make_container
 
 GAME = "black_myth"
 #: 这个库的元数据。`name` 是显示名——它同时是给模型的游戏候选。
@@ -32,9 +34,18 @@ QUESTION = "二郎神掉什么"
 REPLY = "掉的是三尖两刃刀[1]。"
 
 
-def said(rewritten: str, game: str = "") -> dict[str, str]:
-    """提问理解那一步的脚本：一次联合输出。"""
-    return {"game": game, "version": "", "rewritten_query": rewritten}
+def said(rewritten: str, game: str = "") -> dict[str, object]:
+    """提问理解那一步的脚本：一次联合输出。
+
+    **判出来就算确定**：这几个用例关心的是流与落库，分级在 `tests/test_clarifying.py`
+    里单测。少了确定度那两个字段，联合输出节点会当场判成「读不出来」，整条理解静默
+    降级回原问法。
+    """
+    return joint_reply(
+        game=game,
+        game_confidence=CONFIDENT if game else 0.0,
+        rewritten_query=rewritten,
+    )
 
 
 def client_with(llm, *chunks) -> TestClient:
