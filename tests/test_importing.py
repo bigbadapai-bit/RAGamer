@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 from ragamer import importing
@@ -13,12 +15,11 @@ from ragamer.chunking import Chunk, ChunkRules
 from ragamer.importing import (
     Importer,
     ImportStage,
-    SourceDocument,
     chunk_id,
     content_hash,
     document_title,
 )
-from ragamer.sources import NormalizedDoc
+from ragamer.sources import NormalizedDoc, SourceDocument
 from ragamer.stores.base import UNVERSIONED
 from ragamer.stores.memory import InMemoryChunkStore
 from ragamer.tagging import ContentNature, SubjectType, TagVocabulary
@@ -116,7 +117,7 @@ def stored(chunks: InMemoryChunkStore, version: str = UNVERSIONED) -> list:
 def test_一份资料从归一化一路走到入库():
     chunks = InMemoryChunkStore()
 
-    result = make_importer(chunks).source(markdown(), game_id=GAME, vocabulary=BLACK_MYTH)
+    result = make_importer(chunks).import_one(markdown(), game_id=GAME, vocabulary=BLACK_MYTH)
 
     assert result.ok
     assert result.doc_title == "二郎神"
@@ -131,7 +132,7 @@ def test_入库的切片每个字段都填上了():
     过滤静默落空、标签缺了检索静默漏召回。所以在这里逐个钉住。
     """
     chunks = InMemoryChunkStore()
-    make_importer(chunks).source(markdown(), game_id=GAME, vocabulary=BLACK_MYTH)
+    make_importer(chunks).import_one(markdown(), game_id=GAME, vocabulary=BLACK_MYTH)
 
     for chunk in stored(chunks):
         assert chunk.content
@@ -147,7 +148,7 @@ def test_入库的切片每个字段都填上了():
 
 def test_两层标签与切片类型一起落库():
     chunks = InMemoryChunkStore()
-    result = make_importer(chunks).source(markdown(), game_id=GAME, vocabulary=BLACK_MYTH)
+    result = make_importer(chunks).import_one(markdown(), game_id=GAME, vocabulary=BLACK_MYTH)
 
     assert result.tags.subject_name == "二郎神"
     assert result.tags.subject_type == (SubjectType.CHARACTER.value,)
@@ -161,7 +162,7 @@ def test_两层标签与切片类型一起落库():
 
 def test_内容性质逐切片判定_同一文档里两种性质并存():
     chunks = InMemoryChunkStore()
-    make_importer(chunks).source(markdown(), game_id=GAME, vocabulary=BLACK_MYTH)
+    make_importer(chunks).import_one(markdown(), game_id=GAME, vocabulary=BLACK_MYTH)
 
     natures = [chunk.content_nature for chunk in stored(chunks)]
 
@@ -177,9 +178,9 @@ def test_同一份资料导入两次_库里的切片数量不变():
     chunks = InMemoryChunkStore()
     importer = make_importer(chunks)
 
-    first = importer.source(markdown(), game_id=GAME, vocabulary=BLACK_MYTH)
+    first = importer.import_one(markdown(), game_id=GAME, vocabulary=BLACK_MYTH)
     before = [chunk.chunk_id for chunk in stored(chunks)]
-    second = importer.source(markdown(), game_id=GAME, vocabulary=BLACK_MYTH)
+    second = importer.import_one(markdown(), game_id=GAME, vocabulary=BLACK_MYTH)
 
     assert second.chunk_count == first.chunk_count
     assert [chunk.chunk_id for chunk in stored(chunks)] == before
@@ -190,10 +191,10 @@ def test_重导时片数变少_旧的那一截被清掉():
     chunks = InMemoryChunkStore()
     importer = make_importer(chunks)
 
-    importer.source(markdown(), game_id=GAME, vocabulary=BLACK_MYTH)
-    short = importer.source(markdown(text=SHORT_ARTICLE), game_id=GAME, vocabulary=BLACK_MYTH)
+    long = importer.import_one(markdown(), game_id=GAME, vocabulary=BLACK_MYTH)
+    short = importer.import_one(markdown(text=SHORT_ARTICLE), game_id=GAME, vocabulary=BLACK_MYTH)
 
-    assert short.chunk_count < len(SHORT_ARTICLE)  # 确实变少了，这条才验得到东西
+    assert short.chunk_count < long.chunk_count  # 确实变少了，这条才验得到东西
     assert len(stored(chunks)) == short.chunk_count
     assert [chunk.chunk_index for chunk in stored(chunks)] == list(range(short.chunk_count))
 
@@ -203,8 +204,8 @@ def test_不同版本的一份资料并存():
     chunks = InMemoryChunkStore()
     importer = make_importer(chunks)
 
-    importer.source(markdown(), game_id=GAME, vocabulary=BLACK_MYTH)
-    importer.source(markdown(), game_id=GAME, version="2.0", vocabulary=BLACK_MYTH)
+    importer.import_one(markdown(), game_id=GAME, vocabulary=BLACK_MYTH)
+    importer.import_one(markdown(), game_id=GAME, version="2.0", vocabulary=BLACK_MYTH)
 
     assert stored(chunks, version=UNVERSIONED)
     assert stored(chunks, version="2.0")
@@ -212,13 +213,30 @@ def test_不同版本的一份资料并存():
     assert {chunk.version for chunk in stored(chunks, version=UNVERSIONED)} == {UNVERSIONED}
 
 
+def test_同一批里两份同标题的文件留一条覆盖的痕(caplog):
+    """同名即同一份文档（文档标题是重导替换的范围），但两条结果都会报成功。
+
+    这不是错，是界面上「导入了 2 份」的读法要打折扣——所以留一条日志，不假装没发生。
+    """
+    chunks = InMemoryChunkStore()
+
+    with caplog.at_level(logging.WARNING, logger="ragamer.importing"):
+        results = make_importer(chunks).batch(
+            [markdown("甲.md"), markdown("乙.md")], game_id=GAME, vocabulary=BLACK_MYTH
+        )
+
+    assert [result.ok for result in results] == [True, True]
+    assert "甲.md" in caplog.text and "乙.md" in caplog.text
+    assert len(stored(chunks)) == results[-1].chunk_count  # 库里只剩后写的那一份
+
+
 def test_重导时换了版本不动别的版本():
     chunks = InMemoryChunkStore()
     importer = make_importer(chunks)
-    importer.source(markdown(), game_id=GAME, version="1.0", vocabulary=BLACK_MYTH)
+    importer.import_one(markdown(), game_id=GAME, version="1.0", vocabulary=BLACK_MYTH)
     before = len(stored(chunks, version="1.0"))
 
-    importer.source(
+    importer.import_one(
         markdown(text=SHORT_ARTICLE), game_id=GAME, version="2.0", vocabulary=BLACK_MYTH
     )
 
@@ -264,10 +282,10 @@ def test_向量化那一步失败时阶段报得出来():
 def test_入库之前失败时旧的那一批原样留着():
     """删除排在最后而不是最早：中途失败不该留下一个空文档。"""
     chunks = InMemoryChunkStore()
-    make_importer(chunks).source(markdown(), game_id=GAME, vocabulary=BLACK_MYTH)
+    make_importer(chunks).import_one(markdown(), game_id=GAME, vocabulary=BLACK_MYTH)
     before = [chunk.chunk_id for chunk in stored(chunks)]
 
-    result = make_importer(chunks, embedder=FailingEmbedder()).source(
+    result = make_importer(chunks, embedder=FailingEmbedder()).import_one(
         markdown(text=SHORT_ARTICLE), game_id=GAME, vocabulary=BLACK_MYTH
     )
 
@@ -301,7 +319,7 @@ def test_补图没接上时不报这一步():
     seen: list[ImportStage] = []
     importer = make_importer(on_progress=lambda event: seen.append(event.stage))
 
-    importer.source(markdown(), game_id=GAME, vocabulary=BLACK_MYTH)
+    importer.import_one(markdown(), game_id=GAME, vocabulary=BLACK_MYTH)
     assert ImportStage.ENRICH not in seen
 
     enricher = RecordingEnricher()
@@ -310,7 +328,7 @@ def test_补图没接上时不报这一步():
         embedder=FakeEmbedder(),
         rules=RULES,
         enricher=enricher,
-    ).source(markdown(), game_id=GAME, vocabulary=BLACK_MYTH)
+    ).import_one(markdown(), game_id=GAME, vocabulary=BLACK_MYTH)
     assert len(enricher.docs) == 1
 
 
@@ -323,15 +341,15 @@ def test_走到哪报到哪_失败时后面的阶段不出现():
     )
 
     assert seen == [ImportStage.NORMALIZE]
-    assert results[0].progress == tuple(results[0].progress)
     assert [event.stage for event in results[0].progress] == [ImportStage.NORMALIZE]
 
 
 def test_结果里带着这个文件走过的阶段():
-    result = make_importer().source(markdown(), game_id=GAME, vocabulary=BLACK_MYTH)
+    result = make_importer().import_one(markdown(), game_id=GAME, vocabulary=BLACK_MYTH)
 
     assert [event.stage for event in result.progress][-1] is ImportStage.STORE
-    assert result.progress[0].describe().startswith("[1/1] 二郎神.md")
+    first = result.progress[0]
+    assert (first.filename, first.file_number, first.file_total) == ("二郎神.md", 1, 1)
 
 
 # --- 跳过的条数 ---
@@ -347,7 +365,7 @@ def test_没有正文的切片不入库并计入跳过(monkeypatch):
     monkeypatch.setattr(importing, "chunk_document", lambda markdown, rules: [blank])
     chunks = InMemoryChunkStore()
 
-    result = make_importer(chunks).source(markdown(), game_id=GAME, vocabulary=BLACK_MYTH)
+    result = make_importer(chunks).import_one(markdown(), game_id=GAME, vocabulary=BLACK_MYTH)
 
     assert result.ok
     assert (result.chunk_count, result.skipped) == (0, 1)
@@ -397,6 +415,6 @@ def test_没有一级标题时回落到文件名():
 @pytest.mark.parametrize("version", [UNVERSIONED, "2.0"])
 def test_版本原样落库(version):
     chunks = InMemoryChunkStore()
-    make_importer(chunks).source(markdown(), game_id=GAME, version=version)
+    make_importer(chunks).import_one(markdown(), game_id=GAME, version=version)
 
     assert {chunk.version for chunk in stored(chunks, version=version)} == {version}

@@ -30,7 +30,6 @@ from ragamer.logging import get_logger
 from ragamer.sources import (
     ImageEnricher,
     MarkdownParser,
-    NormalizedDoc,
     SourceDocument,
     SourceParser,
 )
@@ -77,11 +76,6 @@ class ProgressEvent:
     #: 这一批一共几个文件。
     file_total: int
 
-    def describe(self) -> str:
-        return (
-            f"[{self.file_number}/{self.file_total}] {self.filename} · {STAGE_LABELS[self.stage]}"
-        )
-
 
 #: 进度回调。每进入一个阶段调一次。
 ProgressCallback = Callable[[ProgressEvent], None]
@@ -110,7 +104,8 @@ class ImportResult:
     doc_title: str
     #: 入库的切片数。
     chunk_count: int
-    #: 没有可向量化正文、因而没有入库的切片数。
+    #: 没有可向量化正文、因而没有入库的切片数。今天的切分器不会产出正文为空的切片
+    #: （`_split` 已经滤掉空段），真实来源是补图那一层——OCR 与摘要都失败的图片切片。
     skipped: int
     tags: CoveredTags
     #: 失败发生在哪一步；成功时是 `None`。
@@ -131,6 +126,10 @@ def document_title(markdown: str, filename: str) -> str:
     先取正文的一级标题（词条页的条目名就在这里），取不到才回落到文件名。
     它对同一份资料必须稳定：文档标题同时是「重导时替换掉哪一批切片」的依据，
     换个文件名重传会变成两份文档——这是回落带来的已知代价。
+
+    按行扫，**不认围栏代码块**：正文若以一段代码开头，代码里的 `#` 会被当成大标题。
+    这与打标读结构（`ragamer.tagging` 的已知限）同源，是同一处妥协；
+    但这里的影响面更大——标题是替换键，改错了旧的那批切片会留在库里。
     """
     title = _TITLE.search(markdown)
     return title.group(1).strip() if title is not None else Path(filename).stem
@@ -185,8 +184,8 @@ class Importer:
     ) -> tuple[ImportResult, ...]:
         """一批资料，顺序即提交顺序。**逐个独立**：某个文件失败时其余照常入库。"""
         total = len(sources)
-        return tuple(
-            self.source(
+        results = tuple(
+            self.import_one(
                 source,
                 game_id=game_id,
                 version=version,
@@ -196,8 +195,10 @@ class Importer:
             )
             for number, source in enumerate(sources, start=1)
         )
+        _warn_on_repeated_documents(results, version=version)
+        return results
 
-    def source(
+    def import_one(
         self,
         source: SourceDocument,
         *,
@@ -352,19 +353,23 @@ def _unique(values: Iterable[str]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(values))
 
 
-__all__ = [
-    "STAGE_LABELS",
-    "CoveredTags",
-    "ImageEnricher",
-    "ImportResult",
-    "ImportStage",
-    "Importer",
-    "NormalizedDoc",
-    "ProgressCallback",
-    "ProgressEvent",
-    "SourceDocument",
-    "SourceParser",
-    "chunk_id",
-    "content_hash",
-    "document_title",
-]
+def _warn_on_repeated_documents(results: Sequence[ImportResult], *, version: str) -> None:
+    """同一批里两份文件切成同一个文档标识时提醒一声。
+
+    文档标识是「文档标题 + 版本」，也是重导替换的范围：两份一级标题相同的文件会互相
+    覆盖——后写的那份先把前一份删掉，两条结果却都报成功，库里最终只剩一份。
+    这不是错（同名即同一份文档），但界面上「导入了 2 份」的读法要打折扣，所以留一条痕。
+    """
+    claimed: dict[str, str] = {}
+    for result in results:
+        if not result.ok:
+            continue
+        first = claimed.setdefault(result.doc_title, result.filename)
+        if first != result.filename:
+            logger.warning(
+                "同一批里 %s 与 %s 切出了同一个文档标题 %r（版本 %r）：后写的覆盖了前一份",
+                first,
+                result.filename,
+                result.doc_title,
+                version,
+            )
