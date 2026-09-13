@@ -26,6 +26,8 @@ from ragamer.tagging import ContentNature, SubjectType, TagVocabulary
 from ragamer.vectors.base import ModelUnavailableError
 from ragamer.vectors.fake import FakeEmbedder
 
+from .conftest import FakeCrawler
+
 RULES = ChunkRules(max_chars=200, min_chars=40, heading_density=0.02)
 
 GAME = "black_myth"
@@ -140,6 +142,8 @@ def test_入库的切片每个字段都填上了():
         assert chunk.doc_title == "二郎神"
         assert chunk.game_id == GAME
         assert chunk.version == UNVERSIONED
+        # 本地文件没有来源地址。网页那一条落的是抓取时的最终地址，见下面网址那一节
+        assert chunk.source_url == ""
         assert chunk.chunk_type in ("text", "table", "image")
         assert chunk.content_hash
         assert chunk.dense_vector is not None
@@ -418,3 +422,95 @@ def test_版本原样落库(version):
     make_importer(chunks).import_one(markdown(), game_id=GAME, version=version)
 
     assert {chunk.version for chunk in stored(chunks, version=version)} == {version}
+
+
+# --- 网址那条入口 ---
+
+PAGE_URL = "https://wiki.test/wiki/二郎神"
+MISSING_URL = "https://wiki.test/wiki/没有这页"
+
+
+def test_网址导入走的是同一条链路():
+    """「抓取结果与本地文件走完全相同的后续链路」——同一份正文，两条入口切出来的片
+    除来源地址之外逐字相同：切分与打标确实不感知来源。"""
+    from_file = InMemoryChunkStore()
+    from_url = InMemoryChunkStore()
+    make_importer(from_file).import_one(markdown(), game_id=GAME, vocabulary=BLACK_MYTH)
+    make_importer(from_url, crawler=FakeCrawler(**{PAGE_URL: WIKI_ARTICLE})).import_url(
+        PAGE_URL, game_id=GAME, vocabulary=BLACK_MYTH
+    )
+
+    fields = (
+        "chunk_id",
+        "content",
+        "ancestor_path",
+        "chunk_index",
+        "chunk_type",
+        "doc_title",
+        "subject_name",
+        "subject_type",
+        "content_nature",
+        "game_terms",
+        "content_hash",
+    )
+    reference = stored(from_file)
+    fetched = stored(from_url)
+    assert len(reference) == len(fetched) > 1  # 确实切出了多片，这条才验得到东西
+    assert [tuple(getattr(chunk, name) for name in fields) for chunk in reference] == [
+        tuple(getattr(chunk, name) for name in fields) for chunk in fetched
+    ]
+
+
+def test_网址导入把来源地址落进每一片():
+    """答案的引用里要显示的就是它。"""
+    chunks = InMemoryChunkStore()
+
+    result = make_importer(chunks, crawler=FakeCrawler(**{PAGE_URL: WIKI_ARTICLE})).import_url(
+        PAGE_URL, game_id=GAME, vocabulary=BLACK_MYTH
+    )
+
+    assert result.ok
+    assert {chunk.source_url for chunk in stored(chunks)} == {PAGE_URL}
+
+
+def test_抓取失败落在归一化那一步():
+    chunks = InMemoryChunkStore()
+
+    result = make_importer(chunks, crawler=FakeCrawler()).import_url(
+        PAGE_URL, game_id=GAME, vocabulary=BLACK_MYTH
+    )
+
+    assert not result.ok
+    assert result.stage is ImportStage.NORMALIZE
+    assert PAGE_URL in result.filename
+    assert stored(chunks) == []
+
+
+def test_网址导入的进度事件里报的是地址():
+    """网页没有文件名，进度与结果里能指认这一条的就是地址。"""
+    events = []
+    make_importer(
+        InMemoryChunkStore(),
+        crawler=FakeCrawler(**{PAGE_URL: WIKI_ARTICLE}),
+        on_progress=events.append,
+    ).import_url(PAGE_URL, game_id=GAME)
+
+    assert events
+    assert {event.filename for event in events} == {PAGE_URL}
+
+
+def test_一批网址逐个独立():
+    chunks = InMemoryChunkStore()
+    importer = make_importer(chunks, crawler=FakeCrawler(**{PAGE_URL: WIKI_ARTICLE}))
+
+    results = importer.batch_urls([PAGE_URL, MISSING_URL], game_id=GAME, vocabulary=BLACK_MYTH)
+
+    assert [result.ok for result in results] == [True, False]
+    assert stored(chunks)  # 失败的那一条没有牵连成功的那一条
+
+
+def test_没接抓取器时导入网址当场报错():
+    """接线漏了是程序错，不是这份资料错——不该被兜成一个「失败的结果」：
+    那样它就跟在一批正常的业务失败里，谁也不觉得要去修。"""
+    with pytest.raises(ValueError):
+        make_importer(InMemoryChunkStore()).import_url(PAGE_URL, game_id=GAME)

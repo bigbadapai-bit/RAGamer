@@ -1,8 +1,13 @@
 """HTTP 端点：写入侧对外的唯一入口。
 
-一个端点——`POST /api/kb/{game_id}/import`。批量提交、**逐文件独立**：某个文件失败时
-其余照常入库，失败的那个在结果里带文件名与失败阶段。读取侧（提问）与几个页面在后面的
-票里接。
+两个端点，对应界面上的两处输入：
+
+- `POST /api/kb/{game_id}/import` —— 上传文件（或界面上传的字节）。
+- `POST /api/kb/{game_id}/import/urls` —— 给网址，抓回来再入库。
+
+两条都是批量提交、**逐条独立**：某一条失败时其余照常入库，失败的那条在结果里带来源与
+失败阶段。两条走的是同一个导入器、同一条链路，响应形状也逐字相同。读取侧（提问）与
+几个页面在后面的票里接。
 
 知识库元数据从 MongoDB 读（`knowledge_bases` 集合，id 就是游戏 id）：打标要用的词表
 ——启用了哪些主体类型、这个游戏的术语映射——就在它里面（docs/ARCHITECTURE.md §2.3）。
@@ -15,6 +20,7 @@ from dataclasses import asdict
 from typing import Annotated, Any
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from pydantic import BaseModel, Field
 
 from ragamer.container import Container
 from ragamer.importing import STAGE_LABELS, Importer, ImportResult, ProgressEvent
@@ -29,6 +35,18 @@ logger = get_logger(__name__)
 KB_COLLECTION = "knowledge_bases"
 
 
+class UrlImport(BaseModel):
+    """一次网址导入的请求体。
+
+    网址单独成一个端点而不是塞进上传那一个的多表单字段里：界面上的两处输入本来就分开
+    （文件上传 / URL 输入，docs/ARCHITECTURE.md §5），而多部分表单里夹一个网址数组
+    两边都不好写。
+    """
+
+    urls: list[str] = Field(min_length=1, description="要抓的网页地址，可多条")
+    version: str = Field(default=UNVERSIONED, description="这次导入标注的版本，留空即未标注版本")
+
+
 def create_app(container: Container) -> FastAPI:
     """把组合根里那套依赖接成 ASGI 应用。"""
     app = FastAPI(title="RAGamer", summary="游戏攻略 RAG 助手")
@@ -36,6 +54,7 @@ def create_app(container: Container) -> FastAPI:
         chunks=container.chunks,
         embedder=container.embedder,
         llm=container.llm,
+        crawler=container.crawler,
         on_progress=_log_progress,
     )
 
@@ -55,15 +74,35 @@ def create_app(container: Container) -> FastAPI:
         ]
 
         results = importer.batch(sources, game_id=game_id, version=version, vocabulary=vocabulary)
-        return {
-            "game_id": game_id,
-            "version": version,
-            "imported": sum(1 for result in results if result.ok),
-            "failed": sum(1 for result in results if not result.ok),
-            "results": [_result_payload(result) for result in results],
-        }
+        return _response(game_id, version, results)
+
+    @app.post("/api/kb/{game_id}/import/urls")
+    async def import_urls(game_id: str, request: UrlImport) -> dict[str, Any]:
+        """抓一批网页再入库。某个地址失败时其余照常入库，失败信息带地址与失败阶段。
+
+        抓回来的资料与上传的文件走同一条链路，响应形状也相同——界面上两条输入各是各的
+        提交按钮，读结果的地方却可以共用一处。
+        """
+        _check_game_id(game_id)
+        vocabulary = _vocabulary(container, game_id)
+
+        results = importer.batch_urls(
+            request.urls, game_id=game_id, version=request.version, vocabulary=vocabulary
+        )
+        return _response(game_id, request.version, results)
 
     return app
+
+
+def _response(game_id: str, version: str, results: tuple[ImportResult, ...]) -> dict[str, Any]:
+    """两条导入路径共用的响应。形状一样是有意的：界面读结果只有一处。"""
+    return {
+        "game_id": game_id,
+        "version": version,
+        "imported": sum(1 for result in results if result.ok),
+        "failed": sum(1 for result in results if not result.ok),
+        "results": [_result_payload(result) for result in results],
+    }
 
 
 def _log_progress(event: ProgressEvent) -> None:
