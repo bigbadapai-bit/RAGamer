@@ -3,6 +3,10 @@
 读取侧到这一步为止：问题进，答案与引用出来。中间是主检索路（`ragamer.retrieval`）
 ——取候选、精排、断崖截断、按文档聚合父块。
 
+**两种给法**：:meth:`Answerer.answer` 一次给全，:meth:`Answerer.stream` 逐字给。
+两者共用同一段检索与同一份提示词（:meth:`Answerer._sources`），差别只在正文怎么出来；
+引用在流式这一路是**先**出来的，因为它在检索那一步就定下来了。
+
 四件事在这里定死：
 
 - **一条资料是一个父块，不是一个切片**。命中并截断之后按文档回查兄弟切片
@@ -31,7 +35,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 
 from ragamer.chunking import PATH_SEPARATOR
@@ -121,6 +125,38 @@ class Answer:
     citations: tuple[Citation, ...]
 
 
+@dataclass(frozen=True)
+class AnswerStream:
+    """一次提问的流式形态：**引用先定下来，正文逐字来**。
+
+    检索、精排、聚合父块在 :meth:`Answerer.stream` 返回之前就跑完了，所以 `citations`
+    到这一刻已经是最终的那一批——界面可以先把来源渲染出来，不必等正文吐完。
+
+    `deltas` 是**惰性**的：模型那一段要等调用方真的开始迭代才发出去。好处不只是省一次
+    网络往返——调用方**随时可以把它丢掉**（客户端断开、页面关掉），丢掉之后这边不留
+    任何痕迹，因为这一层从头到尾没有累积过整段正文（唯一那份累积在
+    `Answerer._streamed` 里，它随生成器一起被关掉）。会话历史要不要记下这一轮，
+    因此完全是调用方的事，见 `ragamer.conversations`。
+
+    `citations` 为空即「没有检索到内容」，这时 `deltas` 只有 `NOT_FOUND` 那一片，
+    与 :class:`Answer` 是同一条口径。
+    """
+
+    citations: tuple[Citation, ...]
+    deltas: Iterator[str]
+
+
+def _require_question(question: str) -> None:
+    """空问题会让检索查出任意一批切片，答案也就是编的。两条路都在最前面拦它。"""
+    if not question.strip():
+        raise ValueError("问题不能为空：空问题会让检索查出任意一批切片，答案也就是编的")
+
+
+def _citations(sources: Sequence[_Source]) -> tuple[Citation, ...]:
+    """编号好的父块 → 交回给调用方的引用。顺序就是提示词里的顺序，一一对应。"""
+    return tuple(source.citation for source in sources)
+
+
 def _prompt_text(block: ParentBlock) -> str:
     """一个父块交给模型时的全文：块内每条切片按源文档顺序拼起来。
 
@@ -172,8 +208,62 @@ class Answerer:
         :raises ValueError: 问题为空。空问题会让检索查出任意一批切片。
         :raises ragamer.llm.LlmError: 生成失败。没有答案就是没有答案，不降级。
         """
-        if not question.strip():
-            raise ValueError("问题不能为空：空问题会让检索查出任意一批切片，答案也就是编的")
+        _require_question(question)
+        sources = self._sources(
+            question, game_id=game_id, version=version, current_version=current_version
+        )
+        if not sources:
+            return Answer(NOT_FOUND, ())
+        text = self.llm.complete(_request(question, sources))
+        _warn_on_unknown_citations(text, len(sources))
+        return Answer(text, _citations(sources))
+
+    def stream(
+        self,
+        question: str,
+        *,
+        game_id: str,
+        version: str = "",
+        current_version: str = "",
+    ) -> AnswerStream:
+        """与 :meth:`answer` 同一套检索与提示，只是正文逐字产出。
+
+        引用与正文分两步给：检索那一段**在返回之前**就跑完了（它决定引用，也决定要不要
+        调模型），模型那一段则等调用方开始时才发出去。没有检索到内容时同样不调模型，
+        `NOT_FOUND` 那段常量作为流的第一片也是唯一一片交出去——界面上两种情况的呈现
+        一样，只是这一种不会有引用。
+
+        这一步与 `answer` 一样**不落任何盘**：调用方可以在正文吐到一半时把它丢掉，
+        不留痕迹。会话历史该不该记下这一轮，由调用方在收完之后决定（`ragamer.conversations`）。
+
+        :param game_id: 进哪个游戏知识库检索。
+        :param version: 这次按哪个版本检索。空串表示没点名（回落 `current_version`）。
+        :param current_version: 知识库标着的现行版本。
+        :raises ValueError: 问题为空。空问题会让检索查出任意一批切片。
+        :raises ragamer.llm.LlmError: 生成失败。`deltas` 迭代到一半才炸是常事——
+            这时已经吐出去的内容是收不回的，调用方应当把整轮丢掉而不是记半句。
+        """
+        _require_question(question)
+        sources = self._sources(
+            question, game_id=game_id, version=version, current_version=current_version
+        )
+        if not sources:
+            return AnswerStream((), iter((NOT_FOUND,)))
+        return AnswerStream(_citations(sources), self._streamed(question, sources))
+
+    def _sources(
+        self,
+        question: str,
+        *,
+        game_id: str,
+        version: str,
+        current_version: str,
+    ) -> tuple[_Source, ...]:
+        """检索、聚合父块、编号。**一条内容都没有时返回空元组**，不编造内容。
+
+        `answer` 与 `stream` 共用这一段：两条路给出去的引用必须是同一批、同一个顺序，
+        各写一遍迟早会分岔——而引用对不上内容这件事，从答案本身看不出来。
+        """
         where = version_filter(version, current_version=current_version)
         found = retrieve(
             question,
@@ -185,7 +275,7 @@ class Answerer:
         )
         if not found:
             logger.info("提问 %r 没检索到内容，回明确回复，不调模型", question)
-            return Answer(NOT_FOUND, ())
+            return ()
         # 聚合在截断之后：先由断崖定下哪些文档进得来，再按文档把兄弟切片一次查齐
         blocks = aggregate_parents(found, game_id=game_id, chunks=self.chunks, where=where)
         if not blocks:
@@ -193,7 +283,7 @@ class Answerer:
             logger.warning(
                 "提问 %r 命中 %d 条切片却聚合不出父块，按检索不到处理", question, len(found)
             )
-            return Answer(NOT_FOUND, ())
+            return ()
         sources = tuple(
             _Source(Citation(index, block.doc_title, block.ancestor_path), block)
             for index, block in enumerate(blocks, start=1)
@@ -201,9 +291,20 @@ class Answerer:
         logger.info(
             "提问 %r 命中 %d 条切片、聚成 %d 个父块，交给生成", question, len(found), len(sources)
         )
-        text = self.llm.complete(_request(question, sources))
-        _warn_on_unknown_citations(text, len(sources))
-        return Answer(text, tuple(source.citation for source in sources))
+        return sources
+
+    def _streamed(self, question: str, sources: Sequence[_Source]) -> Iterator[str]:
+        """逐字转出去，**吐完之后**才检查引用编号。
+
+        编号检查要整段正文才做得成，而流式这一路没有累积——所以在这里攒一份。
+        调用方在正文收完之前就把流丢掉时，这个生成器会被关掉，检查也就不做了：
+        那一轮本来就不该留下任何东西，没有正文可核对。
+        """
+        produced: list[str] = []
+        for piece in self.llm.stream(_request(question, sources)):
+            produced.append(piece)
+            yield piece
+        _warn_on_unknown_citations("".join(produced), len(sources))
 
 
 def _request(question: str, sources: Sequence[_Source]) -> LlmRequest:

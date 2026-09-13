@@ -315,3 +315,60 @@ def test_引用标签不重复文档标题():
     assert Citation(1, "二郎神", "二郎神 › 打法").label == "二郎神 › 打法"
     assert Citation(1, "二郎神", "").label == "二郎神"
     assert Citation(1, "二郎神", "打法").label == "二郎神 › 打法"
+
+
+# --- 流式 ---
+
+
+def test_流式先给引用再逐字给正文():
+    """引用在检索那一步就定下来了，正文要等模型——所以引用能先交出去。"""
+    store = chunk_store(GAME, *BOSS_CHUNKS)
+
+    stream = answerer(store, FakeLlm(REPLY)).stream(QUESTION, game_id=GAME, version="1.0")
+    deltas = list(stream.deltas)
+
+    assert [citation.doc_title for citation in stream.citations] == ["二郎神"]
+    assert len(deltas) > 1  # 一片一片来，不是一次给全
+    assert all(len(delta) == 1 for delta in deltas)  # 逐字
+    assert "".join(deltas) == REPLY
+
+
+def test_流式与一次给全用的是同一批引用():
+    """两条路各拼一遍引用迟早会分岔——而引用对不上内容这件事，从答案本身看不出来。"""
+    store = chunk_store(GAME, *BOSS_CHUNKS)
+
+    whole = answerer(store, FakeLlm(REPLY)).answer(QUESTION, game_id=GAME, version="1.0")
+    piecewise = answerer(store, FakeLlm(REPLY)).stream(QUESTION, game_id=GAME, version="1.0")
+    list(piecewise.deltas)
+
+    assert piecewise.citations == whole.citations
+
+
+def test_流式时没检索到内容回同一段明确回复():
+    """两种情况的呈现一样，只是这一种没有引用——不调模型，脚本一条都不用排。"""
+    stream = answerer(InMemoryChunkStore(), FakeLlm()).stream(QUESTION, game_id=GAME)
+
+    assert stream.citations == ()
+    assert list(stream.deltas) == [NOT_FOUND]
+
+
+def test_流式空问题当场报错():
+    """改写与检索在调用时跑完，所以这一步的失败在开流之前就报出来。"""
+    with pytest.raises(ValueError):
+        answerer(chunk_store(GAME, *BOSS_CHUNKS), FakeLlm(REPLY)).stream("   ", game_id=GAME)
+
+
+def test_流式里越界的编号也留痕(caplog):
+    """编号检查要整段正文才做得成，而流式这一路没有累积——所以攒一份，收完再查。"""
+    llm = FakeLlm("先定身[1]，三阶段有隐藏机制[9]。")
+
+    with caplog.at_level(logging.WARNING):
+        stream = answerer(chunk_store(GAME, *BOSS_CHUNKS), llm).stream(
+            QUESTION, game_id=GAME, version="1.0"
+        )
+        list(stream.deltas)
+
+    warnings = [
+        record.getMessage() for record in caplog.records if record.levelno == logging.WARNING
+    ]
+    assert any("[9]" in message for message in warnings)

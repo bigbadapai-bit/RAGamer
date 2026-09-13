@@ -7,9 +7,11 @@ from pathlib import Path
 
 import pytest
 
+from ragamer.answering import Answerer
 from ragamer.config import get_settings
 from ragamer.container import Container
-from ragamer.llm import FakeLlm
+from ragamer.conversations import Chat
+from ragamer.llm import FakeLlm, LlmRequest, LlmTimeout
 from ragamer.stores.base import Chunk, ChunkFilter, ChunkHit, StoreUnavailableError
 from ragamer.stores.memory import InMemoryChunkStore, InMemoryDocStore, InMemoryObjectStore
 from ragamer.vectors.fake import FakeEmbedder, FakeReranker
@@ -89,6 +91,25 @@ def memory_container() -> Container:
     return make_container()
 
 
+def make_chat(container: Container) -> Chat:
+    """对话侧接上容器里那套依赖。
+
+    语言模型用两次：提问理解（`understand`）与生成（`Answerer.stream`）。两处走的是
+    同一个假件，所以脚本要按调用顺序把两边排在一起——少排一条会当场炸，
+    见 `FakeLlm`。读取条数时记住这个顺序：理解、生成、理解、生成……
+    """
+    return Chat(
+        docs=container.docs,
+        answerer=Answerer(
+            chunks=container.chunks,
+            embedder=container.embedder,
+            reranker=container.reranker,
+            llm=container.llm,
+        ),
+        llm=container.llm,
+    )
+
+
 def fake_vector(seed: int, dim: int = 4) -> tuple[float, ...]:
     """确定性的假向量。本层要验证的是接线，不是语义相似度。"""
     return tuple(round(((seed * 31 + index * 17) % 100) / 100, 4) for index in range(dim))
@@ -159,6 +180,22 @@ class RecordingChunkStore(InMemoryChunkStore):
     def fetch_document(self, game_id: str, doc_title: str, *, version: str | None) -> list[Chunk]:
         self.fetched.append(doc_title)
         return super().fetch_document(game_id, doc_title, version=version)
+
+
+class HalfwayLlm(FakeLlm):
+    """说半句就炸的假模型：生成中途断掉的样子。
+
+    排一条提问理解的脚本就够——生成那一步不走 `FakeLlm.stream`，所以不会被排空。
+    """
+
+    def stream(self, request: LlmRequest) -> Iterator[str]:
+        self.calls.append(request)
+
+        def pieces() -> Iterator[str]:
+            yield "掉的是"
+            raise LlmTimeout("模型在生成中途断了")
+
+        return pieces()
 
 
 class ScriptedReranker:

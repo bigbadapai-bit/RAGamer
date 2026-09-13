@@ -1,23 +1,40 @@
-"""HTTP 端点：写入侧对外的唯一入口。
+"""HTTP 端点：写入侧与读取侧对外的唯一入口。
 
-一个端点——`POST /api/kb/{game_id}/import`。批量提交、**逐文件独立**：某个文件失败时
-其余照常入库，失败的那个在结果里带文件名与失败阶段。读取侧（提问）与几个页面在后面的
-票里接。
+四个端点分两侧：
+
+- **写入侧** `POST /api/kb/{game_id}/import`。批量提交、**逐文件独立**：某个文件失败时
+  其余照常入库，失败的那个在结果里带文件名与失败阶段。
+- **读取侧** `POST /api/chat/sessions`、`GET /api/chat/sessions/{session_id}`、
+  `GET /api/chat/sessions/{session_id}/ask`。开会话、把历史读回来、逐字问一句（SSE）。
+  对话页那一层在后面的票里接。
+
+对话那几个只做 HTTP 这一层的事：会话不存在翻成 404、问题为空翻成 400、一轮问答翻成
+SSE 事件。**「这一轮算不算问完」「要不要写进历史」在 `ragamer.conversations` 里**，
+这一层不重复判断——判两遍迟早会分岔，而分岔的那一次表现为「刷新之后历史少了一轮」。
 
 知识库元数据从 MongoDB 读（`knowledge_bases` 集合，id 就是游戏 id）：打标要用的词表
-——启用了哪些主体类型、这个游戏的术语映射——就在它里面（docs/ARCHITECTURE.md §2.3）。
+——启用了哪些主体类型、这个游戏的术语映射——就在它里面（docs/ARCHITECTURE.md §2.3），
+检索回落哪个版本也从它取（§2.4）。知识库列表同时是**游戏候选**：给模型的是显示名，
+拿回来再换回 id，理由见 `_games`。
 本层**一个适配器都不构造**，全部来自组合根（`ragamer.container`），缝因此立得住。
 """
 
 from __future__ import annotations
 
+import json
+from collections.abc import Iterator, Mapping
 from dataclasses import asdict
 from typing import Annotated, Any
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 
+from ragamer.answering import Answerer, Citation
 from ragamer.container import Container
+from ragamer.conversations import Chat, Cited, Conversation, ConversationNotFound, Reply
 from ragamer.importing import STAGE_LABELS, Importer, ImportResult, ProgressEvent
+from ragamer.llm import LlmError
 from ragamer.logging import get_logger
 from ragamer.sources import SourceDocument
 from ragamer.stores.base import UNVERSIONED, collection_name
@@ -28,6 +45,16 @@ logger = get_logger(__name__)
 #: 知识库元数据所在的集合，文档 id 就是游戏 id。
 KB_COLLECTION = "knowledge_bases"
 
+#: SSE 的响应头。`no-cache` 是这条流的标准要求：中间任何一层缓存住它，逐字就变成一次给全。
+SSE_HEADERS = {"Cache-Control": "no-cache"}
+
+#: SSE 的起手那一行 `retry:`，把浏览器的重连间隔推得很远。
+#:
+#: 🔴 `EventSource` 在连接关闭之后会**自动重连同一个 URL**——正常问完关掉连接也一样。
+#: 重连就是再问一遍，于是历史里多出一轮一模一样的问答。客户端收到 `done` 就该 `close()`，
+#: 但那是页面那一侧的事；这一行是兜底：真忘了关，下一次重连要等一天，而不是默认的三秒。
+SSE_RETRY = "retry: 86400000\n\n"
+
 
 def create_app(container: Container) -> FastAPI:
     """把组合根里那套依赖接成 ASGI 应用。"""
@@ -37,6 +64,16 @@ def create_app(container: Container) -> FastAPI:
         embedder=container.embedder,
         llm=container.llm,
         on_progress=_log_progress,
+    )
+    chat = Chat(
+        docs=container.docs,
+        answerer=Answerer(
+            chunks=container.chunks,
+            embedder=container.embedder,
+            reranker=container.reranker,
+            llm=container.llm,
+        ),
+        llm=container.llm,
     )
 
     @app.post("/api/kb/{game_id}/import")
@@ -63,7 +100,105 @@ def create_app(container: Container) -> FastAPI:
             "results": [_result_payload(result) for result in results],
         }
 
+    @app.post("/api/chat/sessions", status_code=201)
+    def create_session(payload: SessionRequest) -> dict[str, Any]:
+        """开一次会话，绑一个知识库。
+
+        知识库不存在当场 404——与导入端点同一个口径：那是游戏选错了。
+        会话 id 由服务端生成并返回，之后的两次请求都带着它。
+        """
+        _kb_document(container, payload.game_id)
+        return _conversation_payload(chat.start(game_id=payload.game_id, version=payload.version))
+
+    @app.get("/api/chat/sessions/{session_id}")
+    def read_session(session_id: str) -> dict[str, Any]:
+        """一次会话的全部问答。**刷新页面靠它把历史拿回来**——历史在服务端，不在页面里。
+
+        空会话也是一次正常的返回（`turns` 为空列表），与「没有这个会话」分得很开：
+        后者是 404。
+        """
+        return _conversation_payload(_conversation(chat, session_id))
+
+    @app.get("/api/chat/sessions/{session_id}/ask")
+    def ask(session_id: str, question: str, version: str = "") -> StreamingResponse:
+        """问一句，逐字把答案拿回来（SSE）。
+
+        走 GET 是给浏览器原生的 `EventSource` 留的路——它只会发 GET（架构文档 §5 允许
+        对话页那一小块用它）。**客户端收到 `done` 之后必须 `close()`**，理由见 :data:`SSE_RETRY`。
+
+        会话不存在与问题为空都在**开流之前**判掉：这两个都能给出正常的 HTTP 状态码，
+        不该伪装成流里的一条错误事件。检索与生成的失败发生在开流之后，只能走 `error` 事件
+        ——那时响应头已经发出去了，状态码改不了。
+
+        这一层**不等正文**：返回的是个还没开始跑的生成器，读正文由 ASGI 那边拉。
+        端点本身是同步的，FastAPI 会把它放进线程池——检索与生成都是阻塞调用，
+        写在 `async def` 里会把事件循环钉住。
+        """
+        if not question.strip():
+            raise HTTPException(status_code=400, detail="问题不能为空")
+        # 先读一次会话：不存在当场 404，顺带拿到它绑的知识库（现行版本要从那里取）。
+        # `chat.ask` 自己还会再读一次，那是它的事——会话是上一次请求写下的，
+        # 这一层手里这一份只用来决定「去哪个库问」。
+        knowledge = _kb_document(container, _conversation(chat, session_id).game_id)
+        replies = chat.ask(
+            session_id,
+            question,
+            version=version,
+            current_version=str(knowledge.get("version", "")),
+            games=_games(container),
+        )
+        return StreamingResponse(
+            _events(replies), media_type="text/event-stream", headers=SSE_HEADERS
+        )
+
     return app
+
+
+class SessionRequest(BaseModel):
+    """新建会话的请求体。"""
+
+    #: 问哪个知识库（游戏 id）。
+    game_id: str
+    #: 这次会话选定的版本。留空即不选，检索时回落知识库的现行版本。
+    version: str = ""
+
+
+def _events(replies: Iterator[Reply]) -> Iterator[str]:
+    """一轮问答 → SSE 字节流。
+
+    四种事件：`citations`（最先，一次）、`delta`（若干）、`done`（正常收尾）、
+    `error`（生成失败）。
+
+    **失败也必须发成一个事件**：响应头在第一个事件之前就出去了，状态码此刻改不了，
+    「模型挂了」只能以 `error` 收尾。收不到 `done` 就是这一轮没有正常结束——会话里
+    相应地什么都没写（见 `ragamer.conversations`）。
+
+    消费方中途断开时这里走不到 `done`：`GeneratorExit` 不是 `Exception`，下面那个
+    `except` 接不住它，它会一路把上游那个生成器也关掉，这一轮于是不留痕迹。
+    """
+    yield SSE_RETRY
+    try:
+        for reply in replies:
+            if isinstance(reply, Cited):
+                payload = {"citations": [_citation_payload(item) for item in reply.citations]}
+                yield _event("citations", payload)
+            else:
+                yield _event("delta", {"text": reply.text})
+    except LlmError as exc:
+        logger.warning("生成中途失败，这一轮不写进会话：%s", exc)
+        yield _event("error", {"message": str(exc)})
+        return
+    yield _event("done", {})
+
+
+def _event(name: str, payload: Mapping[str, Any]) -> str:
+    """一个 SSE 事件。
+
+    `data` 里放 JSON 而不是裸文本：答案里换行是常事，按 SSE 的多行 `data:` 规则拼要自己
+    处理折行与转义，交给 `json.dumps` 就只有一行。`ensure_ascii=False` 是为了日志与
+    `curl` 看到的还是中文。
+    """
+    return f"event: {name}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
 def _log_progress(event: ProgressEvent) -> None:
@@ -93,12 +228,11 @@ def _check_game_id(game_id: str) -> None:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-def _vocabulary(container: Container, game_id: str) -> TagVocabulary:
-    """这个知识库的打标词表。
+def _kb_document(container: Container, game_id: str) -> dict[str, Any]:
+    """这个知识库的元数据。**它是「当前该用哪个版本」的唯一真相来源**（ADR-0004）。
 
-    配置里没写的项一律走默认值（全部主体类型、映射为空）——用户自定义库没配映射时
-    就是这条降级路径，标签会稀疏但不会漏（docs/ARCHITECTURE.md §2.3）。
-    知识库本身不存在是另一回事：那是游戏选错了，当场 404，不静默按默认词表建内容。
+    检索与聚合父块都从这里取现行版本，不各自维护一份。知识库不存在是游戏选错了，
+    当场 404，不静默按默认值把内容查一遍。
     """
     payload = container.docs.get(KB_COLLECTION, game_id)
     if payload is None:
@@ -106,14 +240,70 @@ def _vocabulary(container: Container, game_id: str) -> TagVocabulary:
             status_code=404,
             detail=f"知识库 {game_id} 不存在。先在知识库管理里建一个，再导入资料",
         )
+    return payload
+
+
+def _vocabulary(container: Container, game_id: str) -> TagVocabulary:
+    """这个知识库的打标词表。
+
+    配置里没写的项一律走默认值（全部主体类型、映射为空）——用户自定义库没配映射时
+    就是这条降级路径，标签会稀疏但不会漏（docs/ARCHITECTURE.md §2.3）。
+    """
     try:
-        return TagVocabulary.from_mapping(payload)
+        return TagVocabulary.from_mapping(_kb_document(container, game_id))
     except ValueError as exc:
         # 库里配了个不认识的主体类型：是知识库自己的数据坏了，不是这份资料的错，
         # 也不该长成一个 500——那样界面上只会看见「服务器错误」，查无可查
         raise HTTPException(
             status_code=422, detail=f"知识库 {game_id} 的配置读不了：{exc}"
         ) from exc
+
+
+def _games(container: Container) -> tuple[tuple[str, str], ...]:
+    """游戏候选：`(显示名, 知识库 id)`。
+
+    候选值必须是**用户问句里会出现的那种写法**。知识库 id 同时是 Milvus 的 collection 名，
+    只能是英文标识符（`collection_name`），用户不会这么问——拿 id 去当候选，模型只会把
+    「黑神话」判成不在候选里，这一步于是永远判不出东西来。所以给显示名，拿回来再换回 id
+    （`ragamer.conversations._game_id`）。显示名没配就回落 id，与知识库管理页一个口径。
+    """
+    candidates = []
+    for game_id in container.docs.list_ids(KB_COLLECTION):
+        knowledge = container.docs.get(KB_COLLECTION, game_id) or {}
+        candidates.append((str(knowledge.get("name", "")) or game_id, game_id))
+    return tuple(candidates)
+
+
+def _conversation(chat: Chat, session_id: str) -> Conversation:
+    try:
+        return chat.open(session_id)
+    except ConversationNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+def _conversation_payload(conversation: Conversation) -> dict[str, Any]:
+    """一次会话对外的样子。
+
+    引用连 `label` 一起给：标题与祖先标题路径怎么拼由 `Citation.label` 定，
+    界面照抄就行——两边各拼一遍，迟早会出现「同一个来源在两处叫法不一样」。
+    """
+    return {
+        "session_id": conversation.session_id,
+        "game_id": conversation.game_id,
+        "version": conversation.version,
+        "turns": [
+            {
+                "role": turn.role,
+                "content": turn.content,
+                "citations": [_citation_payload(citation) for citation in turn.citations],
+            }
+            for turn in conversation.turns
+        ],
+    }
+
+
+def _citation_payload(citation: Citation) -> dict[str, Any]:
+    return {**asdict(citation), "label": citation.label}
 
 
 def _result_payload(result: ImportResult) -> dict[str, Any]:

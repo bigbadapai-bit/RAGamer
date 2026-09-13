@@ -120,12 +120,36 @@ uv run pytest -m integration     # 跑真模型的集成测试（首次会下载
 
 检索侧目前只有主检索路。其余五路召回、RRF 融合、查询路由与聚合父块在后面几张票里接。
 
+## 对话与流式
+
+`ragamer.conversations` 把上面两段串成一次会话：历史进提问理解（指代因此补得全），
+改写后的问题去检索，答案逐字流出来，一轮问完整份落库。
+
+- **会话落在 MongoDB 的 `conversations` 集合**（文档 id 就是会话 id）：刷新页面、换台机器
+  打开，历史都还在；两次会话各有各的历史。会话里存的是**用户的原话**，改写只是给检索用的。
+- **指代靠历史补全，检索用的是改写后的问题**。历史只带最近三轮（`HISTORY_TURNS`）——
+  会话是不封顶的，整段历史进提示词会把模型的上下文顶穿。
+- **历史只进提问理解，不进生成**：生成拿到的是一句补全过的问题加一批原文父块，引用因此
+  永远指向语料；把上一轮的答案也塞进提示词，模型就有了一处引用不到的来源可以顺着编。
+- **整轮一起落库，收完正文才写**：生成中途断掉（客户端断开、模型炸了）时什么都不写，
+  历史里不会留下半句答案。半截答案配一份完整的引用列表，指向的是正文里根本没写到的来源。
+- **逐字是 SSE 推出来的**：`citations` 先到（引用在检索那一步就定下来了），再若干 `delta`，
+  `done` 收尾；生成中途失败发 `error` 而不是 `done`。端点走 GET 是给浏览器原生的
+  `EventSource` 留路——它只会发 GET，而且**在连接关闭后会自动重连**，所以页面收到 `done`
+  之后必须 `close()`，服务端那条 `retry:` 只是兜底。
+
+| 端点 | 做什么 |
+|---|---|
+| `POST /api/chat/sessions` | 开一次会话，绑一个知识库 |
+| `GET /api/chat/sessions/{id}` | 把历史读回来（刷新页面靠它） |
+| `GET /api/chat/sessions/{id}/ask?question=…` | 问一句，SSE 逐字回 |
+
 ## 目录
 
 ```
 src/ragamer/          应用代码（config 配置装载、logging 日志、llm 语言模型适配器、sources 归一化、
                       chunking 切分器、tagging 打标、importing 导入编排器、query 提问理解、
-                      retrieval 主检索路、answering 生成与引用、
+                      retrieval 主检索路、answering 生成与引用、conversations 会话与流式、
                       api HTTP 端点、container 组合根、__main__ 启动自检）
 src/ragamer/stores/   存储适配器：base 协议与共享类型、chunks Milvus、documents Mongo、objects MinIO、memory 内存假件
 src/ragamer/vectors/  向量化与精排：base 协议与共享类型、bge 真实模型、fake 确定性假件
