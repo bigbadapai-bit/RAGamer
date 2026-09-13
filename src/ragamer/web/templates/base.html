@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ title }} · RAGamer</title>
+  {#
+    两个前端依赖都走 CDN —— 这就够了，没有 npm、没有打包（ADR-0005）。
+    代价是页面第一次加载要连得上外网；连不上时页面照常能用（表单是原生 HTML，
+    功能不依赖 JavaScript），只是没有样式、也不会局部刷新。
+  #}
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/htmx.org@2.0.4/dist/htmx.min.js"></script>
+</head>
+<body class="min-h-screen bg-slate-50 text-slate-900">
+  <header class="border-b border-slate-200 bg-white">
+    <div class="mx-auto flex max-w-5xl flex-wrap items-center gap-x-6 gap-y-2 px-4 py-3">
+      <a href="/kb" class="text-lg font-semibold tracking-tight">RAGamer</a>
+      <nav class="flex flex-wrap gap-x-5 gap-y-1 text-sm">
+        {% for item in nav %}
+        <a href="{{ item.url }}"
+           class="{% if item.active %}font-semibold text-slate-900{% else %}text-slate-500 hover:text-slate-900{% endif %}">{{ item.label }}</a>
+        {% endfor %}
+      </nav>
+    </div>
+  </header>
+
+  <main class="mx-auto max-w-5xl px-4 py-8">
+    <h1 class="mb-6 text-2xl font-semibold tracking-tight">{{ title }}</h1>
+
+    {% if message %}
+    <p class="mb-6 rounded border border-emerald-300 bg-emerald-50 px-4 py-3 text-sm text-emerald-800">{{ message }}</p>
+    {% endif %}
+
+    {% if error %}
+    <p class="mb-6 rounded border border-red-300 bg-red-50 px-4 py-3 text-sm text-red-800">{{ error }}</p>
+    {% endif %}
+
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>

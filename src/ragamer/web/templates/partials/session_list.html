@@ -1,0 +1,24 @@
+{#
+  左栏那份会话列表。整页渲染时被 chat.html 包在滚动区里；滚到底时 htmx 单独取下一页的
+  这一段，接在前一页后面（哨兵自己 `outerHTML` 换掉）。两条路共用这一段模板，
+  所以第一页与后面几页长得一模一样。
+#}
+{% for item in sessions %}
+<li>
+  <a href="/chat/{{ game_id }}/{{ item.session_id }}"
+     class="block rounded px-2 py-1 {% if item.session_id == selected %}bg-slate-200 font-medium{% else %}hover:bg-slate-200{% endif %}">
+    {{ item.title or "（还没问过）" }}
+  </a>
+</li>
+{% endfor %}
+{% if next %}
+{#
+  哨兵：滚进视口就去取下一页。**外层那个列表必须有固定高度与 overflow**——不然页面一短，
+  哨兵一上来就在视口里，`revealed` 会连着触发，一口气把全部取完，等于没分页。
+  `selected` 一并带上：下一页里的高亮与第一页是同一套判断。
+#}
+<li hx-get="/chat/{{ game_id }}?after={{ next | urlencode }}&selected={{ selected | urlencode }}"
+    hx-trigger="revealed"
+    hx-swap="outerHTML"
+    class="py-2 text-center text-xs text-slate-400">正在取更早的…</li>
+{% endif %}

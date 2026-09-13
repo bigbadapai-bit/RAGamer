@@ -1,0 +1,78 @@
+[project]
+name = "ragamer"
+version = "0.1.0"
+description = "面向游戏攻略与资料的中文 RAG 助手"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    # 三个存储客户端。业务层只认 ragamer.stores 里的协议，不直接依赖这三个库
+    # 向量库；下限取 3.0 以对齐 Milvus v3 服务端（动态字段那个坑出在 v3.0.0）
+    "pymilvus>=3.0",
+    "pymongo>=4.9",
+    "minio>=7.2",
+    # 语言模型适配器的 HTTP 客户端；自己发 OpenAI 兼容请求，不引 SDK，
+    # 以便用 MockTransport 打真实代码路径（含 SSE 解析）而不碰网络
+    "httpx>=0.28",
+    # 配置装载的唯一入口；用到 dotenv_filtering，故下限取 2.15
+    "pydantic-settings>=2.15",
+    # 直接读 .env 做「未知键 / 取值被 ${…} 改写」这两项检查，pydantic-settings 不汇报
+    "python-dotenv>=1.0",
+    # HTTP 层。界面是服务端渲染 + 局部刷新（ADR-0005），所以只要路由不要前端框架
+    "fastapi>=0.115",
+    # 上面那个的 multipart 解析：导入端点收的是上传的文件
+    "python-multipart>=0.0.20",
+    # 页面模板。fastapi 自己不依赖它，要渲染模板得显式声明
+    "jinja2>=3.1",
+    # 起界面的那个 ASGI 服务器（`ragamer-web` 命令）。测试用 TestClient，不走它
+    "uvicorn>=0.30",
+    # minio 的传输层就是 urllib3；要自定义 PoolManager 才能设连接超时并关掉重试
+    "urllib3>=2.0",
+    # 答案缓存的客户端。业务层只认 ragamer.caching 里的协议，不直接依赖这个库；
+    # 下限取 5.2：热门问题那条 ZSET 查询用的是带排序参数的 zrange
+    "redis>=5.2",
+]
+
+[project.scripts]
+ragamer = "ragamer.__main__:main"
+# 起界面与后端的本地服务。与上一条分开：自检是「配置对不对」的快速检查，
+# 不该因为要开界面而多花一次启动时间；而开界面又必须先过自检。
+ragamer-web = "ragamer.app:main"
+
+[project.optional-dependencies]
+# 真实向量化模型（BGE-M3 与长上下文 reranker）。它拉进 torch 与 transformers，
+# 装一次好几个 G，而核心链路与全部默认测试都用确定性的哈希假件跑——所以放进可选组，
+# 只有要跑 `pytest -m integration` 时才 `uv sync --extra models`。
+# 适配器里是懒加载：没装这个组也能 import，只在真的要用模型时才报错并说明装法。
+models = ["FlagEmbedding>=1.4"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "ruff>=0.9",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ragamer"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# tools/ 下的实验脚本不进包，但它的口径（哪种图片条目算「有图无字」）要能测
+pythonpath = ["tools"]
+markers = [
+    "integration: 需要真实云端与真实模型，默认不跑",
+]
+addopts = '-m "not integration"'
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["ragamer"]
