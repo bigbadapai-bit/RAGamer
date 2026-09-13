@@ -83,6 +83,8 @@ CANDIDATE_LIMIT = MAX_CHUNKS * CANDIDATE_FACTOR
 
 #: RRF 融合里的那个 `k`（§3.3）。作用见 :func:`rrf`——**它不是随手取的默认值**，
 #: 调它等于改「头部名次值多少」，与调断崖阈值是同一类事，都要先有评测集。
+#:
+#: 这里是它的默认值：真正的取值是 :func:`rrf` 的入参，写死进公式就扫不动了（§11）。
 RRF_K = 60
 
 #: 联网兜底一次要几条。**不参与融合，所以它不按 `CANDIDATE_LIMIT` 给**：那个数是
@@ -392,30 +394,41 @@ def _table_filter(where: ChunkFilter | None) -> ChunkFilter:
     return replace(where or ChunkFilter(), chunk_type="table")
 
 
-def rrf(lists: Sequence[Sequence[ChunkHit]]) -> list[ChunkHit]:
+def rrf(lists: Sequence[Sequence[ChunkHit]], *, k: int = RRF_K) -> list[ChunkHit]:
     """RRF 融合多路召回，返回按融合分降序的那一批（§3.3）。
 
     **多路之间只能比名次**：主检索路的分数是稠密与稀疏加权之后的，元数据路的是单路
     稠密的，两者量纲不可比。放在一起比大小，等于让量纲决定谁进上下文。RRF 只看名次
     ——一路里排第几就贡献 `1 / (k + 名次)`——两路的分数各自怎么算都不影响结果。
 
-    `k = 60` 的作用是**削弱头部名次的绝对优势**（§3.3、坑 #11）：k 越小，第一名与
-    第二名的差距越大，融合结果越接近「哪一路的第一名更靠前」；k 大到一定程度，各路
-    名次之间的差异被抹平。这个值取自原项目标定过的数，不是随手取的默认值。
-
     同一个切片在多路里出现只留一条，取**第一次见到的那个**（坑 #10）。两路带回来的
     是同一份切片数据，留哪个都一样，但「哪一路先见到的」在调试时是个有用的信号。
+    两路的名次**都要算**：一票当两票正是融合在做的事。
+
+    只有一路时结果就是那一路的原样：融合分随名次单调递减，排出来仍是它自己的顺序。
 
     这里给出的分数是**融合分，只用来排序**：出去之前 `_reranked` 会用精排分整个换掉，
     交到生成那一步的仍然是精排分。
+
+    :param k: 融合常数，默认 :data:`RRF_K`。它的作用是**削弱头部名次的绝对优势**
+        （§3.3、坑 #11）：k 越小，第一名与第二名的差距越大，融合结果越接近「哪一路的
+        第一名更靠前」；k 大到一定程度，各路名次之间的差异被抹平。默认值取自原项目
+        标定过的数，不是随手取的；改它要先有评测集（§11）。
+    :raises ValueError: `k` 是负数。`k + 名次` 会落到零或负数上：名次等于 `-k` 时除以零，
+        比它靠前的几名会算出一个负的融合分——那是个静默的反向排序，比除零更难发现。
     """
+    if k < 0:
+        raise ValueError(
+            f"融合常数 k 不能是负数（给的是 {k}）：名次到 {-k} 就除以零，"
+            "比它靠前的会算出负分，把名次倒过来"
+        )
     scores: dict[int, float] = {}
     seen: dict[int, Chunk] = {}
     for hits in lists:
         for rank, hit in enumerate(hits, start=1):
             chunk_id = hit.chunk.chunk_id
             seen.setdefault(chunk_id, hit.chunk)
-            scores[chunk_id] = scores.get(chunk_id, 0.0) + 1.0 / (RRF_K + rank)
+            scores[chunk_id] = scores.get(chunk_id, 0.0) + 1.0 / (k + rank)
     fused = [ChunkHit(chunk=seen[chunk_id], score=score) for chunk_id, score in scores.items()]
     fused.sort(key=lambda hit: (-hit.score, hit.chunk.chunk_id))
     return fused
