@@ -17,7 +17,8 @@ htmx 只用在**有一块明显可以就地换掉的结果区**的地方——�
 改配置与删库这类动作一律走「提交 → 重定向 → 重新渲染」，不直接回 200：刷新一下就把上一次
 的删除或改动再提交一遍，是这类页面上最容易踩的一个坑。
 
-对话与评测两个页面在这里只到占位为止，完整形态是后面几张票的事。
+对话页（T24）也在这里：两级导航、会话正文、澄清按钮、版本切换与热门问题。评测那个
+页面只到占位为止，完整形态是后面几张票的事。
 """
 
 from __future__ import annotations
@@ -33,9 +34,9 @@ from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 
-from ragamer.clarifying import Clarification, version_choices
+from ragamer.clarifying import Clarification, NotACandidate, UnknownPending, version_choices
 from ragamer.container import Container
-from ragamer.conversations import ChatStack, ConversationNotFound, Turn
+from ragamer.conversations import LIST_LIMIT, ChatStack, ConversationNotFound, Turn
 from ragamer.importing import STAGE_LABELS, Importer, ImportResult
 from ragamer.knowledge import (
     KnowledgeBase,
@@ -53,6 +54,7 @@ from ragamer.knowledge import (
     update_knowledge_base,
     vocabulary_of,
 )
+from ragamer.llm import LlmError
 from ragamer.sources import SourceDocument
 from ragamer.stores.base import (
     IMAGE_PREFIX,
@@ -403,14 +405,25 @@ def create_router(container: Container, stack: ChatStack) -> APIRouter:
         )
 
     @router.post("/chat/{game_id}")
-    def start_session(request: Request, game_id: str, version: str = Form("")) -> Response:
-        """开一次会话，然后转过去。「提交 → 重定向」：刷新一下不会又开一个。"""
+    def start_session(
+        request: Request,
+        game_id: str,
+        version: str = Form(""),
+        question: str = Form(""),
+    ) -> Response:
+        """开一次会话，然后转过去。「提交 → 重定向」：刷新一下不会又开一个。
+
+        带 `question` 进来时顺手把那一轮也问了——热门问题在**还没开会话**的那一页上就是
+        这么用的：按钮上挂着问题，点一下从这里开一个会话再问。
+        """
         try:
             knowledge = readable_knowledge_base(container.docs, game_id)
         except KnowledgeBaseError as exc:
             return _chat_page(request, container, stack, game_id=game_id, error=str(exc))
         conversation = stack.chat.start(game_id=game_id, version=version or knowledge.version)
-        return RedirectResponse(f"/chat/{game_id}/{conversation.session_id}", status_code=303)
+        if not question.strip():
+            return RedirectResponse(f"/chat/{game_id}/{conversation.session_id}", status_code=303)
+        return _whole_turn(request, container, stack, game_id, conversation.session_id, question)
 
     @router.post("/chat/{game_id}/{session_id}/ask")
     def ask_whole(
@@ -448,12 +461,35 @@ def create_router(container: Container, stack: ChatStack) -> APIRouter:
     def change_version(
         request: Request, game_id: str, session_id: str, version: str = Form("")
     ) -> Response:
-        """换这次会话选定的版本。**下一轮起按它走**，直到再换一次。"""
+        """换这次会话选定的版本。**下一轮起按它走**，直到再换一次。
+
+        空串是「跟随知识库的现行版本」，其余必须是这个库里**真实有过**的版本：
+        换成一个库里没有的版本，检索会静默查空，而界面上看不出区别——
+        与澄清反问的候选是同一条理由。下拉里只摆真有的，这里再拦一道是为了
+        绕过页面的请求（改过的表单、直接打接口）也拦得住。
+        """
+        if version and version not in {
+            choice.value for choice in version_choices(container.chunks, game_id)
+        }:
+            return _chat_page(
+                request,
+                container,
+                stack,
+                game_id=game_id,
+                session_id=session_id,
+                error=f"知识库 {game_id} 里没有版本 {version}。下拉里列的是这个库里真有的版本",
+            )
         try:
             stack.chat.set_version(session_id, version)
         except ConversationNotFound as exc:
             return _chat_page(
-                request, container, stack, game_id=game_id, error=str(exc), status_code=404
+                request,
+                container,
+                stack,
+                game_id=game_id,
+                session_id=session_id,
+                error=str(exc),
+                status_code=404,
             )
         return RedirectResponse(f"/chat/{game_id}/{session_id}", status_code=303)
 
@@ -511,13 +547,8 @@ def _chat_page(
     """
     context: dict[str, Any] = {
         "bases": [
-            {
-                "game_id": base.game_id,
-                "name": base.name,
-                "version": base.version,
-                "current": base.game_id == game_id,
-            }
-            for base in list_knowledge_bases(container.docs)
+            {**row, "current": row["game_id"] == game_id}
+            for row in _knowledge_base_rows(list_knowledge_bases(container.docs))
         ],
         "game_id": game_id,
         "session_id": session_id,
@@ -525,6 +556,9 @@ def _chat_page(
         "turns": [],
         "versions": [],
         "hot": (),
+        # 列表是截断过的（`LIST_LIMIT`）：满了就在侧栏如实说一句，
+        # 免得人以为「就这些了」。真要看更早的得先有分页游标，那是另一张票。
+        "list_limit": LIST_LIMIT,
         "question": question,
         "clarification": _clarification_view(clarification, question) if clarification else None,
     }
@@ -591,41 +625,45 @@ def _whole_turn(
     流式那条路把答案一片一片推给页面；这一条等它全跑完，再把结果渲染回来。两条路走的是
     同一个 `Chat.ask`，所以落库、澄清、版本回落全都一致——差别只在答案怎么出来。
 
-    澄清那一轮不重定向：页面要把候选按钮渲染出来，而那段状态（暂停点、候选）不在会话里，
-    只在这一刻手上。所以直接把它渲染进这一页。
+    澄清那一轮不重定向：页面要把候选按钮渲染出来，而那段状态（暂停点、候选）就在这一刻
+    手上，不在会话里。所以直接把它渲染进这一页。
+
+    说不通的几种各回一页：库读不了、会话没了、点的是个过期的候选、模型挂了。
+    **这条路上没有「流已经开了」这个约束**，所以状态码该怎么给就怎么给
+    （接口那条发 `error` 事件，是因为响应头早发出去了）。
     """
     if not question.strip():
-        return _chat_page(
-            request,
-            container,
-            stack,
-            game_id=game_id,
-            session_id=session_id,
-            question=question,
-            error="问题不能为空",
+        return _wrong(
+            request, container, stack, game_id, session_id, "问题不能为空", question=question
         )
     try:
         # 先读一次会话拿它绑的库：现行版本要从那里取（ADR-0004）。
         # `chat.ask` 自己还会再读一次，那是它的事——会话不可变，`ask` 落的是新的一份。
         bound = stack.chat.open(session_id).game_id
+        # **要用读得出来的那个库**：配置坏掉的库不能被拿来干活（`ragamer.knowledge`），
+        # 照它作答会按「七类全开、映射为空」落标签，看起来一切正常，错的全在标签里。
+        knowledge = readable_knowledge_base(container.docs, bound)
     except ConversationNotFound as exc:
-        return _chat_page(
-            request,
-            container,
-            stack,
-            game_id=game_id,
-            error=str(exc),
-            status_code=404,
+        return _wrong(request, container, stack, game_id, session_id, str(exc), status=404)
+    except KnowledgeBaseError as exc:
+        return _wrong(
+            request, container, stack, game_id, session_id, str(exc), status=_status_of(exc)
         )
-    replies = list(
-        stack.chat.ask(
-            session_id,
-            question,
-            current_version=_current_version(container, bound),
-            pending_id=pending_id,
-            label=label,
+    try:
+        replies = list(
+            stack.chat.ask(
+                session_id,
+                question,
+                current_version=knowledge.version,
+                pending_id=pending_id,
+                label=label,
+            )
         )
-    )
+    except (NotACandidate, UnknownPending) as exc:
+        # 用户点的是个过期的候选：页面停在原处，把原因写出来让他重来一次
+        return _wrong(request, container, stack, game_id, session_id, str(exc), status=422)
+    except LlmError as exc:
+        return _wrong(request, container, stack, game_id, session_id, str(exc), status=502)
     outcome = replies[-1] if replies else None
     if isinstance(outcome, Clarification):
         return _chat_page(
@@ -640,16 +678,39 @@ def _whole_turn(
     return RedirectResponse(f"/chat/{game_id}/{session_id}", status_code=303)
 
 
+def _wrong(
+    request: Request,
+    container: Container,
+    stack: ChatStack,
+    game_id: str,
+    session_id: str,
+    error: str,
+    *,
+    question: str = "",
+    status: int = 400,
+) -> Response:
+    """这一轮没走成，把原因渲染回这一页。**重定向会把它丢掉**——闪一下就没了。"""
+    return _chat_page(
+        request,
+        container,
+        stack,
+        game_id=game_id,
+        session_id=session_id,
+        question=question,
+        error=error,
+        status_code=status,
+    )
+
+
 def _clarification_view(clarification: Clarification, question: str) -> dict[str, Any]:
-    """一次反问渲染成按钮要的那几样。`value` 是回传的取值（游戏是 id），
-    `label` 是按钮上显示的（游戏是显示名）——两者不一样的理由见 `Choice`。"""
+    """一次反问渲染成按钮要的那几样。按钮上显示 `label`、回传的也是它
+    （`ragamer.clarifying` 照它认候选）；`question` 一并带上，用户点完那次请求
+    还要靠它记下这一轮的用户原话。"""
     return {
         "pending_id": clarification.pending_id,
         "prompt": clarification.prompt,
         "question": question,
-        "choices": [
-            {"label": choice.label, "value": choice.value} for choice in clarification.choices
-        ],
+        "choices": [{"label": choice.label} for choice in clarification.choices],
     }
 
 
@@ -672,6 +733,17 @@ def _version_options(container: Container, game_id: str, *, selected: str) -> li
         {"value": choice.value, "label": choice.label, "current": selected == choice.value}
         for choice in version_choices(container.chunks, game_id)
     ]
+    if selected and all(option["value"] != selected for option in options):
+        # 会话上那个版本在这个库里已经没有了（语料重导过，或者会话是走 JSON 端点建的，那边
+        # 不校验）。不摆出来的话，下拉会静默落到「跟随现行版本」——而这一轮实际按另一个
+        # 版本检索，页面上看不出区别。
+        options.append(
+            {
+                "value": selected,
+                "label": f"{selected}（这个库里已经没有它了）",
+                "current": True,
+            }
+        )
     return options
 
 

@@ -31,10 +31,9 @@
       {% for citation in turn.citations %}
       <li class="text-slate-600">
         <span class="text-slate-400">[{{ citation.index }}]</span>
-        <span class="font-medium">{{ citation.doc_title }}</span>
-        {% if citation.ancestor_path %}
-        <span class="text-slate-400">·</span> {{ citation.ancestor_path }}
-        {% endif %}
+        {# 标题与祖先标题路径的拼法由 `Citation.label` 一处定：页面自己再拼一遍，
+           祖先路径以文档标题开头时就会念两遍（「二郎神 · 二郎神 › 掉落」）。 #}
+        <span class="font-medium">{{ citation.label }}</span>
       </li>
       {% endfor %}
     </ol>
@@ -64,4 +63,7 @@
 <div id="live" class="hidden max-w-[95%] rounded-lg border border-slate-200 bg-white px-4 py-3">
   <div id="live-status" class="mb-1 text-xs text-slate-500"></div>
   <p id="live-text" class="text-sm leading-relaxed whitespace-pre-wrap"></p>
+  {# 来源、图片、版本由 `citations` 事件填进来——它比正文早得多（检索那一步就定了） #}
+  <div id="live-sources" class="mt-3 hidden text-xs text-slate-500"></div>
+  <div id="live-images" class="mt-3 hidden flex-wrap gap-2"></div>
 </div>

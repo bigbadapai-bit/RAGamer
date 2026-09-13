@@ -197,8 +197,10 @@ def version_choices(chunks: ChunkStore, game_id: str) -> tuple[Choice, ...]:
 
 @dataclass(frozen=True)
 class Clarifier:
-    """读取侧的入口：提问进，答案或一次反问出。外部依赖由组合根注入。
+    """判定这一层：提问进，**判完的落脚点或一次反问**出。外部依赖由组合根注入。
 
+    **它不生成**——生成那一段归 `ragamer.answering`，逐字流式与落库归
+    `ragamer.conversations.Chat`。这里只回答一个问题：这一问该问谁、该按哪个版本。
     与 `ragamer.answering.Answerer` 是同一个打法：不可变对象，一次接线反复使用。
     """
 
@@ -288,7 +290,7 @@ class Clarifier:
         两档在这里分开（见模块说明）：确定度够就用模型判的那个；落在中间那档才考虑问。
         调用方给的游戏是**默认值**：模型判出的那个与它一致时不必再问——问了也只有同一个
         答案，白白打断一次；**对不上才是真的拿不准**，那种才值得把候选摆出来。
-        `choices` 已经由 `start` 保证非空——空的那一档进不了这里。
+        `choices` 已经由 `decide` 保证非空——空的那一档进不了这里。
         """
         if understanding.game and understanding.game_confidence >= CONFIDENT:
             return _choice_of(choices, understanding.game, GAME).value

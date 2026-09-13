@@ -262,12 +262,36 @@ def test_恢复之后那一轮才落进会话():
 
 
 def test_能在页面上切换当前查询的版本():
-    client = client_with(FakeLlm(said("二郎神怎么打", version="2.0"), REPLY), DOC)
+    container = make_container(
+        llm=FakeLlm(said("二郎神怎么打", version="2.0"), REPLY),
+        chunks=chunk_store(
+            GAME,
+            make_chunk(1, content="旧版正文", version="1.0"),
+            make_chunk(2, content="新版正文", version="2.0"),
+        ),
+    )
+    container.docs.put(KB_COLLECTION, GAME, KB)
+    client = TestClient(create_app(container))
     session_id = start(client)
 
     client.post(f"/chat/{GAME}/{session_id}/version", data={"version": "2.0"})
 
     assert client.get(f"/api/chat/sessions/{session_id}").json()["version"] == "2.0"
+
+
+def test_切到一个库里没有的版本会被拦下来():
+    """换成一个库里没有的版本，检索会静默查空，而界面上看不出区别——所以在这里就拦。
+
+    下拉里只摆真有的那些，这一道拦的是绕过页面的请求（改过的表单、直接打接口）。
+    """
+    client = client_with(FakeLlm(), DOC)  # 这个库里只有 1.0
+    session_id = start(client)
+    before = client.get(f"/api/chat/sessions/{session_id}").json()["version"]
+
+    page = client.post(f"/chat/{GAME}/{session_id}/version", data={"version": "9.9"}).text
+
+    assert "没有版本 9.9" in page
+    assert client.get(f"/api/chat/sessions/{session_id}").json()["version"] == before
 
 
 def test_版本候选只来自语料里真实有过的版本():
@@ -306,6 +330,22 @@ def test_页面上显示热门问题():
     assert "热门问题" in page
     assert "二郎神怎么打" in page
     assert "二郎神掉什么" in page
+
+
+def test_还没开会话时也显示热门问题并且点得动():
+    """选中一个库就该看到大家都在问什么，不必先开一个会话；点一下开一个再问。"""
+    container = make_container(
+        llm=FakeLlm(said("二郎神怎么打"), REPLY), chunks=chunk_store(GAME, DOC)
+    )
+    container.docs.put(KB_COLLECTION, GAME, KB)
+    container.cache.record_question(GAME, "二郎神怎么打")
+    client = TestClient(create_app(container))
+
+    listed = client.get(f"/chat/{GAME}").text
+    answered = client.post(f"/chat/{GAME}", data={"question": "二郎神怎么打"})
+
+    assert "热门问题" in listed and "二郎神怎么打" in listed
+    assert REPLY in answered.text  # 开了一个会话，并把那一轮问了出来
 
 
 # --- 边界 ---
