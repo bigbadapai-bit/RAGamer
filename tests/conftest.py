@@ -116,6 +116,32 @@ class FailingStore:
         raise StoreUnavailableError(self.name, self.address, 2.5, self.reason)
 
 
+class BrokenChunkStore(InMemoryChunkStore):
+    """连不上的向量库：数不出来也删不掉。
+
+    删库那几条要用两种形态：一直坏（清不掉时配置得留着），以及坏一次之后好起来
+    （重来一次能补上）——`recover()` 管后者。`upsert` 照常可用，先得让库里有东西。
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.broken = True
+
+    def recover(self) -> None:
+        self.broken = False
+
+    def count(self, game_id: str) -> int:
+        self._refuse()
+        return super().count(game_id)
+
+    def drop(self, game_id: str) -> None:
+        self._refuse()
+
+    def _refuse(self) -> None:
+        if self.broken:
+            raise StoreUnavailableError("Milvus", "milvus.test:19530", 2.5, "连接被拒绝")
+
+
 def make_chunk(chunk_id: int, **overrides: object) -> Chunk:
     """造一个切片：缺省值都合法且已向量化，测试只覆盖自己关心的那几个字段。"""
     defaults: dict[str, object] = {

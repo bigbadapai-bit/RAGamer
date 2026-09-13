@@ -1,10 +1,15 @@
-"""知识库元数据：建库、读回来，以及两种「用不了」的区分。
+"""知识库元数据：建库、改库、读回来、删干净，以及两种「用不了」的区分。
 
 写入侧（界面）与读取侧（导入端点）共用这一份形状，所以这里两头都验：
 存进去的键名读得回来、坏了的数据报得出来。
+
+删库那几条同时钉住「配置最后才删」这一条：配置是这个库还在的凭据，
+先删它，剩下的切片与原图就成了看不见的孤儿。
 """
 
 from __future__ import annotations
+
+from dataclasses import replace
 
 import pytest
 
@@ -12,13 +17,20 @@ from ragamer.knowledge import (
     KB_COLLECTION,
     BrokenKnowledgeBase,
     KnowledgeBase,
+    PurgeError,
     UnknownKnowledgeBase,
     create_knowledge_base,
     list_knowledge_bases,
+    purge_inventory,
+    purge_knowledge_base,
+    update_knowledge_base,
     vocabulary_of,
 )
-from ragamer.stores.memory import InMemoryDocStore
-from ragamer.tagging import SubjectType
+from ragamer.stores.base import UNVERSIONED, image_key, image_prefix
+from ragamer.stores.memory import InMemoryDocStore, InMemoryObjectStore
+from ragamer.tagging import SubjectType, TagVocabulary
+
+from .conftest import BrokenChunkStore, make_chunk, make_container
 
 GAME = "black_myth"
 
@@ -26,6 +38,11 @@ GAME = "black_myth"
 @pytest.fixture
 def docs() -> InMemoryDocStore:
     return InMemoryDocStore()
+
+
+@pytest.fixture
+def container():
+    return make_container()
 
 
 # --- 建库 ---
@@ -122,3 +139,129 @@ def test_列表按游戏_id_排列(docs):
         "ghost",
         "zelda",
     ]
+
+
+# --- 当前生效版本 ---
+
+
+def test_当前生效版本存得进去也读得回来(docs):
+    create_knowledge_base(docs, replace(KnowledgeBase.new(GAME), version="2.0"))
+
+    stored = docs.get(KB_COLLECTION, GAME)
+    assert KnowledgeBase.from_payload(GAME, stored).version == "2.0"
+
+
+def test_没配版本的库读回来是未标注版本(docs):
+    """老库里没有这个键。默认不是「随便挑一个版本」，而是未标注版本那条路。"""
+    docs.put(KB_COLLECTION, GAME, {"name": "某款游戏"})
+
+    assert list_knowledge_bases(docs)[0].version == UNVERSIONED
+
+
+# --- 改库 ---
+
+
+def test_改库之后读回来是新的(docs):
+    """名称、启用的类目、术语映射、当前生效版本一起换掉，**保存后立即生效**。"""
+    create_knowledge_base(docs, KnowledgeBase.new(GAME, "旧名", (SubjectType.CHARACTER,)))
+
+    update_knowledge_base(
+        docs,
+        KnowledgeBase(
+            game_id=GAME,
+            name="新名",
+            vocabulary=TagVocabulary((SubjectType.ITEM,), {"根器": SubjectType.ITEM}),
+            version="2.0",
+        ),
+    )
+
+    read_back = list_knowledge_bases(docs)[0]
+    assert read_back.name == "新名"
+    assert read_back.vocabulary.subject_types == (SubjectType.ITEM,)
+    assert read_back.vocabulary.term_mapping == {"根器": SubjectType.ITEM}
+    assert read_back.version == "2.0"
+
+
+def test_改一个不存在的库时报错而不是凭空建一个(docs):
+    """界面上点的是「保存」：id 敲错时冒出一个新库，不是它要的结果。"""
+    with pytest.raises(UnknownKnowledgeBase, match="不存在"):
+        update_knowledge_base(docs, KnowledgeBase.new(GAME))
+
+    assert docs.get(KB_COLLECTION, GAME) is None
+
+
+# --- 删库 ---
+
+
+def _stocked(container) -> None:
+    """一个建好、导过资料、存过原图的库。"""
+    create_knowledge_base(container.docs, KnowledgeBase.new(GAME, "黑神话·悟空"))
+    container.chunks.upsert(GAME, [make_chunk(1), make_chunk(2)])
+    container.objects.put(image_key(GAME, "a1b2", "立绘.png"), b"PNG")
+
+
+def test_数一遍这个库在各处占着多少东西(container):
+    """确认页照着它列「将要清理什么」，所以它自己必须先能数准，而且只读。"""
+    _stocked(container)
+
+    inventory = purge_inventory(container.chunks, container.objects, GAME)
+
+    assert (inventory.chunk_count, inventory.image_count) == (2, 1)
+    # 数一遍不动任何数据
+    assert container.chunks.count(GAME) == 2
+    assert container.docs.get(KB_COLLECTION, GAME) is not None
+
+
+def test_删库把切片_原图与配置一并清掉(container):
+    _stocked(container)
+
+    inventory = purge_knowledge_base(container.chunks, container.docs, container.objects, GAME)
+
+    assert (inventory.chunk_count, inventory.image_count) == (2, 1)
+    assert container.chunks.count(GAME) == 0
+    assert container.objects.list_keys(image_prefix(GAME)) == []
+    assert container.docs.get(KB_COLLECTION, GAME) is None
+
+
+def test_一处清不掉时不跳过其余_并且配置留着(container):
+    """配置一删，库里剩下的数据就再也看不见了。留着它，界面上还能再点一次。"""
+    _stocked(container)
+
+    with pytest.raises(PurgeError, match="向量库") as caught:
+        purge_knowledge_base(BrokenChunkStore(), container.docs, container.objects, GAME)
+
+    # 一次看清还差什么：向量库没清掉，原图照清
+    assert container.objects.list_keys(image_prefix(GAME)) == []
+    # 库还在列表上，可以重来
+    assert container.docs.get(KB_COLLECTION, GAME) is not None
+    assert GAME in str(caught.value)
+
+
+def test_重来一次能把没清掉的补上(container):
+    """上一处失败留下的状态是可重入的：已经清掉的那几处再清一次不出错。"""
+    _stocked(container)
+    with pytest.raises(PurgeError):
+        purge_knowledge_base(BrokenChunkStore(), container.docs, container.objects, GAME)
+
+    inventory = purge_knowledge_base(container.chunks, container.docs, container.objects, GAME)
+
+    # 原图上一轮已经清掉了，这一轮报 0；切片这一轮才清掉
+    assert (inventory.chunk_count, inventory.image_count) == (2, 0)
+    assert container.docs.get(KB_COLLECTION, GAME) is None
+
+
+class ExplodingObjectStore(InMemoryObjectStore):
+    """删前缀时炸的不是存储错误。三个适配器只把「连不上」包成 `StoreError`，
+    连上之后操作失败漏出来的是供应商自己的异常类型——那种失败同样得保住配置。"""
+
+    def delete_prefix(self, prefix: str) -> int:
+        raise RuntimeError("MinIO 返回的删除结果缺了一段")
+
+
+def test_不是存储错误的那种失败也保住配置(container):
+    _stocked(container)
+
+    with pytest.raises(PurgeError, match="对象存储"):
+        purge_knowledge_base(container.chunks, container.docs, ExplodingObjectStore(), GAME)
+
+    assert container.docs.get(KB_COLLECTION, GAME) is not None
