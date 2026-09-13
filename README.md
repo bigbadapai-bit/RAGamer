@@ -71,25 +71,54 @@ uv run pytest -m integration     # 跑真模型的集成测试（首次会下载
 
 ## 导入
 
-写入侧的入口是 `POST /api/kb/{game_id}/import`——上传若干份资料、每个文件独立处理。
-四个来源先归一为 Markdown（`ragamer.sources`），之后串起补图、切分、打标、向量化与入库
-（`ragamer.importing`）。现在只接上了 md／txt 一条来源，MinerU 与网页爬虫在后面两张票里接。
+写入侧两个端点，对应界面上的两处输入：
 
-- **一批里某个文件失败不牵连其余**：响应的 `results` 逐文件给结果，失败的那个带
-  `filename`、`stage`（卡在哪一步）与 `error`。整批都失败也是 200，不是 500。
+| 端点 | 收什么 |
+| --- | --- |
+| `POST /api/kb/{game_id}/import` | 上传若干份资料（multipart） |
+| `POST /api/kb/{game_id}/import/urls` | 若干网页地址（JSON：`{"urls": [...], "version": ""}`） |
+
+四个来源先归一为 Markdown（`ragamer.sources`），之后串起补图、切分、打标、向量化与入库
+（`ragamer.importing`）。两条端点**在归一化那一步就合流**：此后切分与打标不感知来源。
+现在接上了 md／txt 与网页两条，MinerU 在后面一张票里接。
+
+- **一批里某一条失败不牵连其余**：响应的 `results` 逐条给结果，失败的那条带
+  `filename`（文件那一路是文件名，网址那一路是地址）、`stage`（卡在哪一步）与 `error`。
+  整批都失败也是 200，不是 500。
 - **重复导入不产生重复切片**：切片主键由导入侧按「游戏 + 文档标题 + 版本 + 切片序号」算出来，
   重导覆盖同一批 id；入库时再按文档整体替换，新切出来的片数变少也不会留下旧的那一截。
 - **同一份资料的另一个版本并存**：新版本作为新文档导入，删除只作用于它自己那个版本（ADR-0004）。
 - **入库的字段与建表时的显式声明一一对应**，不开动态字段。
+- **抓回来的切片带来源地址**（`source_url`）：本地文件是空串。答案是带引用给的，引用的落点就是它。
 - 打标用的词表来自知识库元数据（MongoDB 的 `knowledge_bases` 集合，id 即游戏 id）。
   库不存在时 404，不静默按默认词表建内容。
+
+## 网页抓取
+
+`ragamer.crawl` 一个网址进、一份归一化文档出，两条路（`docs/ARCHITECTURE.md` §1.1）：
+
+- **MediaWiki 类站点**走它的开放接口（`api.php`）拿 **wikitext 原文**，由 `ragamer.wikitext`
+  转成 Markdown。选原文而不是渲染后的 HTML，是因为下游读的正是 wiki 标记：切分器靠
+  `[[内链]]`／`Category:`／`{{模板}}` 认词条页，打标器靠 `[[Category:角色]]` 与 Infobox 字段
+  读主体类型。走哪条路由页面自己说了算——认 head 里的 RSD（`rel="EditURI"`）与
+  `generator` 声明。
+- **普通网页**走正文抽取（trafilatura）：导航、页脚、侧边栏丢掉，正文转成 Markdown。
+
+**合规的三件事落在同一个地方**（`HttpCrawler._fetch`，任何一次出网都得经过它）：先读该主机的
+`robots.txt`、同一主机两次请求之间留足间隔、请求头里标明身份。**没有关掉 robots 的开关。**
+参数在 `.env.example` 的「网页抓取」一节，失败分三类各有各的异常：站点不可达、页面不存在、
+被拒绝访问（robots 挡下的算后者的子类）。
+
+⚠️ **不拦内网地址**：这个端点收的是用户给的网址，多用户部署时它是一个 SSRF 面
+（`http://169.254.169.254/…` 这类）。本项目现在是自己给自己导资料的单机工具，
+上多用户之前必须补上——拦内网要连 DNS 解析一起做，否则域名解析到内网就绕过去了。
 
 ## 目录
 
 ```
 src/ragamer/          应用代码（config 配置装载、logging 日志、llm 语言模型适配器、sources 归一化、
-                      chunking 切分器、tagging 打标、importing 导入编排器、api HTTP 端点、
-                      container 组合根、__main__ 启动自检）
+                      crawl 网页抓取、wikitext 维基语法转 Markdown、chunking 切分器、tagging 打标、
+                      importing 导入编排器、api HTTP 端点、container 组合根、__main__ 启动自检）
 src/ragamer/stores/   存储适配器：base 协议与共享类型、chunks Milvus、documents Mongo、objects MinIO、memory 内存假件
 src/ragamer/vectors/  向量化与精排：base 协议与共享类型、bge 真实模型、fake 确定性假件
 tests/                测试：行为测试 + 结构约束 + 集成测试
