@@ -44,6 +44,10 @@ class Chunk:
     doc_title: str
     chunk_type: ChunkType = "text"
     content_meta: str = ""
+    #: 这份切片的来源地址，网页导入才有；本地文件是空串。
+    #: 跟着每个切片存一份而不是单独存文档：聚合父块是查出来的（§2.5），没有另一张
+    #: 文档表可以挂它，而答案的引用要显示的就是它。
+    source_url: str = ""
     subject_type: tuple[str, ...] = ()
     content_nature: tuple[str, ...] = ()
     game_terms: tuple[str, ...] = ()

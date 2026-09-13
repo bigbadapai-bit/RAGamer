@@ -1,18 +1,26 @@
 """HTTP 端点：写入侧与读取侧对外的唯一入口。
 
-五个端点分两组：
+六个端点分两组：
 
-- **写入侧** `POST /api/kb/{game_id}/import`。批量提交、**逐文件独立**：某个文件失败时
-  其余照常入库，失败的那个在结果里带文件名与失败阶段。
-- **多轮对话** `POST /api/chat/sessions`、`GET /api/chat/sessions`（按库列会话）、
-  `GET /api/chat/sessions/{session_id}`、`GET /api/chat/sessions/{session_id}/ask`。
-  开会话、列会话、把历史读回来、逐字问一句（SSE）。**澄清反问也在这条流上**：
-  判不准时流里出一个 `clarification` 事件，用户点完带 `pending_id` 再问一次。
+**写入侧**两个，对应界面上的两处输入：`POST /api/kb/{game_id}/import` 传文件
+（或界面上传的字节），`POST /api/kb/{game_id}/import/urls` 给网址、抓回来再入库。
+两条都是批量提交、**逐条独立**：某一条失败时其余照常入库，失败的那条在结果里带
+来源与失败阶段；两条走的是同一个导入器、同一条链路，响应形状也逐字相同。
+
+**读取侧**是多轮对话：`POST /api/chat/sessions`、`GET /api/chat/sessions`
+（按库列会话）、`GET /api/chat/sessions/{session_id}`、
+`GET /api/chat/sessions/{session_id}/ask`。开会话、列会话、把历史读回来、
+逐字问一句（SSE）。**澄清反问也在这条流上**：判不准时流里出一个
+`clarification` 事件，用户点完带 `pending_id` 再问一次。
 
 **只有会话这一条提问路径**。曾经另有一个不绑会话的 `POST /api/chat`，接上会话之后
 它被 `/api/chat/sessions` 影子掉了（`/api/chat/{pending_id}` 那条路由先注册，把
 `/api/chat/sessions` 当成了自己的 `pending_id`）——两条入口本来也是同一件事，
 收敛掉的那条不再保留。
+
+**写入侧那两条 JSON 是同步的**：调用方拿到的是最终结果，中途看不见进度。页面那条
+不同——它提交完就返回，进度靠轮询一个任务快照（见 `ragamer.jobs`）。两条都在
+线程池里跑，谁都不占事件循环。
 
 这一层只做 HTTP 这一层的事：会话不存在翻成 404、问题为空翻成 400、一轮问答翻成
 SSE 事件、暂停点选错了翻成 422。**「这一轮算不算问完」「要不要写进历史」在
@@ -37,12 +45,13 @@ from dataclasses import asdict
 from typing import Annotated, Any
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from ragamer.answering import Citation
 from ragamer.clarifying import Clarification, NotACandidate, UnknownPending
-from ragamer.container import Container
+from ragamer.container import Container, build_importer
 from ragamer.conversations import (
     Chat,
     Conversation,
@@ -54,12 +63,8 @@ from ragamer.conversations import (
     build_chat,
     parse_session_cursor,
 )
-from ragamer.importing import STAGE_LABELS, Importer, ImportResult, ProgressEvent
-from ragamer.knowledge import (
-    KnowledgeBase,
-    KnowledgeBaseError,
-    readable_knowledge_base,
-)
+from ragamer.importing import STAGE_LABELS, ImportResult, ProgressEvent
+from ragamer.knowledge import KnowledgeBase, KnowledgeBaseError, readable_knowledge_base
 from ragamer.llm import LlmError
 from ragamer.logging import get_logger
 from ragamer.sources import SourceDocument
@@ -80,24 +85,32 @@ SSE_HEADERS = {"Cache-Control": "no-cache"}
 SSE_RETRY = "retry: 86400000\n\n"
 
 
+class UrlImport(BaseModel):
+    """一次网址导入的请求体。
+
+    网址单独成一个端点而不是塞进上传那一个的多表单字段里：界面上的两处输入本来就分开
+    （文件上传 / URL 输入，docs/ARCHITECTURE.md §5），而多部分表单里夹一个网址数组
+    两边都不好写。
+    """
+
+    urls: list[str] = Field(min_length=1, description="要抓的网页地址，可多条")
+    version: str = Field(default=UNVERSIONED, description="这次导入标注的版本，留空即未标注版本")
+
+
 def create_app(container: Container, chat: Chat | None = None) -> FastAPI:
     """把组合根里那套依赖接成 ASGI 应用。
 
     `chat` 由 `ragamer.app` 传进来：整站只有一套读取侧，JSON 端点与页面共用同一份
     （缓存与澄清器都在它里面，接两遍就可能两边不一样）。不传就现接一份——
     直接打这个应用的测试走那条。
+
+    写入侧那条链路也不在这里拼：`ragamer.container.build_importer` 一处接完，
+    与页面共用同一份。各拼一遍的代价不是重复，而是**缺件不报错**——少接的那几样
+    在界面上只是「用不了」，没有任何一处会说自己没接上。
     """
     chat = chat if chat is not None else build_chat(container).chat
     app = FastAPI(title="RAGamer", summary="游戏攻略 RAG 助手")
-    importer = Importer(
-        chunks=container.chunks,
-        embedder=container.embedder,
-        llm=container.llm,
-        parser=container.parser,
-        objects=container.objects,
-        # 导入完成时按游戏前缀清缓存（架构文档 §4）：语料变了，基于旧语料的答案不该再命中
-        cache=container.cache,
-    )
+    importer = build_importer(container)
 
     @app.post("/api/kb/{game_id}/import")
     async def import_sources(
@@ -107,21 +120,41 @@ def create_app(container: Container, chat: Chat | None = None) -> FastAPI:
             str, Form(description="这次导入标注的版本，留空即未标注版本")
         ] = UNVERSIONED,
     ) -> dict[str, Any]:
-        """批量导入。某个文件失败时其余照常入库，失败信息带文件名与失败阶段。"""
+        """批量导入。某个文件失败时其余照常入库，失败信息带文件名与失败阶段。
+
+        **这一段同步给出最终结果**（调用方要的就是这个），但它跑在**线程池**里：
+        导入是分钟级的一段（MinerU、二次 OCR、出网抓取），压在事件循环里跑会把整个
+        应用卡住——别的端点、别的页面全都得排队等它。
+        """
         _check_game_id(game_id)
         vocabulary = _vocabulary(container, game_id)
         sources = [
             SourceDocument(filename=file.filename or "", data=await file.read()) for file in files
         ]
 
-        results = importer.batch(sources, game_id=game_id, version=version, vocabulary=vocabulary)
-        return {
-            "game_id": game_id,
-            "version": version,
-            "imported": sum(1 for result in results if result.ok),
-            "failed": sum(1 for result in results if not result.ok),
-            "results": [_result_payload(result) for result in results],
-        }
+        results = await run_in_threadpool(
+            importer.batch, sources, game_id=game_id, version=version, vocabulary=vocabulary
+        )
+        return _response(game_id, version, results)
+
+    @app.post("/api/kb/{game_id}/import/urls")
+    async def import_urls(game_id: str, request: UrlImport) -> dict[str, Any]:
+        """抓一批网页再入库。某个地址失败时其余照常入库，失败信息带地址与失败阶段。
+
+        抓回来的资料与上传的文件走同一条链路，响应形状也相同——界面上两条输入各是各的
+        提交按钮，读结果的地方却可以共用一处。同上，这一段也在线程池里跑。
+        """
+        _check_game_id(game_id)
+        vocabulary = _vocabulary(container, game_id)
+
+        results = await run_in_threadpool(
+            importer.batch_urls,
+            request.urls,
+            game_id=game_id,
+            version=request.version,
+            vocabulary=vocabulary,
+        )
+        return _response(game_id, request.version, results)
 
     @app.post("/api/chat/sessions", status_code=201)
     def create_session(payload: SessionRequest) -> dict[str, Any]:
@@ -318,6 +351,17 @@ def _event(name: str, payload: Mapping[str, Any]) -> str:
     return f"event: {name}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
+def _response(game_id: str, version: str, results: tuple[ImportResult, ...]) -> dict[str, Any]:
+    """两条导入路径共用的响应。形状一样是有意的：界面读结果只有一处。"""
+    return {
+        "game_id": game_id,
+        "version": version,
+        "imported": sum(1 for result in results if result.ok),
+        "failed": sum(1 for result in results if not result.ok),
+        "results": [_result_payload(result) for result in results],
+    }
+
+
 def _check_game_id(game_id: str) -> None:
     """游戏 id 同时是 collection 名，不合法就当场 400。
 
@@ -403,7 +447,7 @@ def _citation_payload(citation: Citation) -> dict[str, Any]:
 def _result_payload(result: ImportResult) -> dict[str, Any]:
     """一个文件的结果。失败时 `stage` 与 `error` 一起给出：界面要能说清卡在哪一步。"""
     return {
-        "filename": result.filename,
+        "source": result.source,
         "doc_title": result.doc_title,
         "chunk_count": result.chunk_count,
         "skipped": result.skipped,
@@ -416,7 +460,7 @@ def _result_payload(result: ImportResult) -> dict[str, Any]:
 
 def _event_payload(event: ProgressEvent) -> dict[str, Any]:
     return {
-        "filename": event.filename,
+        "source": event.source,
         "stage": event.stage.value,
         "stage_label": STAGE_LABELS[event.stage],
         "file_number": event.file_number,

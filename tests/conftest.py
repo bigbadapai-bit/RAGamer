@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -13,8 +14,9 @@ from ragamer.clarifying import Clarifier
 from ragamer.config import get_settings
 from ragamer.container import Container
 from ragamer.conversations import Chat
+from ragamer.crawl import CrawlError
 from ragamer.llm import FakeLlm, LlmRequest, LlmTimeout
-from ragamer.sources import MarkdownParser, ParserRouter
+from ragamer.sources import MarkdownParser, NormalizedDoc, ParserRouter
 from ragamer.stores.base import Chunk, ChunkFilter, ChunkHit, StoreUnavailableError
 from ragamer.stores.memory import InMemoryChunkStore, InMemoryDocStore, InMemoryObjectStore
 from ragamer.vectors.fake import FakeEmbedder, FakeReranker
@@ -43,6 +45,13 @@ COMPLETE_ENV: dict[str, str] = {
     "RAGAMER_LLM_MAX_ATTEMPTS": "5",
     "RAGAMER_LLM_BACKOFF_BASE": "0.25",
     "RAGAMER_LLM_BACKOFF_MAX": "4",
+    "RAGAMER_VISION_BASE_URL": "https://vision.test/v1",
+    "RAGAMER_VISION_API_KEY": "test-vision-api-key",
+    "RAGAMER_VISION_MODEL": "test-vision-model",
+    "RAGAMER_VISION_TIMEOUT": "30",
+    "RAGAMER_VISION_MAX_ATTEMPTS": "2",
+    "RAGAMER_VISION_BACKOFF_BASE": "0.5",
+    "RAGAMER_VISION_BACKOFF_MAX": "2",
     "RAGAMER_MINERU_BASE_URL": "https://mineru.test",
     "RAGAMER_MINERU_API_KEY": "test-mineru-api-key",
     "RAGAMER_MINERU_MODEL_VERSION": "pipeline",
@@ -57,6 +66,10 @@ COMPLETE_ENV: dict[str, str] = {
     "RAGAMER_RERANK_MODEL": "test-rerank-model",
     "RAGAMER_RERANK_BATCH_SIZE": "32",
     "RAGAMER_RERANK_MAX_LENGTH": "2048",
+    "RAGAMER_CRAWL_USER_AGENT": "RAGamerTest/0.1 (+https://crawl.test/bot)",
+    "RAGAMER_CRAWL_TIMEOUT": "7.5",
+    "RAGAMER_CRAWL_MIN_INTERVAL": "0.25",
+    "RAGAMER_CRAWL_MAX_BYTES": "1048576",
 }
 
 
@@ -75,6 +88,24 @@ def settings_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[di
     get_settings.cache_clear()
 
 
+class FakeCrawler:
+    """不发请求的抓取器：地址 → 事先排好的正文。
+
+    没排过的地址当场炸，而不是返回一份空文档——静默返回会把「链路走通了」与
+    「假件其实什么都没做」混成同一件事。
+    """
+
+    def __init__(self, **pages: str) -> None:
+        self._pages = pages
+        self.requested: list[str] = []
+
+    def crawl(self, url: str) -> NormalizedDoc:
+        self.requested.append(url)
+        if url not in self._pages:
+            raise CrawlError(f"{url}：假件里没有排这一页")
+        return NormalizedDoc(markdown=self._pages[url], source_url=url)
+
+
 def make_container(
     chunks=None,
     docs=None,
@@ -83,6 +114,9 @@ def make_container(
     reranker=None,
     llm=None,
     parser=None,
+    vision=None,
+    ocr=None,
+    crawler=None,
     cache=None,
 ) -> Container:
     """造一个容器：八个依赖默认都是假件，测试只覆盖自己关心的那几个。
@@ -99,9 +133,42 @@ def make_container(
         embedder=embedder if embedder is not None else FakeEmbedder(),
         reranker=reranker if reranker is not None else FakeReranker(),
         llm=llm if llm is not None else FakeLlm(),
+        # 默认不接视觉模型：没配时组合根给的就是 None（补图只做二次 OCR）
+        vision=vision,
+        # 默认的 OCR 引擎一被调用就炸——排了脚本的测试才该走到它
+        ocr=ocr if ocr is not None else FailingOcr(),
         parser=parser if parser is not None else ParserRouter((MarkdownParser(),)),
+        crawler=crawler if crawler is not None else FakeCrawler(),
         cache=cache if cache is not None else InMemoryAnswerCache(),
     )
+
+
+class FailingOcr:
+    """一调就炸的 OCR。默认的二次 OCR：真被用到说明这个测试接线接错了。"""
+
+    def read(self, data: bytes) -> str:
+        raise AssertionError("这个测试没排 OCR：补图那一层不该走到这里")
+
+
+class FakeOcr:
+    """按图逐张回话的假 OCR。记下每一张喂进来的字节。
+
+    脚本里也可以排异常（`OcrError` / `OcrUnavailable`），用来验失败那两条路。
+    脚本排空之后再被调用会当场炸——测试少排了一条时立刻看得见，不是静默给空串。
+    """
+
+    def __init__(self, *texts: Any) -> None:
+        self.texts = list(texts)
+        self.images: list[bytes] = []
+
+    def read(self, data: bytes) -> str:
+        self.images.append(data)
+        if not self.texts:
+            raise AssertionError("假 OCR 没有更多脚本回复了 —— 测试少排了一条")
+        text = self.texts.pop(0)
+        if isinstance(text, Exception):
+            raise text
+        return text
 
 
 @pytest.fixture

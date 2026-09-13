@@ -30,6 +30,10 @@ dependencies = [
     # 答案缓存的客户端。业务层只认 ragamer.caching 里的协议，不直接依赖这个库；
     # 下限取 5.2：热门问题那条 ZSET 查询用的是带排序参数的 zrange
     "redis>=5.2",
+    # 普通网页的正文抽取：导航栏、页脚、侧边栏这些 boilerplate 由它识别并丢掉，
+    # 顺带把正文转成 Markdown（`output_format="markdown"`）。自己写一遍是重造轮子，
+    # 而这正是它唯一做的事。MediaWiki 那条路不用它——那条走接口拿 wikitext
+    "trafilatura>=2.0",
 ]
 
 [project.scripts]
@@ -44,6 +48,11 @@ ragamer-web = "ragamer.app:main"
 # 只有要跑 `pytest -m integration` 时才 `uv sync --extra models`。
 # 适配器里是懒加载：没装这个组也能 import，只在真的要用模型时才报错并说明装法。
 models = ["FlagEmbedding>=1.4"]
+# 二次 OCR。MinerU 不识别图片区域里的文字（三年未变的产品决策），PDF 与图片那条路
+# 靠它把图里的文字取回来。RapidOCR 带 PP-OCR 的中文模型（随包带，运行时不下模型），
+# 但推理引擎要自己装——它支持好几个引擎，自己不拉任何一个。
+# 不分开装的话，导入 PNG/PDF 时会在补图那一步报错并说清装法（`ragamer.ocr`）。
+ocr = ["rapidocr>=3.9", "onnxruntime>=1.20"]
 
 [dependency-groups]
 dev = [

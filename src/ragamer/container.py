@@ -20,10 +20,14 @@ from dataclasses import dataclass
 from ragamer.caching.base import AnswerCache
 from ragamer.caching.redis import RedisAnswerCache
 from ragamer.config import Settings
+from ragamer.crawl import HttpCrawler
+from ragamer.enriching import ImageEnricher
+from ragamer.importing import Importer
 from ragamer.llm import LlmClient, OpenAiLlm
 from ragamer.logging import get_logger
 from ragamer.mineru import MineruParser
-from ragamer.sources import MarkdownParser, ParserRouter, SourceParser
+from ragamer.ocr import OcrEngine, RapidOcrEngine
+from ragamer.sources import MarkdownParser, PageCrawler, ParserRouter, SourceParser
 from ragamer.stores.base import (
     ChunkStore,
     DocStore,
@@ -52,8 +56,16 @@ class Container:
     reranker: Reranker
     #: 语言模型。打标兜底、查询路由、多查询改写、生成都走它。
     llm: LlmClient
+    #: 视觉模型。**没配就是 `None`**：补图只做二次 OCR，图里没有文字的那几张
+    #: 会少掉可检索的文本，其余照旧（见 `ragamer.config.VisionSettings`）。
+    vision: LlmClient | None
+    #: 二次 OCR 引擎。PDF 与图片那条路上，图片区域里的文字只能靠它取回来
+    #: （MinerU 一个字都不给，见 docs/ARCHITECTURE.md §1.2）。
+    ocr: OcrEngine
     #: 解析适配器，按扩展名把一份资料交给唯一的那个（`ragamer.sources.ParserRouter`）。
     parser: SourceParser
+    #: 网页抓取。唯一一个往**外网**去的外部依赖，同样只在这里构造一次。
+    crawler: PageCrawler
     #: 答案缓存与提问计数。**不在 `stores()` 里**，见模块说明。
     cache: AnswerCache
 
@@ -102,6 +114,10 @@ def build_container(settings: Settings) -> Container:
         embedder=BgeM3Embedder(settings.embed, settings.models),
         reranker=BgeReranker(settings.rerank, settings.models),
         llm=OpenAiLlm(settings.llm),
+        # 没配视觉模型时不构造：空对象会让「有没有这一步」看起来永远成立
+        vision=OpenAiLlm(settings.vision) if settings.vision.enabled else None,
+        # 引擎的加载推后到第一次真的要用（见 `ragamer.ocr`），自检不等它
+        ocr=RapidOcrEngine(),
         parser=ParserRouter(
             (
                 MarkdownParser(),
@@ -109,4 +125,32 @@ def build_container(settings: Settings) -> Container:
                 MineruParser(settings.mineru),
             )
         ),
+        crawler=HttpCrawler(settings.crawl),
+    )
+
+
+def build_importer(container: Container) -> Importer:
+    """写入侧那条链路的接线。JSON 端点与页面两条入口共用这一份。
+
+    各自拼一遍的代价不是重复，而是**缺件不报错**：页面那条曾经只接了三个依赖，
+    PDF 与图片解析不了、网址导入不了、图片补不了，而那三样在界面上只是「用不了」，
+    没有任何一处会说自己没接上。
+    """
+    return Importer(
+        chunks=container.chunks,
+        embedder=container.embedder,
+        llm=container.llm,
+        parser=container.parser,
+        objects=container.objects,
+        # 补图要的三样（对象存储、OCR 引擎、视觉模型）都在组合根里造好了，
+        # 编排器只该看见一个 `Enricher`
+        enricher=ImageEnricher(
+            objects=container.objects,
+            ocr=container.ocr,
+            vision=container.vision,
+        ),
+        crawler=container.crawler,
+        # 缓存也一并接上：少了它，导入完成后那批基于旧语料写出来的答案不会被清掉，
+        # 而「答案已经不对了」在界面上看不出来——正是上面那种「缺件不报错」。
+        cache=container.cache,
     )

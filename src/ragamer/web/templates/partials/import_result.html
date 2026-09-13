@@ -2,33 +2,63 @@
   导入结果区。整页渲染时被 import.html 包在 #import-result 里；htmx 提交时单独回这一个片段，
   换掉那个 div 的内容。两处渲染的是同一份数据，所以两条路看到的东西一模一样——
   出错时也一样：那条消息得落在这个区域里，才不至于被换掉之后看不见。
+
+  还在跑的时候，这一块**自己往下续**：根元素带 hx-get + every 1s，换的是它自己
+  （outerHTML）。跑到哪就渲染到哪，跑完那一份不带这两个属性，轮询自然停。
 #}
-{% if message %}
-<p class="mb-6 rounded border border-red-300 bg-red-50 px-4 py-3 text-sm text-red-800">{{ message }}</p>
+{% if notice %}
+{# 片段自己那条消息。整页那一路由 base.html 顶上的位置说，不走这里——两处都渲染就是说两遍 #}
+<p class="mb-6 rounded border border-red-300 bg-red-50 px-4 py-3 text-sm text-red-800">{{ notice }}</p>
 {% endif %}
 
 {% if result %}
-<section class="rounded border border-slate-200 bg-white p-5">
-  <h2 class="mb-1 text-lg font-medium">导入结果</h2>
+<section class="rounded border border-slate-200 bg-white p-5"
+         {% if result.running %}hx-get="/import/result?job={{ result.job_id }}"
+         hx-trigger="every 1s" hx-swap="outerHTML"{% endif %}>
+  <h2 class="mb-1 text-lg font-medium">导入结果{% if result.running %}（跑着）{% endif %}</h2>
+  <p class="mb-1 text-sm text-slate-500">{{ result.headline }}</p>
+  {% if result.running %}
   <p class="mb-4 text-sm text-slate-500">
-    共 {{ result.rows | length }} 份，成功 {{ result.imported }} 份{% if result.failed %}，失败 {{ result.failed }} 份{% endif %}。
+    导入在后台照跑，不想等可以先离开。脚本在时这一块每秒自己刷一次，脚本关掉时整页每两秒刷一次；
+    两种都没生效（比如 htmx 没加载出来）就点<a class="underline" href="/import?job={{ result.job_id }}">刷新看进度</a>。
   </p>
+  {% elif result.summary %}
+  <p class="mb-4 text-sm text-slate-500">这批入库 {{ result.chunks }} 条切片。{{ result.summary }}</p>
+  {% else %}
+  <div class="mb-4"></div>
+  {% endif %}
+
+  {% if result.error %}
+  <p class="mb-4 rounded border border-red-300 bg-red-50 px-4 py-3 text-sm text-red-800">
+    这一批没能跑起来：{{ result.error }}
+  </p>
+  {% endif %}
 
   <ul class="space-y-3">
     {% for row in result.rows %}
-    <li class="border-t border-slate-200 pt-3 first:border-0 first:pt-0">
+    <li data-source="{{ row.source }}" class="border-t border-slate-200 pt-3 first:border-0 first:pt-0">
       <div class="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
-        <span class="text-sm font-medium">{{ row.filename }}</span>
-        {% if row.ok %}
-        <span class="text-sm text-slate-500">
-          《{{ row.doc_title }}》· 入库 {{ row.chunk_count }} 条{% if row.skipped %}，跳过 {{ row.skipped }} 条{% endif %}
-        </span>
+        <span class="text-sm font-medium">{{ row.source }}</span>
+        {% if row.status == "ok" %}
+        <span class="text-sm text-green-700">{{ row.status_label }}</span>
+        {% elif row.status == "failed" %}
+        <span class="text-sm text-red-700">{{ row.status_label }}</span>
         {% else %}
-        <span class="text-sm text-red-700">卡在「{{ row.stage_label }}」：{{ row.error }}</span>
+        <span class="text-sm text-slate-500">{{ row.status_label }}</span>
         {% endif %}
       </div>
 
-      {% if row.ok %}
+      {# 走过的阶段就是这一条的进度：卡在归一化的那条不该显示它走过切分 #}
+      {% if row.steps %}
+      <p class="mt-1 text-xs {% if row.status == 'failed' %}text-red-700{% else %}text-slate-500{% endif %}">
+        走到：{{ row.steps | join(" › ") }}
+      </p>
+      {% endif %}
+
+      {% if row.status == "ok" %}
+      <p class="mt-1 text-sm text-slate-600">
+        《{{ row.doc_title }}》· 入库 {{ row.chunk_count }} 条{% if row.skipped %}，跳过 {{ row.skipped }} 条{% endif %}
+      </p>
       <p class="mt-1 text-xs text-slate-500">
         主体名 {{ row.subject_name or empty }}
         {%- if row.subject_types %} · 主体类型 {{ row.subject_types | join("、") }}{% endif %}
@@ -37,9 +67,62 @@
       <p class="mt-2 text-sm">
         <a class="underline" href="{{ row.preview_url }}">看切分结果</a>
       </p>
+      {% elif row.status == "failed" %}
+      <p class="mt-1 text-sm text-red-700">卡在「{{ row.stage_label }}」：{{ row.error }}</p>
+      {% if row.collides_with %}
+      <p class="mt-1 text-xs text-slate-500">
+        这一条不能靠重试解决：单独重试它，它就成了这一批里唯一的一条，写下去会把它撞赢的那份整份替掉。
+      </p>
+      {% endif %}
       {% endif %}
     </li>
     {% endfor %}
   </ul>
+
+  {% if result.retry.urls or result.retry.files %}
+  {#
+    只重试失败的那些。网址能原样带上（地址就是它的凭据）；文件带不了——字节在浏览器那边，
+    提交完就不在页面上了，只能请人重新选中，**没重新选中的不会被提交**，所以这里把
+    「这一提交会带上什么」说清楚。这张表单与上面那张提交到同一个端点，走的还是同一条链路。
+  #}
+  <form id="import-retry" method="post" action="/import" enctype="multipart/form-data"
+        hx-post="/import" hx-encoding="multipart/form-data"
+        hx-target="#import-result" hx-swap="innerHTML" hx-indicator="#import-busy"
+        class="mt-6 space-y-4 border-t border-slate-200 pt-4">
+    <h3 class="text-sm font-medium">重试这些</h3>
+    <input type="hidden" name="game_id" value="{{ result.game_id }}">
+    <input type="hidden" name="version" value="{{ result.retry.version }}">
+    {% if result.retry.urls %}
+    <p class="text-xs text-slate-500">本次会重试这 {{ result.retry.urls | length }} 个网址：</p>
+    <textarea name="urls" rows="{{ [result.retry.urls | length, 6] | min }}"
+              class="w-full rounded border border-slate-300 px-3 py-2 text-xs">{{ result.retry.urls | join("\n") }}</textarea>
+    {% endif %}
+    {% if result.retry.files %}
+    <p class="text-xs text-slate-500">
+      另有 {{ result.retry.files | length }} 个文件要重试：{{ result.retry.files | join("、") }}。
+      浏览器不会把文件留给我们，<strong>重新选中</strong>它们再提交，没选中的不会被提交。
+    </p>
+    <input type="file" name="files" multiple accept="{{ result.accept }}"
+           class="block w-full text-sm">
+    {% endif %}
+    <div class="flex items-center gap-4">
+      <button type="submit" class="rounded bg-slate-900 px-4 py-2 text-sm font-medium text-white">
+        重试这些
+      </button>
+      <span class="htmx-indicator text-sm text-slate-500">已经交上去了，下面在跟着跑</span>
+    </div>
+  </form>
+  {% endif %}
+
+  {% if result.retry.blocked %}
+  <div class="mt-6 border-t border-slate-200 pt-4">
+    <h3 class="text-sm font-medium">这些不是重试能解决的</h3>
+    <ul class="mt-2 space-y-1 text-xs text-slate-500">
+      {% for item in result.retry.blocked %}
+      <li>{{ item.source }} 与 {{ item.other }} 落成了同一个文档标题，重试其中一个会把另一个替掉。</li>
+      {% endfor %}
+    </ul>
+  </div>
+  {% endif %}
 </section>
 {% endif %}

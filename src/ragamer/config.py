@@ -18,7 +18,14 @@ from pathlib import Path
 from typing import Annotated, Any, Literal
 
 from dotenv import dotenv_values
-from pydantic import BaseModel, Field, SecretStr, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    SecretStr,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 from pydantic_settings import BaseSettings, SettingsConfigDict, SettingsError
 
 #: 所有键的前缀。与原项目共享同一台机器时靠它避免环境变量串味。
@@ -111,6 +118,45 @@ class LlmSettings(BaseModel):
     backoff_max: float = Field(default=8.0, gt=0, le=120)
 
 
+class VisionSettings(LlmSettings):
+    """视觉模型：给每张图补一段摘要，写进替代文本（docs/ARCHITECTURE.md §1.3）。
+
+    与语言模型同形——同一个 `OpenAiLlm` 适配器接它，只是地址、密钥、模型名各是各的：
+    读图的模型和写字的模型通常不是同一个（纯文本模型接不了图）。
+
+    **不配就是整组不启用。** 补图那一层没接视觉模型时只做二次 OCR——图里没有文字的
+    那几张（立绘、示意图）会少掉可检索的文本，其余一切照旧。三个键要么都给、要么
+    都不给：配了一半是最坏的一种，它看起来像配好了，实际到用的时候才炸。
+    """
+
+    # 这三项在父类里是必需项，这里给空默认值——空即「没配」
+    base_url: str = ""
+    api_key: SecretStr = SecretStr("")
+    model: str = ""
+
+    @property
+    def enabled(self) -> bool:
+        """配齐了没有。全有或全无由下面的校验器保证，所以看一个就够。"""
+        return bool(self.base_url)
+
+    @model_validator(mode="after")
+    def _all_or_nothing(self) -> VisionSettings:
+        keys = (
+            ("RAGAMER_VISION_BASE_URL", self.base_url),
+            ("RAGAMER_VISION_API_KEY", self.api_key.get_secret_value()),
+            ("RAGAMER_VISION_MODEL", self.model),
+        )
+        missing = [key for key, value in keys if not value]
+        if len(missing) == len(keys):
+            return self
+        if missing:
+            raise ValueError(
+                f"视觉模型要么三个键都给、要么都不给。还差 {'、'.join(missing)}"
+                "（整组不配时补图只做二次 OCR）"
+            )
+        return self
+
+
 class MineruSettings(BaseModel):
     """MinerU 云端解析：PDF 与图片 → Markdown（docs/ARCHITECTURE.md §1.1）。
 
@@ -171,6 +217,22 @@ class RerankSettings(BaseModel):
     max_length: int = Field(default=8192, ge=1, le=32768)
 
 
+class CrawlSettings(BaseModel):
+    """网页抓取。合规要的三件事在这里，另一件（robots）在 `ragamer.crawl` 里做。"""
+
+    #: 请求头里的身份。**不要改成匿名的通用值**：站点按 UA 匹配 robots 规则，
+    #: 而不肯说自己是谁的爬虫被拦下来是应该的。带上联系地址，站长才找得到人。
+    user_agent: NonEmptyStr = "RAGamerBot/0.1 (+https://github.com/bigbadapai-bit/RAGamer)"
+    #: 单次请求超时（秒）
+    timeout: float = Field(default=15.0, gt=0, le=300)
+    #: 同一台主机两次请求之间的最小间隔（秒）。限的是主机不是页面——并发抓一个站的
+    #: 十个页面，压力全落在同一台服务器上。0 表示不限，只在自己搭的站上这么配。
+    min_interval: float = Field(default=1.0, ge=0, le=60)
+    #: 单个页面的字节上限。**超了当场报错而不是截断**：截断的 HTML 会安静地少掉后半篇，
+    #: 而导入看着是成功的。
+    max_bytes: int = Field(default=5_000_000, ge=64_000, le=64_000_000)
+
+
 class Settings(BaseSettings):
     """全部配置。由 :func:`load_settings` 或 :func:`get_settings` 构造。"""
 
@@ -200,10 +262,13 @@ class Settings(BaseSettings):
     redis: RedisSettings
     llm: LlmSettings
     mineru: MineruSettings
-    # 三个模型配置组都有完整默认值：不配也能跑，配了才落进 .env
+    # 四个模型配置组都有完整默认值：不配也能跑，配了才落进 .env
+    vision: VisionSettings = Field(default_factory=VisionSettings)
     models: ModelSettings = Field(default_factory=ModelSettings)
     embed: EmbedSettings = Field(default_factory=EmbedSettings)
     rerank: RerankSettings = Field(default_factory=RerankSettings)
+    # 抓取也只有完整默认值：不配也能跑，配了才落进 .env
+    crawl: CrawlSettings = Field(default_factory=CrawlSettings)
 
 
 def load_settings(env_file: str | Path | None = DEFAULT_ENV_FILE) -> Settings:

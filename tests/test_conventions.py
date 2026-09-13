@@ -33,6 +33,8 @@ _ADAPTERS = {
     "OpenAiLlm",
     "MineruParser",
     "RedisAnswerCache",
+    "RapidOcrEngine",
+    "HttpCrawler",
 }
 
 #: 只扫 `src/ragamer`：`tools/` 下是一次性运维脚本，不进包、没有测试缝可言，
@@ -50,6 +52,10 @@ _VENDOR_MODULES = {
     # 真实模型是可选的 models 组，bge 里对它是懒导入（没装也能 import 本模块）
     "FlagEmbedding": _PACKAGE / "vectors" / "bge.py",
     "redis": _PACKAGE / "caching" / "redis.py",
+    # 二次 OCR 是可选的 ocr 组，ocr 里同样是懒导入
+    "rapidocr": _PACKAGE / "ocr.py",
+    # 网页正文抽取只发生在抓取适配器里：wikitext 那条路自己写，不碰它
+    "trafilatura": _PACKAGE / "crawl.py",
 }
 
 
@@ -72,6 +78,8 @@ def test_守则扫到了源码():
         "tagging.py",
         "sources.py",
         "mineru.py",
+        "crawl.py",
+        "wikitext.py",
         "importing.py",
         "query.py",
         "retrieval.py",
@@ -81,6 +89,10 @@ def test_守则扫到了源码():
         "knowledge.py",
         "redis.py",
         "answer.py",
+        "jobs.py",
+        "enriching.py",
+        "ocr.py",
+        "lazy.py",
         "api.py",
         "logging.py",
         "memory.py",

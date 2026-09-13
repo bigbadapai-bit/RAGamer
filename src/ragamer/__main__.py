@@ -38,6 +38,7 @@ def describe(settings: Settings) -> str:
             f"redis: url=已配置 prefix={settings.redis.prefix}",
             f"llm: base_url={redact_address(settings.llm.base_url)} model={settings.llm.model}"
             " api_key=已配置",
+            _vision_line(settings),
             f"mineru: base_url={redact_address(settings.mineru.base_url)}"
             f" model_version={settings.mineru.model_version}"
             f" poll_interval={settings.mineru.poll_interval_seconds:g}"
@@ -48,6 +49,18 @@ def describe(settings: Settings) -> str:
             f"rerank: model={settings.rerank.model} batch_size={settings.rerank.batch_size}"
             f" max_length={settings.rerank.max_length}",
         ]
+    )
+
+
+def _vision_line(settings: Settings) -> str:
+    """视觉模型那一行。「没配」是一种合法状态（补图只做二次 OCR），
+    所以它要**明说**，而不是省略——省略了看起来就像这一项不存在。
+    """
+    if not settings.vision.enabled:
+        return "vision: 未配置（图片只做二次 OCR，没有摘要）"
+    return (
+        f"vision: base_url={redact_address(settings.vision.base_url)}"
+        f" model={settings.vision.model} api_key=已配置"
     )
 
 

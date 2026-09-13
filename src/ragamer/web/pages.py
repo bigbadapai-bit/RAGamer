@@ -35,7 +35,7 @@ from fastapi.responses import RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 
 from ragamer.clarifying import Clarification, NotACandidate, UnknownPending, version_choices
-from ragamer.container import Container
+from ragamer.container import Container, build_importer
 from ragamer.conversations import (
     CONVERSATIONS,
     ChatStack,
@@ -43,7 +43,8 @@ from ragamer.conversations import (
     Turn,
     parse_session_cursor,
 )
-from ragamer.importing import STAGE_LABELS, Importer, ImportResult
+from ragamer.importing import STAGE_LABELS, ImportResult, SourceKind
+from ragamer.jobs import ImportJobs, JobItem, JobSnapshot
 from ragamer.knowledge import (
     KnowledgeBase,
     KnowledgeBaseError,
@@ -100,6 +101,9 @@ CHUNK_TYPE_NAMES: Mapping[str, str] = {"text": "正文", "table": "表格", "ima
 #: 「没有内容」时占位用的短横。留白的单元格容易被看漏。
 EMPTY = "—"
 
+#: 任务号认不出来时说的话。服务重启过、或者那条早被丢掉了（只留最近几条），两种都算。
+_GONE = "这个导入任务不在了：服务重启过，或者它已经跑完很久、被新任务挤掉了。再提交一次吧。"
+
 
 def create_router(container: Container, stack: ChatStack) -> APIRouter:
     """把页面挂成一个路由器，由 `ragamer.app` 与 JSON 端点装进同一个应用。
@@ -108,9 +112,11 @@ def create_router(container: Container, stack: ChatStack) -> APIRouter:
     端点打的是同一批会话、同一份缓存，所以**由装配那一处传进来**，页面不再接一遍。
     """
     router = APIRouter()
-    # 进度回调用 Importer 的默认实现（落日志）：导入是同步的一整段，
-    # 在页面上等的时候只有日志看得见进度。
-    importer = Importer(chunks=container.chunks, embedder=container.embedder, llm=container.llm)
+    # 与 JSON 端点共用组合根里那一份接线（进度回调也是 Importer 的默认实现：落日志）。
+    # 各自拼一遍的话，页面这条会静默少接几样——PDF、图片与网址在界面上就永远用不了。
+    importer = build_importer(container)
+    # 导入在它自己的线程里跑，页面按任务号来问进度（见 `ragamer.jobs`）
+    jobs = ImportJobs(importer)
 
     @router.get("/")
     def home() -> RedirectResponse:
@@ -283,28 +289,55 @@ def create_router(container: Container, stack: ChatStack) -> APIRouter:
         return RedirectResponse(f"/kb?{query}", status_code=303)
 
     @router.get("/import")
-    def import_page(request: Request, game_id: str = "") -> Response:
-        """导入页：选库、传资料、看结果。进度与 URL 导入在后面的票里。"""
-        return _import_page(request, container, selected=game_id)
+    def import_page(request: Request, game_id: str = "", job: str = "") -> Response:
+        """导入页：选库、传资料或填网址、看这一次跑到哪了。
+
+        `job` 是任务号。它让**刷新之后还看得见这一批**——不带脚本那条路提交完就是
+        跳到这里来的（见 `run_import`）。
+        """
+        return _import_page(request, container, jobs, selected=game_id, job=job)
+
+    @router.get("/import/result")
+    def import_result(request: Request, job: str = "") -> Response:
+        """只回结果那一块。跑着的时候 htmx 每秒来问一次，跑到哪就换到哪。"""
+        snapshot = jobs.snapshot(job)
+        return templates.TemplateResponse(
+            request,
+            "partials/import_result.html",
+            {
+                "result": None
+                if snapshot is None
+                else _job_view(snapshot, accept=_accept(container)),
+                "notice": "" if snapshot is not None else _GONE,
+                "empty": EMPTY,
+            },
+        )
 
     @router.post("/import")
     async def run_import(
         request: Request,
         game_id: Annotated[str, Form()] = "",
         version: Annotated[str, Form()] = "",
+        urls: Annotated[str, Form()] = "",
         files: Annotated[list[UploadFile] | None, File()] = None,
     ) -> Response:
-        """跑一次导入，把**逐文件**的结果渲染出来。
+        """收下一次提交，**立刻返回**——导入在后台跑，结果区自己轮询。
 
-        htmx 发来的请求只回结果那一块，原生表单提交回整页，两块内容一模一样。
+        文件与网址是同一次提交的两半：一次请求里两条都收，交给同一个任务——编号连着排，
+        文档标识也共用一份认领表，同一次提交里一个文件与一个网址撞上才不会互相覆盖。
+
+        导入是分钟级的一段（MinerU、二次 OCR、出网抓取），压在请求里跑的话页面什么都
+        看不见，而且会把整个应用卡住（见 `ragamer.jobs`）。
+
+        htmx 发来的请求只回结果那一块并换掉地址栏；原生表单提交回一个重定向，
+        两条路都落在同一个页面上。
         """
 
         def reply(
             message: str = "",
-            result: Mapping[str, Any] | None = None,
             status: int = 200,
         ) -> Response:
-            """结果区该显示什么——**整页与 htmx 片段走同一个出口**。
+            """出错时说一句人话——**整页与 htmx 片段走同一个出口**。
 
             片段一律 200：htmx 默认不换入非 2xx 的响应，出错时回 4xx 的话人会对着一个
             空的结果区发呆。整页那条路仍报真实状态码，curl 与别的工具看得见。
@@ -313,15 +346,15 @@ def create_router(container: Container, stack: ChatStack) -> APIRouter:
                 return templates.TemplateResponse(
                     request,
                     "partials/import_result.html",
-                    {"result": result, "message": message, "empty": EMPTY},
+                    {"result": None, "notice": message, "empty": EMPTY},
                 )
             return _import_page(
                 request,
                 container,
+                jobs,
                 selected=game_id,
                 version=version,
                 message=message,
-                result=result,
                 status_code=status,
             )
 
@@ -333,8 +366,9 @@ def create_router(container: Container, stack: ChatStack) -> APIRouter:
             # 空的文件框也会送上来一个 filename 为空的部件，那不是一份资料
             if file.filename
         ]
-        if not sources:
-            return reply("先选一份资料再提交")
+        links = _url_lines(urls)
+        if not sources and not links:
+            return reply("先选一份资料或填一个网址再提交")
         try:
             collection_name(game_id)
             vocabulary = vocabulary_of(container.docs, game_id)
@@ -344,13 +378,29 @@ def create_router(container: Container, stack: ChatStack) -> APIRouter:
             # 状态码跟着异常走：接口与页面两条路翻出来的是同一个（见 ragamer.knowledge）
             return reply(str(exc), status=exc.status)
 
-        results = importer.batch(
+        job_id = jobs.submit(
             sources,
+            urls=links,
             game_id=game_id,
             version=version or UNVERSIONED,
             vocabulary=vocabulary,
         )
-        return reply(result=_import_result(results, game_id=game_id, version=version))
+        where = f"/import?{urlencode({'game_id': game_id, 'job': job_id})}"
+        if request.headers.get("HX-Request"):
+            response = templates.TemplateResponse(
+                request,
+                "partials/import_result.html",
+                {
+                    "result": _job_view(jobs.snapshot(job_id), accept=_accept(container)),
+                    "notice": "",
+                    "empty": EMPTY,
+                },
+            )
+            # 地址栏跟着变：刷新之后还看得见这一批，而不是回到一张空表单
+            response.headers["HX-Push-Url"] = where
+            return response
+        # 不带脚本那条路：提交 → 重定向 → 重新渲染（与本仓别的写入路径同一条规矩）
+        return RedirectResponse(where, status_code=303)
 
     @router.get("/kb/{game_id}/preview")
     def preview(
@@ -1005,23 +1055,34 @@ def _delete_page(
     )
 
 
+def _accept(container: Container) -> str:
+    """能传什么格式由解析适配器说了算，不在模板里再抄一份——抄的那份迟早对不上。"""
+    return ",".join(container.parser.SUFFIXES)
+
+
 def _import_page(
     request: Request,
     container: Container,
+    jobs: ImportJobs,
     *,
     selected: str = "",
     version: str = "",
+    job: str = "",
     message: str = "",
-    result: Mapping[str, Any] | None = None,
     status_code: int = 200,
 ) -> Response:
-    """导入页整页。`message` 与 `result` 落在结果区里，与 htmx 拿到的片段是同一份内容。
+    """导入页整页。`message` 与结果区里的东西，与 htmx 拿到的片段是同一份内容。
 
     **不经 base.html 的那条 `error` 通道**：那条画在表单上方，片段换入时看不见；
     要显示的东西得在结果区里，两条路才一致。
     """
     bases = _knowledge_base_rows(list_knowledge_bases(container.docs))
     known = {base["game_id"] for base in bases}
+    snapshot = jobs.snapshot(job) if job else None
+    if job and snapshot is None:
+        # 服务重启过、或者这条早被丢掉了：说清楚，别让人对着一个空结果区猜
+        message = message or _GONE
+    result = None if snapshot is None else _job_view(snapshot, accept=_accept(container))
     return _page(
         request,
         "import.html",
@@ -1031,8 +1092,11 @@ def _import_page(
         # 直接打开这个页面时默认选中第一个库，省得每回都挑一次
         selected=selected if selected in known else next(iter(sorted(known)), ""),
         version=version,
+        accept=_accept(container),
         message=message,
         result=result,
+        # 跑着的时候整页自己刷新（没脚本那条路的进度）；有 htmx 时不需要它
+        running=bool(snapshot is not None and snapshot.running),
         status_code=status_code,
     )
 
@@ -1115,31 +1179,153 @@ def _status_of(exc: Exception) -> int:
     return int(getattr(exc, "status", 400))
 
 
-def _import_result(
-    results: Sequence[ImportResult], *, game_id: str, version: str
-) -> dict[str, Any]:
-    """一次导入的逐文件结果。**失败也是结果**，和成功的一起列出来。"""
-    rows = [
-        {
-            "filename": result.filename,
-            "doc_title": result.doc_title,
-            "ok": result.ok,
-            "chunk_count": result.chunk_count,
-            "skipped": result.skipped,
-            "stage_label": EMPTY if result.stage is None else STAGE_LABELS[result.stage],
-            "error": result.error or "",
-            "subject_name": result.tags.subject_name,
-            "subject_types": _names(SUBJECT_TYPE_NAMES, result.tags.subject_type),
-            "content_natures": _names(CONTENT_NATURE_NAMES, result.tags.content_nature),
-            "preview_url": _preview_url(game_id, result.doc_title, version),
-        }
-        for result in results
-    ]
+def _job_view(snapshot: JobSnapshot, *, accept: str) -> dict[str, Any]:
+    """一个导入任务在界面上的样子。跑着的、跑完的、整批没跑起来的，都用同一份形状。
+
+    跑着的每一秒被重新渲染一次（htmx 轮询这个片段），所以这里**不许有副作用**，
+    也不要在模板里做判断——数字与句子都在这里算好。任务号认不出来时**不叫它**：
+    由调用方统一说「这个任务不在了」那一句。
+    """
+    results = list(snapshot.results)
+    ok = [result for result in results if result.ok]
+    failed = [result for result in results if not result.ok]
     return {
-        "rows": rows,
-        "imported": sum(1 for row in rows if row["ok"]),
-        "failed": sum(1 for row in rows if not row["ok"]),
+        "job_id": snapshot.job_id,
+        "game_id": snapshot.game_id,
+        "accept": accept,
+        "running": snapshot.running,
+        "error": snapshot.error,
+        "headline": _headline(snapshot, ok=len(ok), failed=len(failed)),
+        # 这一批实际落下的东西：进了多少切片、覆盖到哪些标签（验收要的那两句）。
+        # 跑着的时候不报——那是半截账，读了会当成总数。
+        "summary": _labels_text(ok) if snapshot.finished else "",
+        "chunks": sum(result.chunk_count for result in ok),
+        "rows": [_job_row(item, snapshot) for item in snapshot.items],
+        "retry": _retry_payload(failed, version=snapshot.version),
     }
+
+
+def _headline(snapshot: JobSnapshot, *, ok: int, failed: int) -> str:
+    """结果区顶上那一行。跑着的时候说的是「已经跑完几条」，不是最终账单。"""
+    if snapshot.error:
+        counts = f"共 {snapshot.total} 条：这一批没能跑起来"
+    elif snapshot.running:
+        counts = f"共 {snapshot.total} 条，已跑完 {len(snapshot.results)} 条 · 还在跑"
+    else:
+        counts = f"共 {snapshot.total} 条，成功 {ok} 条，失败 {failed} 条"
+    # 空串就是未标注版本。界面上直接显示空串的话，那一行读起来像没渲染出来
+    return f"{counts}。标注版本：{snapshot.version or '未标注版本'}。"
+
+
+def _job_row(item: JobItem, snapshot: JobSnapshot) -> dict[str, Any]:
+    """一条资料此刻的样子。**它走到哪一步就是它在界面上的进度**。"""
+    result = item.result
+    if result is None:
+        # 整批没跑起来时，每一条都不该还挂着「排队中」——那一批永远不会轮到它
+        if snapshot.error:
+            status, label = "unstarted", "没能开始"
+        elif item.stage is not None:
+            status, label = "running", f"正在{STAGE_LABELS[item.stage]}"
+        else:
+            status, label = "queued", "排队中"
+        return _empty_row(item, status=status, status_label=label)
+    return _empty_row(
+        item,
+        status="ok" if result.ok else "failed",
+        status_label="成功" if result.ok else "失败",
+        # 只列走过的阶段：卡在归一化的那条不该显示它走过切分
+        steps=[STAGE_LABELS[event.stage] for event in result.progress],
+        doc_title=result.doc_title,
+        chunk_count=result.chunk_count,
+        skipped=result.skipped,
+        subject_name=result.tags.subject_name,
+        subject_types=_names(SUBJECT_TYPE_NAMES, result.tags.subject_type),
+        content_natures=_names(CONTENT_NATURE_NAMES, result.tags.content_nature),
+        stage_label=EMPTY if result.stage is None else STAGE_LABELS[result.stage],
+        error=result.error or "",
+        # 撞了标题的那条重试不得：单独重试它，写下去就是把它撞的那一份删掉
+        collides_with=result.collides_with,
+        preview_url=_preview_url(snapshot.game_id, result.doc_title, snapshot.version),
+    )
+
+
+def _empty_row(item: JobItem, *, status: str, status_label: str, **filled: Any) -> dict[str, Any]:
+    """一条行的底子：还没有结果的那些字段都留空。"""
+    row: dict[str, Any] = {
+        "source": item.source,
+        "status": status,
+        "status_label": status_label,
+        "steps": [STAGE_LABELS[stage] for stage in item.stages],
+        "doc_title": "",
+        "chunk_count": 0,
+        "skipped": 0,
+        "subject_name": "",
+        "subject_types": [],
+        "content_natures": [],
+        "stage_label": "",
+        "error": "",
+        "collides_with": "",
+        "preview_url": "",
+    }
+    row.update(filled)
+    return row
+
+
+def _labels_text(results: Sequence[ImportResult]) -> str:
+    """这一批成功的那几条合起来覆盖到哪些标签（验收要的那一句）。
+
+    一份资料一个切片都可能是空的（比如整篇都没读出结构），所以是并集而不是「第一条的」。
+    一条标签都没有时明说，不留一句「覆盖到的标签：」在那儿吊着。
+    """
+    groups = (
+        ("主体类型", _union(SUBJECT_TYPE_NAMES, [r.tags.subject_type for r in results])),
+        ("内容性质", _union(CONTENT_NATURE_NAMES, [r.tags.content_nature for r in results])),
+        ("游戏术语", sorted({term for result in results for term in result.tags.game_terms})),
+    )
+    covered = [f"{name} {'、'.join(values)}" for name, values in groups if values]
+    if not covered:
+        return "这一批一条标签都没打上——语料本身没有可读的结构，模型那条路也没给出结论。"
+    return "覆盖到的标签：" + "；".join(covered) + "。"
+
+
+def _union(labels: Mapping[Any, str], groups: Iterable[Sequence[str]]) -> list[str]:
+    """并集，按词表里的顺序——界面上两个字段的排列才稳定。"""
+    values = {value for group in groups for value in group}
+    ordered = [name for value, name in labels.items() if value in values]
+    # 词表里没有的取值原样补在后面，不吞掉
+    return ordered + sorted(_names(labels, values - set(labels)))
+
+
+def _retry_payload(failed: Sequence[ImportResult], *, version: str) -> dict[str, Any]:
+    """「只重试失败的那些」要带上的东西。
+
+    网址能原样带上（它本身就是那条资料的凭据）；**文件带不了**——字节在浏览器那边，
+    提交完就不在页面上了，只能请人重新选中。
+
+    **撞了标题的那条不进重试**：它失败是因为同一次提交里另有两条落成了同一个文档标题，
+    单独重试它，它就成了那一批里唯一的一条，写下去会把它撞赢的那份整份替掉——
+    重试按钮不该是把人送进这个坑的那只手。
+    """
+    retryable = [result for result in failed if not result.collides_with]
+    return {
+        "urls": [result.source for result in retryable if result.kind is SourceKind.URL],
+        "files": [result.source for result in retryable if result.kind is SourceKind.FILE],
+        "blocked": [
+            {"source": result.source, "other": result.collides_with}
+            for result in failed
+            if result.collides_with
+        ],
+        "version": version,
+    }
+
+
+def _url_lines(raw: str) -> list[str]:
+    """网址输入框里的地址：一行一条，空行与前后空白丢掉。
+
+    重复的地址不去重——两条一样的地址就是同一份资料，导入侧按幂等处理（主键稳定，
+    写下去等于没写），这里替它做主反而会让人以为自己只填了一条。
+    """
+    return [line.strip() for line in raw.splitlines() if line.strip()]
 
 
 def _chunk_rows(chunks: Sequence[Chunk], version: str) -> list[dict[str, Any]]:

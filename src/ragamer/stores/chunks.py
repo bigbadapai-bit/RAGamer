@@ -83,6 +83,7 @@ _MAX_LENGTH = {
     "game_id": 128,
     "version": 64,
     "doc_title": 512,
+    "source_url": 2048,
     "chunk_type": 16,
     "content_hash": 64,
 }
@@ -103,6 +104,7 @@ SCALAR_FIELDS = (
     "game_id",
     "version",
     "doc_title",
+    "source_url",
     "chunk_type",
     "content_hash",
 )
@@ -119,7 +121,15 @@ def chunk_schema() -> CollectionSchema:
     for name in ("content", "content_meta", "ancestor_path"):
         schema.add_field(name, DataType.VARCHAR, max_length=_MAX_LENGTH[name])
     schema.add_field("chunk_index", DataType.INT64)
-    for name in ("subject_name", "game_id", "version", "doc_title", "chunk_type", "content_hash"):
+    for name in (
+        "subject_name",
+        "game_id",
+        "version",
+        "doc_title",
+        "source_url",
+        "chunk_type",
+        "content_hash",
+    ):
         schema.add_field(name, DataType.VARCHAR, max_length=_MAX_LENGTH[name])
     # 两个标签字段都是数组：主体类型不互斥（"二郎神的技能"同时属于角色与技能）
     for name in ("subject_type", "content_nature", "game_terms"):
@@ -212,6 +222,7 @@ def _row(chunk: Chunk) -> dict[str, Any]:
         "game_id": chunk.game_id,
         "version": chunk.version,
         "doc_title": chunk.doc_title,
+        "source_url": chunk.source_url,
         "chunk_type": chunk.chunk_type,
         "content_hash": chunk.content_hash,
         "dense_vector": list(chunk.dense_vector),
@@ -243,6 +254,7 @@ def _chunk(fields: Mapping[str, Any]) -> Chunk:
         game_id=fields["game_id"],
         version=fields["version"],
         doc_title=fields["doc_title"],
+        source_url=fields["source_url"],
         chunk_type=fields["chunk_type"],
         content_hash=fields["content_hash"],
     )

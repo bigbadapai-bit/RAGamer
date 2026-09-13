@@ -20,11 +20,16 @@ from ragamer.sources import MarkdownParser, ParserRouter
 from ragamer.stores.base import UNVERSIONED, image_prefix
 from ragamer.stores.memory import InMemoryObjectStore
 
-from .conftest import make_container
+from .conftest import FakeCrawler, FakeOcr, make_container
 from .test_mineru import FakeMineru, FakeTime, make_parser
 
 GAME = "black_myth"
 CHUNKS_URL = f"/api/kb/{GAME}/import"
+URLS_URL = f"{CHUNKS_URL}/urls"
+#: 网址那一路的假抓取器排的就是这一页。正文与 `ARTICLE` 相同，
+#: 于是「两条入口切出同样的片」可以直接两两对起来
+CRAWLED_URL = "https://wiki.test/wiki/二郎神"
+MISSING_URL = "https://wiki.test/wiki/没有这页"
 
 #: 假 MinerU 服务回的正文里的大标题，也就是入库时的文档标题。
 DOC_TITLE = "二郎神攻略"
@@ -69,8 +74,12 @@ KB = {
 
 @pytest.fixture
 def container():
-    """整条链路的内存版。知识库先建好——导入不负责建库。"""
-    container = make_container()
+    """整条链路的内存版。知识库先建好——导入不负责建库。
+
+    抓取器是假的，但它在容器里占的位置与真的那个一样：网址那一路从组合根拿到它，
+    与三个存储、两个模型同级。
+    """
+    container = make_container(crawler=FakeCrawler(**{CRAWLED_URL: ARTICLE}))
     container.docs.put(KB_COLLECTION, GAME, KB)
     return container
 
@@ -92,6 +101,15 @@ def saved(container, version: str = UNVERSIONED) -> list:
 def import_articles(client, *files, version: str | None = None):
     data = {} if version is None else {"version": version}
     response = client.post(CHUNKS_URL, files=list(files), data=data)
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def import_links(client, *urls: str, version: str | None = None):
+    body = {"urls": list(urls)}
+    if version is not None:
+        body["version"] = version
+    response = client.post(URLS_URL, json=body)
     assert response.status_code == 200, response.text
     return response.json()
 
@@ -183,7 +201,7 @@ def test_某个文件失败时其余正常入库_失败信息带文件名与阶�
 
     assert (payload["imported"], payload["failed"]) == (2, 1)
     failed = payload["results"][1]
-    assert failed["filename"] == "攻略.pdf"
+    assert failed["source"] == "攻略.pdf"
     assert failed["stage"] == "normalize"
     assert failed["error"]
     assert saved(container)
@@ -203,14 +221,18 @@ def test_导入过程中上报了进度(client):
     payload = import_articles(client, upload("二郎神.md"))
     progress = payload["results"][0]["progress"]
 
+    # 组合根接上补图之后，每个文件都会走过这一步——md 上是空跑一趟（它没有条目级结构，
+    # 补图原样返回）。阶段表按接线报，不按「这一步对这份资料有没有事做」报：那个判断
+    # 在补图那一层里，编排器不替它猜
     assert [event["stage"] for event in progress] == [
         "normalize",
+        "enrich",
         "chunk",
         "tag",
         "embed",
         "store",
     ]
-    assert [event["stage_label"] for event in progress][0] == "归一化"
+    assert [event["stage_label"] for event in progress][:2] == ["归一化", "补图"]
     assert all(event["file_number"] == 1 and event["file_total"] == 1 for event in progress)
 
 
@@ -239,7 +261,7 @@ def test_一批的条数按文件算(client):
     payload = import_articles(client, upload("甲.md"), upload("乙.md"))
 
     assert (payload["imported"], payload["failed"]) == (2, 0)
-    assert [result["filename"] for result in payload["results"]] == ["甲.md", "乙.md"]
+    assert [result["source"] for result in payload["results"]] == ["甲.md", "乙.md"]
 
 
 # --- PDF 与图片这条来源 ---
@@ -249,11 +271,15 @@ def mineru_container() -> tuple[FakeMineru, object]:
     """一个把 MinerU 接上的容器：假服务 + 内存对象存储，一次网络都不发。
 
     解析器这一组照组合根那份配：md／txt 走 MarkdownParser，PDF 与图片走 MinerU。
+    OCR 也照组合根那样接上——**接上 MinerU 就意味着图片区域里的文字要靠二次 OCR
+    取回来**，这里不给它，截图那份资料会卡在补图那一步（那正是它该有的行为，
+    只是这一条测的是「接线接对了」，不是「缺件时报什么错」）。
     """
     fake = FakeMineru()
     container = make_container(
         objects=InMemoryObjectStore(),
         parser=ParserRouter((MarkdownParser(), make_parser(fake, FakeTime()))),
+        ocr=FakeOcr("图内文字一", "图内文字二"),
     )
     container.docs.put(KB_COLLECTION, GAME, KB)
     return fake, container
@@ -293,7 +319,7 @@ def test_一批里截图失败不牵连_markdown():
 
     assert (payload["imported"], payload["failed"]) == (1, 1)
     failed = payload["results"][1]
-    assert failed["filename"] == "攻略.png"
+    assert failed["source"] == "攻略.png"
     assert failed["stage"] == "normalize"  # 卡在归一化那一步
     assert saved(container)  # 另一份照常入库
 
@@ -366,3 +392,96 @@ def test_没配术语映射的库仍读得出主体名():
     assert tags["subject_name"] == "二郎神"  # 文档大标题不依赖术语映射
     assert tags["subject_type"] == []
     assert tags["content_nature"]  # 内容性质按标题归一，同样不调模型
+
+
+# --- 提交网址 ---
+
+
+def test_提交一个网址_抓回来的内容切成切片入库(client, container):
+    payload = import_links(client, CRAWLED_URL)
+
+    assert payload["imported"] == 1
+    assert payload["failed"] == 0
+    assert container.crawler.requested == [CRAWLED_URL]
+    stored = saved(container)
+    assert payload["results"][0]["chunk_count"] == len(stored) > 1
+
+
+def test_抓下来的切片带上来源地址(client, container):
+    """答案的引用里要显示的就是它。"""
+    import_links(client, CRAWLED_URL)
+
+    assert {chunk.source_url for chunk in saved(container)} == {CRAWLED_URL}
+
+
+def test_同一份正文从网址来与从文件来切出的片一样(client, container):
+    """验收第 6 条：两条入口走的是同一条链路，切分与打标不感知来源。
+
+    两边切出的片除来源地址之外逐字相同——切片主键也在内，因为主键只看
+    游戏、文档标题、版本与序号，不看资料从哪来。
+    """
+    import_articles(client, upload("二郎神.md"))
+    from_file = saved(container)
+
+    import_links(client, CRAWLED_URL)
+    from_url = saved(container)
+
+    assert len(from_file) == len(from_url) > 1
+    for before, after in zip(from_file, from_url, strict=True):
+        assert before.chunk_id == after.chunk_id
+        assert before.content == after.content
+        assert before.ancestor_path == after.ancestor_path
+        assert before.content_nature == after.content_nature
+        assert before.source_url == ""
+        assert after.source_url == CRAWLED_URL
+
+
+def test_某个地址抓不到时其余照常入库(client, container):
+    payload = import_links(client, CRAWLED_URL, MISSING_URL)
+
+    assert (payload["imported"], payload["failed"]) == (1, 1)
+    failed = payload["results"][1]
+    assert failed["source"] == MISSING_URL
+    assert failed["stage"] == "normalize"  # 抓取属于归一化那一步
+    assert failed["error"]
+    assert saved(container)  # 失败的那一条没有牵连成功的那一条
+
+
+def test_网址导入的进度一路报到入库(client, caplog):
+    """抓取是同步的一整段，日志是它跑的时候唯一看得见的进度窗口。"""
+    with caplog.at_level(logging.INFO):
+        import_links(client, CRAWLED_URL)
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(CRAWLED_URL in message and "归一化" in message for message in messages)
+    assert any(CRAWLED_URL in message and "入库" in message for message in messages)
+
+
+def test_网址导入也标注版本(client, container):
+    payload = import_links(client, CRAWLED_URL, version="1.0")
+
+    assert payload["version"] == "1.0"
+    assert {chunk.version for chunk in saved(container, version="1.0")} == {"1.0"}
+
+
+def test_一个网址都不给时_422(client):
+    """空数组是请求本身不合法，不是「导入了零条」——后者看起来像成功。"""
+    response = client.post(URLS_URL, json={"urls": []})
+
+    assert response.status_code == 422
+
+
+def test_网址那一路同样拦住非法游戏_id(container):
+    client = TestClient(create_app(container))
+
+    response = client.post("/api/kb/黑神话/import/urls", json={"urls": [CRAWLED_URL]})
+
+    assert response.status_code in (400, 404)
+
+
+def test_网址那一路的知识库不存在时_404(container):
+    client = TestClient(create_app(container))
+
+    response = client.post("/api/kb/other_game/import/urls", json={"urls": [CRAWLED_URL]})
+
+    assert response.status_code == 404
