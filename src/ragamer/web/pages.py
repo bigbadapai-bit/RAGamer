@@ -886,11 +886,25 @@ def _page(
     status_code: int = 200,
     **context: Any,
 ) -> Response:
-    """渲染一个整页。`section` 决定导航里哪一项高亮。"""
+    """渲染一个整页。
+
+    `section` 决定导航里哪一项高亮；上下文里的 `game_id`／`session_id` 决定每一项指向
+    哪——同一段里的不同位置落点不同（见 `_nav`）。两者都从 `context` 里取，因为它们
+    本来就在那儿，不必每个调用点再传一遍。
+    """
     return templates.TemplateResponse(
         request,
         template,
-        {"title": title, "nav": _nav(section), "empty": EMPTY, **context},
+        {
+            "title": title,
+            "nav": _nav(
+                section,
+                game_id=str(context.get("game_id") or ""),
+                session_id=str(context.get("session_id") or ""),
+            ),
+            "empty": EMPTY,
+            **context,
+        },
         status_code=status_code,
     )
 
@@ -1075,26 +1089,41 @@ def _import_page(
 
     **不经 base.html 的那条 `error` 通道**：那条画在表单上方，片段换入时看不见；
     要显示的东西得在结果区里，两条路才一致。
+
+    `job` 没带上时**自己认领一条**（`ImportJobs.latest`）：导入是分钟级的一段，切到别的
+    页再切回来时地址栏里那个任务号多半已经没了，而那一批还在后台跑着。认领到的那批决定
+    这一页的主题，库与版本都跟着它走——否则会出现「显示着 A 库的结果、表单却停在 B 库」。
     """
     bases = _knowledge_base_rows(list_knowledge_bases(container.docs))
     known = {base["game_id"] for base in bases}
-    snapshot = jobs.snapshot(job) if job else None
-    if job and snapshot is None:
-        # 服务重启过、或者这条早被丢掉了：说清楚，别让人对着一个空结果区猜
-        message = message or _GONE
-    result = None if snapshot is None else _job_view(snapshot, accept=_accept(container))
+    if job:
+        snapshot = jobs.snapshot(job)
+        if snapshot is None:
+            # 服务重启过、或者这条早被丢掉了：说清楚，别让人对着一个空结果区猜
+            message = message or _GONE
+    else:
+        snapshot = jobs.latest(selected)
+    if snapshot is not None:
+        selected = snapshot.game_id
+        # 提交失败时回填的那份版本优先：那一次提交的值比上一批的更能说明人想干什么
+        version = version or snapshot.version
+    # 直接打开这个页面时默认选中第一个库，省得每回都挑一次；认领到库里已经没有了的那一批
+    # （它的库刚被删掉）也退到同一个落点
+    if selected not in known:
+        selected = next(iter(sorted(known)), "")
     return _page(
         request,
         "import.html",
         "导入",
         "/import",
         bases=bases,
-        # 直接打开这个页面时默认选中第一个库，省得每回都挑一次
-        selected=selected if selected in known else next(iter(sorted(known)), ""),
+        # 给外壳与导航用：这一页此刻是在哪个库里
+        game_id=selected,
+        selected=selected,
         version=version,
         accept=_accept(container),
         message=message,
-        result=result,
+        result=None if snapshot is None else _job_view(snapshot, accept=_accept(container)),
         # 跑着的时候整页自己刷新（没脚本那条路的进度）；有 htmx 时不需要它
         running=bool(snapshot is not None and snapshot.running),
         status_code=status_code,
@@ -1130,8 +1159,35 @@ def _preview_page(
 # --- 页面要用的数据 ---
 
 
-def _nav(current: str) -> list[dict[str, Any]]:
-    return [{"label": label, "url": url, "active": url == current} for label, url in NAV]
+def _nav(current: str, *, game_id: str = "", session_id: str = "") -> list[dict[str, Any]]:
+    """导航四项。`active` 说这一页属于哪一段，`url` 说**从这儿点它去哪儿**。
+
+    两件事分开是因为四项写成四个裸地址时，「切到别的页再切回来」会把上下文丢光：在
+    `/chat/黑神话/s1` 上点「对话」回到 `/chat`、在 `/import?job=…` 上点「导入」回到一张
+    空表单。而 URL 本来就带得住这些，所以每一项按当前位置补上它。
+    """
+    return [
+        {
+            "label": label,
+            "url": _nav_url(url, game_id=game_id, session_id=session_id),
+            "active": url == current,
+        }
+        for label, url in NAV
+    ]
+
+
+def _nav_url(url: str, *, game_id: str, session_id: str) -> str:
+    """一个导航项在当前位置下该指向哪。认不出来（评测那项）的原样返回。"""
+    if not game_id:
+        return url
+    if url == "/kb":
+        return f"/kb/{game_id}"
+    if url == "/import":
+        return f"/import?{urlencode({'game_id': game_id})}"
+    if url == "/chat":
+        # 在某个会话里就回那个会话；只在库那一层就回那个库
+        return f"/chat/{game_id}/{session_id}" if session_id else f"/chat/{game_id}"
+    return url
 
 
 def _knowledge_base_rows(bases: Sequence[KnowledgeBase]) -> list[dict[str, Any]]:
