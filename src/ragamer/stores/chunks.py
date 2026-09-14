@@ -87,14 +87,29 @@ _MAX_LENGTH = {
     "chunk_type": 16,
     "content_hash": 64,
 }
-_ARRAY_MAX_CAPACITY = {"subject_type": 8, "content_nature": 8, "game_terms": 64}
-_ARRAY_ELEMENT_LENGTH = {"subject_type": 32, "content_nature": 32, "game_terms": 64}
+_ARRAY_MAX_CAPACITY = {
+    "subject_type": 8,
+    "content_nature": 8,
+    "game_terms": 64,
+    # 一条切片里的图片地址个数。实测两个库里最多 5 条（一整页图标也不过这个量级），
+    # 留出十倍余量；真超了会在写入时报错，好过静默截断掉几张图
+    "image_urls": 64,
+}
+_ARRAY_ELEMENT_LENGTH = {
+    "subject_type": 32,
+    "content_nature": 32,
+    "game_terms": 64,
+    # 网页来源存的是外链（实测最长 203 字符，bwiki 的缩略图地址带一串百分号转义），
+    # MinerU 来源存的是对象 key，都比它短得多。与 `source_url` 同一个量级
+    "image_urls": 2048,
+}
 
 #: 检索结果里要取回的标量字段。不取向量的原因很直接：聚合父块只用得到正文与元数据，
 #: 取回来是白搬一遍数据。
 SCALAR_FIELDS = (
     "content",
     "content_meta",
+    "image_urls",
     "ancestor_path",
     "chunk_index",
     "subject_name",
@@ -131,8 +146,9 @@ def chunk_schema() -> CollectionSchema:
         "content_hash",
     ):
         schema.add_field(name, DataType.VARCHAR, max_length=_MAX_LENGTH[name])
-    # 两个标签字段都是数组：主体类型不互斥（"二郎神的技能"同时属于角色与技能）
-    for name in ("subject_type", "content_nature", "game_terms"):
+    # 三个标签字段与图片地址都是数组：主体类型不互斥（"二郎神的技能"同时属于角色与技能），
+    # 一片正文里的图片也不止一张
+    for name in ("subject_type", "content_nature", "game_terms", "image_urls"):
         schema.add_field(
             name,
             DataType.ARRAY,
@@ -162,6 +178,26 @@ def chunk_index_params() -> IndexParams:
     for name in INDEXED_SCALARS:
         params.add_index(field_name=name, index_type="INVERTED")
     return params
+
+
+def _require_current_schema(name: str, described: Mapping[str, Any]) -> None:
+    """已在的 collection 必须与代码里的 schema 一致，缺字段就当场报出来。
+
+    建表只在表**不存在**时发生，所以加一个字段之后老库会一直停在旧结构上。那时写入报的
+    是服务端的一句「字段不存在」，看不出「这个库要重新导入」——而重导是这个项目的主流程，
+    这个坑每次改 schema 都会踩一遍。
+
+    **不自动补字段**：补字段要重建索引，而更省事的「删掉重建」会顺手清空整个库，
+    那是个不可逆的动作，不该藏在一次导入里替人做主。
+    """
+    present = {str(field.get("name")) for field in described.get("fields") or ()}
+    missing = sorted(field.name for field in chunk_schema().fields if field.name not in present)
+    if missing:
+        raise StoreError(
+            f"collection {name} 还是旧的表结构，缺这些字段：{'、'.join(missing)}。"
+            "建表只在表不存在时发生，所以改过 schema 之后老库要重新导入"
+            "（删掉这个知识库重建，或换一个 game_id）"
+        )
 
 
 def filter_expression(where: ChunkFilter | None) -> str:
@@ -213,6 +249,7 @@ def _row(chunk: Chunk) -> dict[str, Any]:
         "chunk_id": chunk.chunk_id,
         "content": chunk.content,
         "content_meta": chunk.content_meta,
+        "image_urls": list(chunk.image_urls),
         "ancestor_path": chunk.ancestor_path,
         "chunk_index": chunk.chunk_index,
         "subject_name": chunk.subject_name,
@@ -244,6 +281,8 @@ def _chunk(fields: Mapping[str, Any]) -> Chunk:
         chunk_id=int(chunk_id),
         content=fields["content"],
         content_meta=fields["content_meta"],
+        # 空数组有的版本回 None，有的回 []——与下面三个标签字段同一条口径
+        image_urls=tuple(fields.get("image_urls") or ()),
         ancestor_path=fields["ancestor_path"],
         chunk_index=int(fields["chunk_index"]),
         subject_name=fields["subject_name"],
@@ -298,7 +337,7 @@ class MilvusChunkStore:
             raise unavailable(self.name, self.address, self._timeout, exc) from exc
 
     def ensure_collection(self, game_id: str) -> None:
-        """确保该游戏的 collection 存在，索引也一并建好。"""
+        """确保该游戏的 collection 存在、索引建好，**且表结构与代码里的那份对得上**。"""
         client = self._client()
         name = collection_name(game_id)
         if not client.has_collection(name, timeout=self._timeout):
@@ -310,6 +349,8 @@ class MilvusChunkStore:
                 timeout=self._timeout,
             )
             logger.info("新建 Milvus collection %s", name)
+            return
+        _require_current_schema(name, client.describe_collection(name, timeout=self._timeout))
 
     def upsert(self, game_id: str, chunks: Sequence[Chunk]) -> None:
         if not chunks:

@@ -44,6 +44,10 @@ class Chunk:
     doc_title: str
     chunk_type: ChunkType = "text"
     content_meta: str = ""
+    #: 这片正文里出现过的图片地址。**它不在 `content` 里**——切分时就把地址摘走了
+    #: （`ragamer.chunking`），正文里留下的是替代文本。唯一的用处是答案里能显示原图；
+    #: 既不进向量，也不随正文交给生成。网页来源是外链，MinerU 来源是对象 key。
+    image_urls: tuple[str, ...] = ()
     #: 这份切片的来源地址，网页导入才有；本地文件是空串。
     #: 跟着每个切片存一份而不是单独存文档：聚合父块是查出来的（§2.5），没有另一张
     #: 文档表可以挂它，而答案的引用要显示的就是它。

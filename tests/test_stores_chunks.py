@@ -51,6 +51,7 @@ FIELDS = (
     "subject_type",
     "content_nature",
     "game_terms",
+    "image_urls",
     "dense_vector",
     "sparse_vector",
 )
@@ -68,6 +69,8 @@ class FakeMilvusClient:
     #: 开连之前就预置成「已经存在的表」。默认空——多数用例要看着表被建出来，
     #: 查询与删除那几条要的是「表已经在」，用 `existing` fixture 预置。
     existing: ClassVar[set[str]] = set()
+    #: `describe_collection` 的返回。`None` 即按当前 schema 给，见那个方法。
+    described: ClassVar[dict[str, Any] | None] = None
 
     def __init__(self, **kwargs: Any) -> None:
         self.init_kwargs = kwargs
@@ -85,6 +88,7 @@ class FakeMilvusClient:
         cls.rows = []
         cls.hits = []
         cls.existing = set()
+        cls.described = None
 
     def _record(self, name: str, **kwargs: Any) -> None:
         self.calls.append((name, kwargs))
@@ -117,6 +121,14 @@ class FakeMilvusClient:
     def has_collection(self, collection_name: str, **kwargs: Any) -> bool:
         self._record("has_collection", collection_name=collection_name)
         return collection_name in self.collections
+
+    def describe_collection(self, collection_name: str, **kwargs: Any) -> dict[str, Any]:
+        """表结构的描述。默认按**当前** schema 给——「表已经在」的那些用例要的是
+        「结构与代码对得上」；结构停在旧版本上的那一条自己预置一份 `described`。"""
+        self._record("describe_collection", collection_name=collection_name)
+        if self.described is not None:
+            return self.described
+        return {"fields": [{"name": field.name} for field in chunk_schema().fields]}
 
     def create_collection(self, **kwargs: Any) -> None:
         self._record("create_collection", **kwargs)
@@ -183,15 +195,20 @@ def test_建表显式声明全部字段并关闭动态字段():
     assert {field.name for field in schema.fields} == set(FIELDS)
 
 
-def test_两个标签字段是数组():
-    """主体类型不互斥（"二郎神的技能"同时属于角色与技能），过滤用包含判断。"""
+def test_标签与图片地址都是数组():
+    """主体类型不互斥（"二郎神的技能"同时属于角色与技能），过滤用包含判断；
+    一片正文里的图片也不止一张。"""
     fields = {field.name: field for field in chunk_schema().fields}
 
-    for name in ("subject_type", "content_nature", "game_terms"):
+    for name in ("subject_type", "content_nature", "game_terms", "image_urls"):
         assert fields[name].dtype == DataType.ARRAY
         assert fields[name].element_type == DataType.VARCHAR
     # 七类主体类型 + 一些余量
     assert fields["subject_type"].max_capacity >= 7
+    # 实测一条切片里最多 5 个地址，留出十倍余量
+    assert fields["image_urls"].max_capacity >= 5
+    # 实测最长的地址 203 字符（bwiki 的缩略图地址带一串百分号转义）
+    assert fields["image_urls"].max_length >= 203
 
 
 def test_稠密向量维度是_BGE_M3_的_1024():
@@ -369,6 +386,21 @@ def test_重复确保同一个_collection_时只建一次(store, milvus):
 
     assert _client(milvus).called("create_collection") == []
     assert _client(milvus).called("create_database") == []
+
+
+def test_旧结构的_collection_当场报出来而不是写坏(store, existing):
+    """建表只在表不存在时发生，所以加过字段之后老库会一直停在旧结构上。
+
+    那时写入报的是服务端的一句「字段不存在」，看不出「这个库要重新导入」——
+    而这个项目的主流程就是导入。宁可在这一步就说清。
+    """
+    existing.described = {"fields": [{"name": "chunk_id"}, {"name": "content"}]}
+
+    with pytest.raises(StoreError) as failure:
+        store.ensure_collection("black_myth")
+
+    assert "image_urls" in str(failure.value)
+    assert "重新导入" in str(failure.value)
 
 
 def test_入库的行带上全部字段与两个向量(store, milvus):

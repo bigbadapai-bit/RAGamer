@@ -303,10 +303,11 @@ def test_上传截图走端点里接上的_MinerU_并完成入库():
     stored = container.chunks.fetch_document(GAME, DOC_TITLE, version=UNVERSIONED)
     assert payload["results"][0]["chunk_count"] == len(stored)
     assert stored
-    # 图进了对象存储，正文里留的是它的 key
+    # 图进了对象存储，切片带着它的 key——正文里没有（地址由切片单独带着去回显）
     keys = container.objects.list_keys(image_prefix(GAME))
     assert len(keys) == 2
-    assert all(any(key in chunk.content for chunk in stored) for key in keys)
+    assert all(any(key in chunk.image_urls for chunk in stored) for key in keys)
+    assert all(key not in chunk.content for key in keys for chunk in stored)
 
 
 def test_一批里截图失败不牵连_markdown():

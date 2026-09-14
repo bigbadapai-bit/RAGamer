@@ -12,6 +12,9 @@
 - **表格原子化**：Markdown 表格整表一块，装不下按行组切、**每块重复表头**；
   **长文本列整列降级进 `content_meta`，不进正文**（见 `_table_chunks`）；
   Infobox 与模板块整块保留，与表格同标 `table`。
+- **图片地址摘走**：正文里只留替代文本，地址进切片自己的 `image_urls`（见 `_piece_chunks`）。
+  它唯一用处是答案里显示原图，既不参与向量化也不交给生成；而留在正文里既占满字数预算、
+  又会被切分从中间切开，存下一条取不到原图的坏地址。
 - **顺序**：`chunk_index` 从 0 起连续，聚合父块靠它还原文档顺序。
 
 只做切分。打标与图片补全不在这一层。
@@ -20,9 +23,12 @@
 from __future__ import annotations
 
 import re
+from bisect import bisect_right
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal
+
+from ragamer.sources import ImageRef, strip_image_refs
 
 #: 祖先标题路径的分隔符，写法以 CONTEXT.md 的同名词条为准。
 PATH_SEPARATOR = " › "
@@ -98,6 +104,11 @@ class Chunk:
     #: 不参与向量化的附加文本：表格里的长文本列。随结果返回但没进 embedding，
     #: 也就不存在「超长被截断」这回事。取值与 `chunks` schema 的 `content_meta` 一致。
     content_meta: str = ""
+    #: 这片正文里出现过的图片地址，按出现顺序、去重前原样。**它不在正文里**——
+    #: 地址在切分之前就被摘走了（`strip_image_refs`），正文里留下的是替代文本。
+    #: 唯一的用处是答案里能显示原图（用户故事 52），既不参与向量化、
+    #: 也不随正文交给生成。网页来源是外链，MinerU 来源是对象 key（`ragamer.sources`）。
+    image_urls: tuple[str, ...] = ()
     #: `text` 正文 · `table` 结构化块（Markdown 表格、Infobox 与模板块）· `image` 图片。
     #: v1 的切分器只产出前两种：补图那一层是把图内文字**写回正文**（`ragamer.enriching`），
     #: 不另外产出图片切片——图片引用连同它的文字落在同一片正文里，答案里还能展示原图。
@@ -141,18 +152,59 @@ def chunk_document(markdown: str, rules: ChunkRules | None = None) -> list[Chunk
 def _piece_chunks(piece: _Piece, index: int, rules: ChunkRules) -> list[Chunk]:
     """把一段待切内容切成切片。
 
-    三种走法：表格自成一套切法；模板块整块留一片；其余按语义边界切。
+    三种走法：表格自成一套切法（它按单元格摘地址）；模板块整块留一片；其余按语义边界切。
     降级切分（`_flat_pieces`）只产出 `text` 片段——表格与模板本身就把文档判成有结构的。
+
+    图片地址在这一层就摘走，正文里只留替代文本（`strip_image_refs`）：地址留着会占满
+    字数预算，还会被下面的切分从中间切开——那会存下一条取不到原图的坏地址，不报错。
     """
     if piece.kind == "table":
         return _table_chunks(piece, index, rules)
+    text, refs = strip_image_refs(piece.text)
     if piece.kind == "template":
         # 切开就不是 Infobox 了，长度再超也不动它
-        return [Chunk(piece.text, index, piece.path, chunk_type="table")]
+        return [Chunk(text, index, piece.path, chunk_type="table", image_urls=_urls(refs))]
     return [
-        Chunk(text, index + offset, piece.path)
-        for offset, text in enumerate(_split(piece.text, rules))
+        Chunk(text, index + offset, piece.path, image_urls=urls)
+        for offset, (text, urls) in enumerate(_spread(text, _split(text, rules), refs))
     ]
+
+
+def _urls(refs: Sequence[ImageRef]) -> tuple[str, ...]:
+    return tuple(ref.ref for ref in refs)
+
+
+def _spread(
+    text: str, texts: Sequence[str], refs: Sequence[ImageRef]
+) -> list[tuple[str, tuple[str, ...]]]:
+    """把这一段里的图片地址分派给切出来的那几片正文。
+
+    分派看引用在这段正文里的**落点**：几片正文是这段的连续几刀，顺着往下走，
+    落点进了哪一片，地址就归哪一片。落点取自 `strip_image_refs`（在摘完地址的正文上算），
+    所以一条地址不可能横跨两片。
+
+    落点落在两片之间的空白上时归**前**一片：那处空白本来就在前一片的边界上。
+
+    一段切不出任何正文（整段都是图片、替代文本又都空着）时返回空列表，
+    地址跟着一起没有落点——那种段本来就没有可检索的正文，进不了库（见 `ragamer.importing`）。
+    """
+    if not texts:
+        return []
+    starts: list[int] = []
+    cursor = 0
+    for piece in texts:
+        cursor = max(text.find(piece, cursor), 0)
+        starts.append(cursor)
+        cursor += len(piece)
+    owned: list[list[str]] = [[] for _ in texts]
+    for ref in refs:
+        owned[_slot(starts, ref.end, len(texts))].append(ref.ref)
+    return [(piece, tuple(urls)) for piece, urls in zip(texts, owned, strict=True)]
+
+
+def _slot(starts: Sequence[int], position: int, count: int) -> int:
+    """落点落在第几片里。落点在整段开头的空白上时归第一片（`bisect_right` 会算出 -1）。"""
+    return min(max(bisect_right(starts, position) - 1, 0), count - 1)
 
 
 def probe_structure(markdown: str, rules: ChunkRules | None = None) -> StructureProbe:
@@ -375,24 +427,30 @@ def _source_line(block: _Block) -> str:
 
 @dataclass(frozen=True)
 class _Table:
-    """解析后的表格。单元格已去空白，转义的竖线留在原处。
+    """解析后的表格。单元格已去空白、已摘掉图片地址，转义的竖线留在原处。
 
     **结构归它自己**（`render`），**怎么切归下面的自由函数**：哪几列算长文本列、
     按什么分组都是切分策略，要跟着 `ChunkRules` 走，不该长在数据结构上。
+
+    `render` 收的是**行号**不是行本身：行里的图片地址要和它所在的那一片正文对上，
+    传行号才认得出是哪些格。
     """
 
     header: list[str]
     aligns: list[str]
     rows: list[list[str]]
+    #: 每一格的图片地址：`[0]` 是表头、`[1:]` 是数据行，形状与 `header` / `rows` 对齐。
+    #: 与单元格分开存，是因为渲染会把若干格拼成一片正文，而地址要跟着那片正文走。
+    cell_urls: list[list[tuple[str, ...]]]
 
-    def render(self, columns: Sequence[int], rows: Sequence[Sequence[str]]) -> str:
+    def render(self, columns: Sequence[int], rows: Sequence[int]) -> str:
         """按列投影渲回一张 Markdown 表格。
 
         单元格之间统一成一个空格：源表里那些对齐空格是给人看的，重排一次反而整齐。
         """
         head = [self.header[column] for column in columns]
         rule = [self.aligns[column] for column in columns]
-        body = [[_cell(row, column) for column in columns] for row in rows]
+        body = [[_cell(self.rows[index], column) for column in columns] for index in rows]
         return "\n".join("| " + " | ".join(line) + " |" for line in [head, rule, *body])
 
 
@@ -409,6 +467,9 @@ def _table_chunks(piece: _Piece, index: int, rules: ChunkRules) -> list[Chunk]:
       拆到两个地方，读的人对不上号。
     - **每一列都是长文本列时，正文只留表头骨架**，数据行全数进 meta：正文不能是空的
       （空了就检索不回来，meta 也就没机会随结果返回），但也不能拿长文本凑数。
+
+    图片地址按**格**摘（`_parse_table`），一片正文拿到的是它自己那些格里的地址——
+    留在正文里的话，一格只有一个图标也顶得上一篇正文的长度，长文本列还会判错。
     """
     table = _parse_table(piece.text)
     long_columns = _long_columns(table, rules)
@@ -416,7 +477,9 @@ def _table_chunks(piece: _Piece, index: int, rules: ChunkRules) -> list[Chunk]:
     # meta 里带上第一列：长列单拎出来之后，得知道哪一格属于哪一行
     meta_columns = sorted(long_columns | {0}) if long_columns else []
     # 一列都没剩下时不再分组：正文只剩骨架，分几组都一样，数据行整份进 meta
-    groups = _group_rows(table, kept_columns, rules) if kept_columns else [table.rows]
+    groups = (
+        _group_rows(table, kept_columns, rules) if kept_columns else [list(range(len(table.rows)))]
+    )
 
     chunks: list[Chunk] = []
     for rows in groups:
@@ -426,6 +489,7 @@ def _table_chunks(piece: _Piece, index: int, rules: ChunkRules) -> list[Chunk]:
                 chunk_index=index + len(chunks),
                 ancestor_path=piece.path,
                 content_meta=table.render(meta_columns, rows) if meta_columns else "",
+                image_urls=_table_urls(table, rows),
                 chunk_type="table",
             )
         )
@@ -437,18 +501,53 @@ def _skeleton(table: _Table) -> str:
     return table.render(range(len(table.header)), [])
 
 
+def _table_urls(table: _Table, rows: Sequence[int]) -> tuple[str, ...]:
+    """这一片正文里的图片地址：表头那一行 + 这几行数据行，按出现顺序去重。
+
+    **降级进 `content_meta` 的那些列也算**：meta 随结果一起交给生成，里面同样可以有图，
+    漏掉它答案里就会少显示几张。留下的列与降级的列合起来正好是全部列
+    （见 `_table_chunks`），所以这里按整行取即可。
+    """
+    lines = (0, *(index + 1 for index in rows))
+    return tuple(
+        dict.fromkeys(url for line in lines for cell in table.cell_urls[line] for url in cell)
+    )
+
+
 def _parse_table(text: str) -> _Table:
-    """把表格块拆成单元格。数据行比表头宽时把表头补到那么宽——多出来的格也是内容。"""
+    """把表格块拆成单元格，顺带把每格的图片地址摘出来。
+
+    数据行比表头宽时把表头补到那么宽——多出来的格也是内容。**先补宽再摘地址**：
+    补出来的空格本就该与别的格一样处理。
+    """
     head, rule, *rows = text.splitlines()
     header = _cells(head)
     body = [_cells(row) for row in rows]
     width = max(len(header), max((len(row) for row in body), default=0))
+    padded = [_pad(header, width), *(_pad(row, width) for row in body)]
+    stripped = [_strip_cells(row) for row in padded]
     aligns = [align or "---" for align in _cells(rule)]
     return _Table(
-        header=[*header, *([""] * (width - len(header)))],
+        header=stripped[0][0],
         aligns=[*aligns, *(["---"] * width)][:width],
-        rows=body,
+        rows=[cells for cells, _ in stripped[1:]],
+        cell_urls=[urls for _, urls in stripped],
     )
+
+
+def _pad(cells: Sequence[str], width: int) -> list[str]:
+    return [*cells, *([""] * (width - len(cells)))]
+
+
+def _strip_cells(cells: Sequence[str]) -> tuple[list[str], list[tuple[str, ...]]]:
+    """一格一格地摘图片地址：返回摘完的格与每格的地址（顺序与格一一对应）。"""
+    stripped: list[str] = []
+    urls: list[tuple[str, ...]] = []
+    for cell in cells:
+        text, refs = strip_image_refs(cell)
+        stripped.append(text)
+        urls.append(_urls(refs))
+    return stripped, urls
 
 
 def _cells(line: str) -> list[str]:
@@ -470,6 +569,10 @@ def _long_columns(table: _Table, rules: ChunkRules) -> set[int]:
     """哪几列算长文本列：表头或任一单元格超过 `long_cell_chars`。
 
     一格超长就整列降级：只挪走超长的那几格，同一列会在正文与 `content_meta` 里各留一半。
+
+    量的是**摘掉图片地址之后**的格（`_parse_table`）：一格只有一个图标时，地址比那一格
+    真正的文字还长，按原样量会把整整一列判成长文本列——列里的说明文字因此全被挪出正文，
+    而那正是这一列最该被检索到的东西。
     """
     long_columns = {
         column for column, name in enumerate(table.header) if len(name) > rules.long_cell_chars
@@ -481,21 +584,22 @@ def _long_columns(table: _Table, rules: ChunkRules) -> set[int]:
     return long_columns
 
 
-def _group_rows(table: _Table, columns: Sequence[int], rules: ChunkRules) -> list[list[list[str]]]:
-    """把数据行分组，每组配上表头之后不超过 `max_chars`。
+def _group_rows(table: _Table, columns: Sequence[int], rules: ChunkRules) -> list[list[int]]:
+    """把数据行分组（组里放的是**行号**），每组配上表头之后不超过 `max_chars`。
 
     量的是**渲染之后的正文**，只算留下的那几列：`content_meta` 不参与向量化，
-    长短与这一片的上限无关。
+    长短与这一片的上限无关。行号而不是行本身：图片地址要跟着行走到它落的那一片，
+    见 :meth:`_Table.render`。
 
     两个与正文切分不同的地方：单行自己就超长时让它独占一组，不把一行掰到两组里去；
     也不为了凑够下限把两组并回去——每块都带着表头，只剩一行也是读得懂的。
     """
-    groups: list[list[list[str]]] = []
-    for row in table.rows:
-        if groups and len(table.render(columns, [*groups[-1], row])) <= rules.max_chars:
-            groups[-1].append(row)
+    groups: list[list[int]] = []
+    for index in range(len(table.rows)):
+        if groups and len(table.render(columns, [*groups[-1], index])) <= rules.max_chars:
+            groups[-1].append(index)
         else:
-            groups.append([row])
+            groups.append([index])
     # 没有数据行也留一片：表头本身是内容，丢掉就等于把这张表删了
     return groups or [[]]
 

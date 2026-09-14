@@ -166,7 +166,10 @@ def test_切片正文里不残留折叠块标记():
     for marker in ("<details>", "</details>", "<summary>", "</summary>"):
         assert marker not in chunks[0].content
     assert "图内写着：血量 12000。" in chunks[0].content
-    assert "![](images/1.jpg)" in chunks[0].content
+    # 地址摘走了，正文里连它的空壳（`![]()`）都不该留下
+    assert "images/1.jpg" not in chunks[0].content
+    assert "![" not in chunks[0].content
+    assert chunks[0].image_urls == ("images/1.jpg",)
 
 
 def test_代码块里的折叠块标记原样保留():
@@ -333,6 +336,79 @@ def test_整段切完剩下的尾巴并回前一片():
     assert _sizes_are_sane(chunks)
     # 重新分一次只是挪了边界，正文一字不少（片首尾的空白不计）
     assert "".join(_contents(chunks)).replace("\n", "") == body.replace("\n", "")
+
+
+# --- 图片地址 ---
+
+
+def _urls(chunks) -> list[tuple[str, ...]]:
+    return [chunk.image_urls for chunk in chunks]
+
+
+def test_地址从正文里摘走而替代文本留下():
+    """地址留着会占满字数预算、还会进向量化；替代文本是这张图唯一的可检索文本
+    （补图那一层的视觉摘要正写在这里），不能连它一起去掉。"""
+    markdown = "# 打法\n\n先看图 ![三阶段立绘](https://wiki.example.com/a.png) 再往下打。\n"
+
+    chunks = chunk_document(markdown, RULES)
+
+    assert len(chunks) == 1
+    assert "https://wiki.example.com/a.png" not in chunks[0].content
+    assert "![" not in chunks[0].content
+    assert "先看图 三阶段立绘 再往下打。" == chunks[0].content
+    assert chunks[0].image_urls == ("https://wiki.example.com/a.png",)
+
+
+def test_地址不会被切分器从中间切开():
+    """地址比切片上限还长时，切完再摘会把它切两半——两半各自留在相邻两片里，
+    存下的是一条取不到原图的坏地址，而且不报错。"""
+    url = "https://patchwiki.biligame.com/images/wukong/" + "x" * 200 + ".png"
+    markdown = f"# 打法\n\n![图标]({url})\n\n" + "正文。" * 60
+
+    chunks = chunk_document(markdown, RULES)
+
+    assert all("patchwiki" not in chunk.content for chunk in chunks)
+    assert [url for chunk in chunks for url in chunk.image_urls] == [url]
+
+
+def test_地址归到它落的那一片():
+    """几片正文是同一段切出来的连续几刀，地址跟着落点走，不落到别的小节去。"""
+    body = "第一段。" * 30 + "\n\n![图](https://a.example.com/1.png)\n\n" + "第二段。" * 30
+    markdown = f"# 二郎神\n\n{body}\n"
+
+    chunks = chunk_document(markdown, RULES)
+
+    assert len(chunks) > 1
+    carrying = [index for index, urls in enumerate(_urls(chunks)) if urls]
+    assert carrying == [1], _contents(chunks)
+    assert chunks[1].image_urls == ("https://a.example.com/1.png",)
+
+
+def test_表格里的地址按格摘走():
+    """一格只有一个图标时，地址比那一格真正的文字还长：留着既占字数，
+    又会把整整一列判成长文本列（`_long_columns` 量的是摘完之后的格）。"""
+    markdown = (
+        "# 丹药\n"
+        "\n"
+        "| 名称 | 图标 | 说明 |\n"
+        "| --- | --- | --- |\n"
+        "| 碧藕金丹 | ![图标](https://a.example.com/18px-icon.png) | 回血 |\n"
+    )
+
+    chunks = chunk_document(markdown, RULES)
+
+    assert len(chunks) == 1
+    assert "https://a.example.com/18px-icon.png" not in chunks[0].content
+    assert "碧藕金丹" in chunks[0].content
+    assert chunks[0].image_urls == ("https://a.example.com/18px-icon.png",)
+
+
+def test_整段只有图片且没有替代文本时不产出空片():
+    """地址摘走之后一个字都不剩，写进库只会让检索冒出一条什么都没有的命中。
+    备了图片却没写摘要的那些图因此连地址一起落空——补图那一层给写摘要正是为此。"""
+    markdown = "# 图集\n\n![](https://a.example.com/1.png)\n\n![](https://a.example.com/2.png)\n"
+
+    assert chunk_document(markdown, RULES) == []
 
 
 # --- 边界 ---

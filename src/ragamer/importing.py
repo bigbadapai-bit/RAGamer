@@ -180,9 +180,11 @@ class ImportResult:
     doc_title: str
     #: 入库的切片数。
     chunk_count: int
-    #: 没有可向量化正文、因而没有入库的切片数。今天的切分器不会产出正文为空的切片
-    #: （`_split` 已经滤掉空段），补图那一层也不会——一张图补不上时那一行只留图片引用，
-    #: 不是留一片空白。所以这个数今天是 0，留着是因为它是界面要说清的一个口径。
+    #: 没有可向量化正文、因而没有入库的切片数。切分器会产出正文为空的切片，但只在一种
+    #: 情况下：一整段正文里只有图片，替代文本又都空着——图片地址在切分时就被摘走了
+    #: （`ragamer.chunking`），剩下的正文一个字都没有。这种段本来就没有可检索的正文，
+    #: 写进去只会让检索冒出一条什么都没有的命中。**备了图片却没有替代文本的图**
+    #: 因此会连它的地址一起没有落点，靠的是补图那一层给写摘要（`ragamer.enriching`）。
     skipped: int
     tags: CoveredTags
     #: 本地文件还是网址。界面据此决定重试时回填到哪个框里。
@@ -548,6 +550,7 @@ class Importer:
                     ),
                     content=content,
                     content_meta=item.chunk.content_meta,
+                    image_urls=item.chunk.image_urls,
                     ancestor_path=item.chunk.ancestor_path,
                     chunk_index=item.chunk.chunk_index,
                     subject_name=item.subject_name,

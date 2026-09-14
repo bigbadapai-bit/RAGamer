@@ -43,8 +43,10 @@ LONG_REPLY = "先定身再贴身输出[1]。二阶段躲开红光，等它收招
 #: 一份能切出多片的资料。导入那条路上用它。
 ARTICLE = "# 二郎神\n\n二郎神是隐藏 BOSS，需要三阶段打完。\n\n## 打法\n\n先定身，再贴身输出。\n"
 
-#: 正文里带图片的切片：图片地址随答案一起交回，缓存里也得有。
-WITH_IMAGE = "二郎神怎么打：先定身\n![打法](images/black_myth/boss.jpg)"
+#: 带着图片地址的切片：地址随答案一起交回，缓存里也得有。正文里没有它——
+#: 切分时就把地址摘到切片自己的字段上了（`ragamer.chunking`）。
+WITH_IMAGE = "二郎神怎么打：先定身\n打法"
+IMAGE_URLS = ("images/black_myth/boss.jpg",)
 
 
 def reader(store, llm, *, cache=None, embedder=None, reranker=None) -> CachedAnswerer:
@@ -67,7 +69,13 @@ def boss_chunks() -> InMemoryChunkStore:
     """本游戏的一批切片，外加另一款游戏的一条——跨游戏的键不该互相命中。"""
     store = chunk_store(
         GAME,
-        make_chunk(1, content=WITH_IMAGE, doc_title="二郎神", ancestor_path="二郎神 › 打法"),
+        make_chunk(
+            1,
+            content=WITH_IMAGE,
+            doc_title="二郎神",
+            ancestor_path="二郎神 › 打法",
+            image_urls=IMAGE_URLS,
+        ),
         make_chunk(
             2, content="二郎神的获取方式", doc_title="二郎神", ancestor_path="二郎神 › 获取方式"
         ),

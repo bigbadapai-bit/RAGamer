@@ -53,6 +53,11 @@ def probe_chunks() -> Iterator[list[Chunk]]:
             content="二郎神第一阶段的打法",
             subject_type=("character", "skill"),
             content_nature=("guide",),
+            # 数组字段的容量、元素长度与服务端的收法只有真库验得了
+            image_urls=(
+                "https://patchwiki.biligame.com/images/wukong/thumb/b/b1/x.png/18px-%E5%9B%BE%E6%A0%87.png",
+                "images/black_myth/0123456789abcdef/phase2.jpg",
+            ),
             dense_vector=fake_vector(1, DENSE_DIM),
             sparse_vector={1: 0.5, 7: 0.25},
         ),
@@ -91,6 +96,8 @@ def test_建表_写入_检索_取回_删表(settings: Settings, probe_chunks: li
         )
         assert [hit.chunk.chunk_id for hit in hits] == [1]
         assert hits[0].chunk.subject_type == ("character", "skill")
+        # 图片地址是数组字段，长度与顺序都要原样回来
+        assert hits[0].chunk.image_urls == probe_chunks[0].image_urls
 
         # 聚合父块走的那条路：按 doc_title 回查同文档的兄弟切片
         siblings = container.chunks.fetch_document(PROBE_GAME, "探针文档", version="1.0")

@@ -23,6 +23,7 @@ from ragamer.sources import (
     publish_assets,
     rewrite_image_refs,
     set_image_alt,
+    strip_image_refs,
 )
 from ragamer.stores.base import image_key, image_prefix
 from ragamer.stores.memory import InMemoryObjectStore
@@ -152,6 +153,55 @@ def test_alt_在_src_前面也读得出来():
     refs = image_refs_in('<img alt="甲" class="icon" src="a.png">')
 
     assert [(item.ref, item.alt) for item in refs] == [("a.png", "甲")]
+
+
+# --- 摘走地址 ---
+
+
+def test_摘地址时留下替代文本():
+    """地址的用处只有回显（由切片自己的字段带着走），替代文本是这张图唯一的
+    可检索文本——补图那一层的视觉摘要正写在这里。"""
+    text, refs = strip_image_refs("先看图 ![三阶段立绘](a.png) 再往下打。\n")
+
+    assert text == "先看图 三阶段立绘 再往下打。\n"
+    assert [(item.ref, item.alt) for item in refs] == [("a.png", "三阶段立绘")]
+
+
+def test_摘地址时连收尾的右括号一起摘():
+    """`_MD_IMAGE` 匹配到地址就停，不收那个 `)`——不咽它正文里会留一个孤零零的括号。"""
+    text, refs = strip_image_refs("![](a.png)")
+
+    assert text == ""
+    assert [item.ref for item in refs] == ["a.png"]
+
+
+def test_摘地址时两种形式都认():
+    text, refs = strip_image_refs('甲 ![乙](b.png) 丙 <img src="c.png" alt="丁"> 戊')
+
+    assert text == "甲 乙 丙 丁 戊"
+    assert [item.ref for item in refs] == ["b.png", "c.png"]
+
+
+def test_嵌在链接里的图摘完还剩一个正常的链接():
+    """攻略站常见写法：缩略图外面套一层指向大图的链接。"""
+    text, refs = strip_image_refs("[![大图](https://x/a_S.jpg)](https://p/show?https://x/a.jpg)")
+
+    assert text == "[大图](https://p/show?https://x/a.jpg)"
+    assert [item.ref for item in refs] == ["https://x/a_S.jpg"]
+
+
+def test_摘地址后的落点是结果正文里的位置():
+    """切分器靠它把地址分派到切出来的那几片上，所以量的必须是**摘完**的正文。"""
+    text, refs = strip_image_refs("前面 ![甲](a.png) 中间")
+
+    assert text[: refs[0].end] == "前面 甲"
+
+
+def test_没有图片时正文一字不动():
+    text, refs = strip_image_refs('光有正文。\n\n<img class="icon">\n')
+
+    assert text == '光有正文。\n\n<img class="icon">\n'
+    assert refs == ()
 
 
 # --- 写替代文本 ---

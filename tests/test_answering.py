@@ -391,15 +391,19 @@ def test_问题没点名版本时用知识库标的现行版本():
 # --- 图片 ---
 
 
-def test_答案带出内容里的图片地址():
-    """图片留在正文里（§1.3），随答案一起交回，用户不必跳出去找原图。
-    `content_meta` 里的也算：表格的长文本列整列降级在那里。"""
+def test_答案带出切片自己的图片地址():
+    """图片地址取自切片自己的字段，随答案一起交回，用户不必跳出去找原图。
+
+    **不是从正文里扫出来的**：地址在切分时就摘走了（`ragamer.chunking`），
+    正文里只有替代文本。落在 `content_meta` 里的图（表格的长文本列整列降级在那里）
+    同样进这个字段，所以这里只认字段、不看它来自哪一段正文。"""
     store = chunk_store(
         GAME,
         make_chunk(
             1,
-            content="二郎神怎么打\n![打法](images/black_myth/boss.jpg)",
-            content_meta="| 图 | ![](images/black_myth/phase2.jpg) |",
+            content="二郎神怎么打\n打法",
+            content_meta="| 图 | 第二形态 |",
+            image_urls=("images/black_myth/boss.jpg", "images/black_myth/phase2.jpg"),
         ),
     )
     llm = FakeLlm(REPLY)
@@ -415,8 +419,12 @@ def test_答案带出内容里的图片地址():
 def test_同一张图出现两次只交回一次():
     store = chunk_store(
         GAME,
-        make_chunk(1, content="二郎神怎么打\n![](images/black_myth/boss.jpg)", chunk_index=1),
-        make_chunk(2, content="![](images/black_myth/boss.jpg)", chunk_index=2),
+        make_chunk(
+            1, content="二郎神怎么打", chunk_index=1, image_urls=("images/black_myth/boss.jpg",)
+        ),
+        make_chunk(
+            2, content="第二阶段", chunk_index=2, image_urls=("images/black_myth/boss.jpg",)
+        ),
     )
     llm = FakeLlm(REPLY)
 
@@ -491,7 +499,7 @@ def test_流式与一次给全用的是同一批引用与图片():
     图片同理：命中缓存与否会给出两种结果，说的就是这一条。"""
     store = chunk_store(
         GAME,
-        make_chunk(1, content="二郎神怎么打\n![](images/black_myth/boss.jpg)"),
+        make_chunk(1, content="二郎神怎么打", image_urls=("images/black_myth/boss.jpg",)),
     )
 
     whole = answerer(store, FakeLlm(REPLY)).answer(QUESTION, game_id=GAME, version="1.0")

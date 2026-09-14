@@ -517,8 +517,12 @@ def test_没有正文的切片不入库并计入跳过(monkeypatch):
 # --- 解析产物里的附件 ---
 
 
-def test_附件存进对象存储_正文里的引用改指对象_key():
-    """独立上传的截图走的正是这条路：图先落对象存储，切片正文里留的是它的 key。"""
+def test_附件存进对象存储_切片带着对象_key():
+    """独立上传的截图走的正是这条路：图先落对象存储，切片带着它的 key。
+
+    key 落在切片的 `image_urls` 上而**不在正文里**：正文里只有替代文本，地址是由
+    这一路单独带着去回显的（`ragamer.chunking`）。
+    """
     chunks = InMemoryChunkStore()
     objects = InMemoryObjectStore()
     importer = make_importer(chunks, parser=StubParser(scanned_doc()), objects=objects)
@@ -529,7 +533,8 @@ def test_附件存进对象存储_正文里的引用改指对象_key():
     keys = objects.list_keys(image_prefix(GAME))
     assert len(keys) == 1
     assert objects.get(keys[0]) == b"PNG"
-    assert all(keys[0] in chunk.content for chunk in stored(chunks))
+    assert all(keys[0] in chunk.image_urls for chunk in stored(chunks))
+    assert all(keys[0] not in chunk.content for chunk in stored(chunks))
 
 
 def test_同一份资料重导_图片原样覆盖同一个对象():

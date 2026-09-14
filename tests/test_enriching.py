@@ -362,9 +362,13 @@ def test_独立上传的截图从解析到切片全走一遍():
     assert result.ok, result.error
     stored = chunks.fetch_document("blackmyth", "论坛帖", version="")
     content = "\n".join(chunk.content for chunk in stored)
-    # 原图换成对象 key 之后仍然留在正文里，答案里展示得出来
-    assert f"![一张论坛帖截图]({image_refs(content)[0]})" in content
-    assert image_refs(content)[0].startswith("images/blackmyth/")
+    # 原图换成对象 key 之后落在切片的图片地址字段上，答案里展示得出来；正文里不再有它
+    urls = [url for chunk in stored for url in chunk.image_urls]
+    assert len(urls) == 1
+    assert urls[0].startswith("images/blackmyth/")
+    assert "![" not in content
+    # 视觉摘要写进替代文本，摘走地址之后它是这张图唯一的可检索文本
+    assert "一张论坛帖截图" in content
     # 图内文字进了切片，检索得到
     assert chunk_document(content), "正文切不出切片"
     assert any("躲横扫" in chunk.content for chunk in chunk_document(content))

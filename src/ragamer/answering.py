@@ -52,7 +52,6 @@ from ragamer.logging import get_logger
 from ragamer.query import version_filter
 from ragamer.retrieval import ParentBlock, aggregate_parents, retrieve
 from ragamer.routing import Route
-from ragamer.sources import image_refs
 from ragamer.stores.base import Chunk, ChunkStore
 from ragamer.vectors.base import Embedder, Reranker
 from ragamer.websearch import WebResult, WebSearch
@@ -164,6 +163,10 @@ class _Source:
 
     citation: Citation
     text: str
+    #: 这条来源带出来的图片地址。语料里的取自切片自己的字段（:func:`_block_images`），
+    #: 网络来源没有——搜索服务给的是一段摘要，没有图片可言。**地址不进 `text`**：
+    #: 它唯一的去处是答案下面那排图，不该占着模型的上下文。
+    images: tuple[str, ...] = ()
 
 
 def require_question(question: str) -> None:
@@ -187,7 +190,9 @@ class Answer:
     调用方不必另外判断有没有答案——空引用就是那个信号。
 
     `images` 是交给生成的那批内容里出现过的图片地址：答案里要能直接展示原图，
-    用户不必跳出去找（用户故事 52）。它是**跟着引用走**的，不是另一次检索的结果。
+    用户不必跳出去找（用户故事 52）。它是**跟着引用走**的，不是另一次检索的结果——
+    地址跟着切片走（`Chunk.image_urls`），切片跟着父块走，父块跟着引用走。
+    正文里没有它们：地址在切分时就摘走了（`ragamer.chunking`）。
     """
 
     text: str
@@ -264,7 +269,11 @@ def _numbered(blocks: Sequence[ParentBlock], web: Sequence[WebResult]) -> tuple[
     中间还有没给它的东西。
     """
     sources = [
-        _Source(Citation(index, block.doc_title, block.ancestor_path), _prompt_text(block))
+        _Source(
+            Citation(index, block.doc_title, block.ancestor_path),
+            _prompt_text(block),
+            _block_images(block),
+        )
         for index, block in enumerate(blocks, start=1)
     ]
     sources += [
@@ -306,16 +315,23 @@ def _chunk_text(chunk: Chunk) -> str:
     return f"{chunk.content}\n{meta}" if meta else chunk.content
 
 
+def _block_images(block: ParentBlock) -> tuple[str, ...]:
+    """一个父块带出来的图片地址：块内每条切片自己的，按源文档顺序去重。
+
+    切片里的地址是**切分时从正文摘下来的**（`ragamer.chunking`），不再拿正则扫一遍
+    正文——正文里已经没有地址了。所以这里是读字段，不是从交给模型的那段文字里挑。
+    """
+    return tuple(dict.fromkeys(url for chunk in block.chunks for url in chunk.image_urls))
+
+
 def _image_urls(sources: Sequence[_Source]) -> tuple[str, ...]:
     """交给生成的这批内容里出现过的图片地址，按首次出现的顺序去重。
 
-    图片地址本来就留在正文里（§1.3：原图保留，供答案展示），所以这里是从**已经要
-    交给模型的那批内容**里取，不是另查一次——另查一次就会与引用对不上。
-    `content_meta` 也算：表格的长文本列整列降级在那里（§2.5），里面同样可以有图。
-
-    认什么样的图片引用由 `ragamer.sources.image_refs` 定，与补图那一层同一处正则。
+    **跟着引用走**：哪几条内容进得了提示词，它们带的图就在答案里显示。各来源自己的
+    图片在组装来源清单时就定下了（`_numbered`），这里只做去重与排序——同一个地址
+    经两个父块交回来是常事（同文档的两个小节各带一次）。
     """
-    return tuple(dict.fromkeys(url for source in sources for url in image_refs(source.text)))
+    return tuple(dict.fromkeys(url for source in sources for url in source.images))
 
 
 @dataclass(frozen=True)

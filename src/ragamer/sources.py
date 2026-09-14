@@ -243,6 +243,72 @@ def image_refs(markdown: str) -> tuple[str, ...]:
     return tuple(item.ref for item in image_refs_in(markdown))
 
 
+def strip_image_refs(text: str) -> tuple[str, tuple[ImageRef, ...]]:
+    """把图片地址从正文里摘走，只留替代文本；返回摘完的正文与各处引用的落点。
+
+    地址留在正文里是有代价的：它占满切片的字数预算，还会进向量化——一个词条页上百个
+    图标时，正文里大半是地址（实测 black_myth 库里 77.6% 的字符）。而地址唯一的用处是
+    「答案里能显示原图」，那件事由切片自己的图片地址字段单独带着走
+    （`ragamer.stores.base.Chunk.image_urls`）。
+
+    **替代文本留下**：它是这张图唯一的可检索文本（`ragamer.enriching` 的视觉摘要正写在
+    这里），连它一起去掉，图里没有文字的那些图就再也搜不到了。
+
+    **在切分之前调用**：切完再摘的话，一条比切片上限还长的地址会被切分器从中间切开，
+    两半各自留在相邻的两片正文里，存下一条取不到原图的坏地址，而且不报错。
+    地址现在不进正文，切分器也就没有机会切到它。
+
+    返回的 `ImageRef.end` 是在**结果正文**里的落点——与 :func:`image_refs_in` 的 `end`
+    不同，那个是在入参正文里的。落点供切分器把地址分派到切出来的那几片上，
+    见 `ragamer.chunking`。
+    """
+    found: list[tuple[int, re.Match[str], bool]] = [
+        (match.start(), match, True) for match in _MD_IMAGE.finditer(text)
+    ]
+    found += [(match.start(), match, False) for match in _HTML_IMAGE.finditer(text)]
+    found.sort(key=lambda item: item[0])
+
+    out: list[str] = []
+    refs: list[ImageRef] = []
+    cursor = 0
+    written = 0
+    for start, match, markdown_ref in found:
+        # 两种形式叠在同一处时以先出现的那个为准：剩下的半个已经不是引用了
+        if start < cursor:
+            continue
+        if markdown_ref:
+            alt, ref = match.group(1), match.group(3)
+        else:
+            src = _HTML_SRC.search(match.group(0))
+            if src is None:
+                # 没有 `src` 的 `<img>` 不是引用（`_html_image_ref` 同一条口径），原样留着
+                continue
+            ref = src.group(1)
+            written_alt = _HTML_ALT.search(match.group(0))
+            alt = written_alt.group(1) if written_alt is not None else ""
+        out.append(text[cursor:start])
+        written += start - cursor
+        cursor = _end_of_ref(text, match, markdown_ref)
+        out.append(alt)
+        written += len(alt)
+        refs.append(ImageRef(ref, written, alt))
+    out.append(text[cursor:])
+    return "".join(out), tuple(refs)
+
+
+def _end_of_ref(text: str, match: re.Match[str], markdown_ref: bool) -> int:
+    """一处引用到哪一列为止。
+
+    Markdown 那种的匹配到地址就停了（`_MD_IMAGE` 不收右括号），收尾的那个 `)` 因此要
+    自己咽掉——不咽它就会留在正文里，`![](images/1.jpg)` 被摘成孤零零一个 `)`。
+    `[![说明](图.jpg)](页面)` 这种嵌在链接里的图咽掉之后正好剩 `[说明](页面)`，
+    是一个正常的链接，不必另外处理。
+    """
+    if markdown_ref and text[match.end() : match.end() + 1] == ")":
+        return match.end() + 1
+    return match.end()
+
+
 def set_image_alt(markdown: str, alt_by_ref: Mapping[str, str]) -> str:
     """给替代文本空着的图片引用写上替代文本。两种形式都写。
 

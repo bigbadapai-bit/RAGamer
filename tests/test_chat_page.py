@@ -32,15 +32,17 @@ OTHER_KB = {"name": "燕云十六声", "version": "3.0", "subject_types": ["char
 
 QUESTION = "二郎神怎么打"
 REPLY = "先定身再贴身输出[1]。"
-#: 正文里带着原图的切片。原图地址就是对象 key（§1.2），页面按 `/images/…` 取。
+#: 带着原图的切片。原图地址就是对象 key（§1.2），页面按 `/images/…` 取。
+#: **地址在切片自己的字段上，不在正文里**——正文里只有替代文本（`ragamer.chunking`）。
 IMAGE = "images/black_myth/abcdef/phase2.jpg"
 #: 一张「图」的字节。这一层验的是取图这条缝，不是解码，所以内容随便给。
 PNG = b"\x89PNG\r\n\x1a\n pretend-this-is-a-picture"
 DOC = make_chunk(
     1,
-    content=f"二郎神掉落三尖两刃刀\n![打法]({IMAGE})",
+    content="二郎神掉落三尖两刃刀\n打法",
     doc_title="二郎神",
     ancestor_path="二郎神 › 掉落",
+    image_urls=(IMAGE,),
 )
 
 
