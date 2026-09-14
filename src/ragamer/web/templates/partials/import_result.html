@@ -5,11 +5,63 @@
 
   还在跑的时候，这一块**自己往下续**：根元素带 hx-get + every 1s，换的是它自己
   （outerHTML）。跑到哪就渲染到哪，跑完那一份不带这两个属性，轮询自然停。
+
+  一次只跑一批，所以这一块里可能有**两块回执**：正在跑的那批（`result`）与排在它后面的
+  那几批（`result.behind`，工作线程一次只取一批）。后者在轮到自己之前一条进度都没有，
+  把它们自己的回执一并摆出来，提交完才看得见「我交的那批在队里」。
 #}
 {% if notice %}
 {# 片段自己那条消息。整页那一路由 base.html 顶上的位置说，不走这里——两处都渲染就是说两遍 #}
 <p class="mb-6 rounded border border-red-300 bg-red-50 px-4 py-3 text-sm text-red-800">{{ notice }}</p>
 {% endif %}
+
+{# 一批里每一条的样子。两块回执共用它：排在后面的那批也要看得见自己交了什么。 #}
+{% macro batch_rows(rows) %}
+<ul class="space-y-3">
+  {% for row in rows %}
+  <li data-source="{{ row.source }}" class="border-t border-slate-200 pt-3 first:border-0 first:pt-0">
+    <div class="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
+      <span class="text-sm font-medium">{{ row.source }}</span>
+      {% if row.status == "ok" %}
+      <span class="text-sm text-green-700">{{ row.status_label }}</span>
+      {% elif row.status == "failed" %}
+      <span class="text-sm text-red-700">{{ row.status_label }}</span>
+      {% else %}
+      <span class="text-sm text-slate-500">{{ row.status_label }}</span>
+      {% endif %}
+    </div>
+
+    {# 走过的阶段就是这一条的进度：卡在归一化的那条不该显示它走过切分 #}
+    {% if row.steps %}
+    <p class="mt-1 text-xs {% if row.status == 'failed' %}text-red-700{% else %}text-slate-500{% endif %}">
+      走到：{{ row.steps | join(" › ") }}
+    </p>
+    {% endif %}
+
+    {% if row.status == "ok" %}
+    <p class="mt-1 text-sm text-slate-600">
+      《{{ row.doc_title }}》· 入库 {{ row.chunk_count }} 条{% if row.skipped %}，跳过 {{ row.skipped }} 条{% endif %}
+    </p>
+    <p class="mt-1 text-xs text-slate-500">
+      主体名 {{ row.subject_name or empty }}
+      {%- if row.subject_types %} · 主体类型 {{ row.subject_types | join("、") }}{% endif %}
+      {%- if row.content_natures %} · 内容性质 {{ row.content_natures | join("、") }}{% endif %}
+    </p>
+    <p class="mt-2 text-sm">
+      <a class="underline" href="{{ row.preview_url }}">看切分结果</a>
+    </p>
+    {% elif row.status == "failed" %}
+    <p class="mt-1 text-sm text-red-700">卡在「{{ row.stage_label }}」：{{ row.error }}</p>
+    {% if row.collides_with %}
+    <p class="mt-1 text-xs text-slate-500">
+      这一条不能靠重试解决：单独重试它，它就成了这一批里唯一的一条，写下去会把它撞赢的那份整份替掉。
+    </p>
+    {% endif %}
+    {% endif %}
+  </li>
+  {% endfor %}
+</ul>
+{% endmacro %}
 
 {% if result %}
 <section class="rounded border border-slate-200 bg-white p-5"
@@ -34,50 +86,7 @@
   </p>
   {% endif %}
 
-  <ul class="space-y-3">
-    {% for row in result.rows %}
-    <li data-source="{{ row.source }}" class="border-t border-slate-200 pt-3 first:border-0 first:pt-0">
-      <div class="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
-        <span class="text-sm font-medium">{{ row.source }}</span>
-        {% if row.status == "ok" %}
-        <span class="text-sm text-green-700">{{ row.status_label }}</span>
-        {% elif row.status == "failed" %}
-        <span class="text-sm text-red-700">{{ row.status_label }}</span>
-        {% else %}
-        <span class="text-sm text-slate-500">{{ row.status_label }}</span>
-        {% endif %}
-      </div>
-
-      {# 走过的阶段就是这一条的进度：卡在归一化的那条不该显示它走过切分 #}
-      {% if row.steps %}
-      <p class="mt-1 text-xs {% if row.status == 'failed' %}text-red-700{% else %}text-slate-500{% endif %}">
-        走到：{{ row.steps | join(" › ") }}
-      </p>
-      {% endif %}
-
-      {% if row.status == "ok" %}
-      <p class="mt-1 text-sm text-slate-600">
-        《{{ row.doc_title }}》· 入库 {{ row.chunk_count }} 条{% if row.skipped %}，跳过 {{ row.skipped }} 条{% endif %}
-      </p>
-      <p class="mt-1 text-xs text-slate-500">
-        主体名 {{ row.subject_name or empty }}
-        {%- if row.subject_types %} · 主体类型 {{ row.subject_types | join("、") }}{% endif %}
-        {%- if row.content_natures %} · 内容性质 {{ row.content_natures | join("、") }}{% endif %}
-      </p>
-      <p class="mt-2 text-sm">
-        <a class="underline" href="{{ row.preview_url }}">看切分结果</a>
-      </p>
-      {% elif row.status == "failed" %}
-      <p class="mt-1 text-sm text-red-700">卡在「{{ row.stage_label }}」：{{ row.error }}</p>
-      {% if row.collides_with %}
-      <p class="mt-1 text-xs text-slate-500">
-        这一条不能靠重试解决：单独重试它，它就成了这一批里唯一的一条，写下去会把它撞赢的那份整份替掉。
-      </p>
-      {% endif %}
-      {% endif %}
-    </li>
-    {% endfor %}
-  </ul>
+  {{ batch_rows(result.rows) }}
 
   {% if result.retry.urls or result.retry.files %}
   {#
@@ -86,7 +95,7 @@
     「这一提交会带上什么」说清楚。这张表单与上面那张提交到同一个端点，走的还是同一条链路。
   #}
   <form id="import-retry" method="post" action="/import" enctype="multipart/form-data"
-        hx-post="/import" hx-encoding="multipart/form-data"
+        hx-post="/import" hx-encoding="multipart/form-data" hx-disabled-elt="find button"
         hx-target="#import-result" hx-swap="innerHTML" hx-indicator="#import-busy"
         class="mt-6 space-y-4 border-t border-slate-200 pt-4">
     <h3 class="text-sm font-medium">重试这些</h3>
@@ -124,5 +133,17 @@
     </ul>
   </div>
   {% endif %}
+
+  {#
+    排在后面还没轮到的批次：**它们自己的回执**。只显示正在跑的那批的话，人提交完看到的
+    就是「我提交了但屏幕上没有它」——实测会因此再点一次提交（两个任务内容一模一样）。
+  #}
+  {% for waiting in result.behind %}
+  <div class="mt-6 rounded border border-amber-200 bg-amber-50 p-4">
+    <h3 class="mb-1 text-sm font-medium text-amber-900">排队中</h3>
+    <p class="mb-3 text-sm text-amber-800">{{ waiting.headline }}</p>
+    {{ batch_rows(waiting.rows) }}
+  </div>
+  {% endfor %}
 </section>
 {% endif %}

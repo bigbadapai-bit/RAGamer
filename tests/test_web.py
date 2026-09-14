@@ -440,6 +440,58 @@ def test_不带脚本时提交完跳到任务页_整页自己刷(gated, gate):
     assert '<noscript><meta http-equiv="refresh"' not in done.text  # 跑完就不刷了
 
 
+def test_在跑的那批与排队的那批同时显示(gated, gate):
+    """连着提交几批时，屏幕上换成刚交的那批的话，正在跑的那批进度就整块消失了；而反过来
+    只显示正在跑的那批，人又看不见自己刚交的那批——会以为没提交上，再点一次
+    （实测发生过，两个任务内容一模一样）。所以两块回执同时摆出来。
+    """
+    first = submit(gated, upload("甲.md"), upload("白龙马.md", DRAGON))
+    assert gate.entered.wait(timeout=JOB_TIMEOUT)
+
+    second = submit(gated, upload("二郎神.md"))
+
+    # 正在跑的那批：它的进度还在（第一批停在向量化那一步）
+    assert "正在向量化" in second.text
+    assert job_id_of(first) in second.headers["HX-Push-Url"]
+    # 刚交的那批：自己的回执也在，标着排队中，条目逐个列出来
+    assert "排队中" in second.text
+    assert "共 1 条，排队中" in second.text
+    assert "二郎神.md" in second.text
+
+    gate.opened.set()
+    wait_for_done(gated, job_id_of(first), page=True)
+    wait_for_done(gated, job_id_of(second), page=True)
+
+
+def test_轮到之后排队那块就不见了(gated, gate):
+    """第一批跑完之后第二批被取走：屏幕上只剩正在跑的那批，不再有「排队中」那一块。"""
+    first = submit(gated, upload("甲.md"))
+    assert gate.entered.wait(timeout=JOB_TIMEOUT)
+    second = submit(gated, upload("二郎神.md"))
+    assert "排队中" in second.text
+
+    gate.opened.set()
+    wait_for_done(gated, job_id_of(first), page=True)
+
+    # 第二批已经被工作线程取走了：它自己的那一份回执变成「跑着」，不再是排队中
+    queued = 0
+    for _ in range(60):
+        page = gated.get(f"/import/result?job={job_id_of(second)}", headers={"HX-Request": "true"})
+        queued = page.text.count("排队中")
+        if not queued:
+            break
+        time.sleep(0.05)
+    assert queued == 0, page.text
+    wait_for_done(gated, job_id_of(second), page=True)
+
+
+def test_提交按钮在请求期间被禁掉(gated):
+    """连点两下的结果是同一批内容提交两次，第二次那批白排一遍队。"""
+    page = gated.get(f"/import?game_id={GAME}").text
+
+    assert 'hx-disabled-elt="find button"' in page
+
+
 def test_切走再切回来还看得见在跑的那一批(gated, gate):
     """导入在后台跑，地址栏里那个任务号却不跟着人走：切到别的页再切回来只剩库了。
     这一批还在跑，就该接着显示它——而不是一张什么都没有的空表单。"""

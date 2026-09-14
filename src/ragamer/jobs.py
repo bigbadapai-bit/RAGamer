@@ -75,6 +75,9 @@ class JobSnapshot:
     items: tuple[JobItem, ...]
     #: 整批都跑完了（不管是全部成功还是各有各的失败）。
     finished: bool = False
+    #: 还没轮到它：工作线程一次跑一批，它排在别人后面。界面据此把它标成「排队中」，
+    #: 而不是与刚被取走的那批混为一谈（两者的条目上都没有任何进度事件）。
+    queued: bool = False
     #: 整批压根没跑起来的原因（例如给了网址却没接抓取器）。它与单条的失败不是一回事。
     error: str = ""
 
@@ -114,6 +117,7 @@ class _Job:
         self.vocabulary = vocabulary
         self._items = [(source, kind, (), None) for source, kind in items]
         self._finished = False
+        self._started = False
         self._error = ""
         self._lock = threading.Lock()
 
@@ -124,6 +128,15 @@ class _Job:
             if 0 <= index < len(self._items):
                 source, kind, stages, result = self._items[index]
                 self._items[index] = (source, kind, (*stages, event.stage), result)
+
+    def start(self) -> None:
+        """工作线程把它取走了。**「排队中」与「刚开始跑」在快照上分得开**靠的就是这一笔。
+
+        两者都没有任何进度事件，光看条目分不出：刚被取走的那批界面上还没走到第一步，
+        说它「排队中」是错的（它前面已经没有别人了）。
+        """
+        with self._lock:
+            self._started = True
 
     def finish(self, results: Sequence[ImportResult]) -> None:
         """一批跑完了。结果按提交顺序对上每一条。"""
@@ -156,6 +169,12 @@ class _Job:
         with self._lock:
             return self._finished
 
+    @property
+    def queued(self) -> bool:
+        """还没轮到它：工作线程没取走、也没跑完。"""
+        with self._lock:
+            return not self._started and not self._finished
+
     def snapshot(self) -> JobSnapshot:
         with self._lock:
             return JobSnapshot(
@@ -164,6 +183,7 @@ class _Job:
                 version=self.version,
                 items=tuple(JobItem(*item) for item in self._items),
                 finished=self._finished,
+                queued=not self._started and not self._finished,
                 error=self._error,
             )
 
@@ -246,6 +266,27 @@ class ImportJobs:
         running = [job for job in candidates if not job.finished]
         return (running[0] if running else candidates[-1]).snapshot()
 
+    def queued_behind(self, job_id: str) -> tuple[JobSnapshot, ...]:
+        """这条任务后面还**排着**的批次，按提交顺序（只算还没被取走的）。
+
+        工作线程一次跑一批，所以「我刚提交的那批」在轮到自己之前一条进度都没有。界面上
+        把它们的回执一并摆出来（见 `ragamer.web.pages._job_view`）：提交完就能看见
+        「我交的那批在队里、共几条」，而不是只有正在跑的那批。
+
+        认不出这个任务号时返回空元组：那一页会说「这个任务不在了」，不必再多一句。
+        """
+        with self._lock:
+            jobs = list(self._jobs.items())
+        behind = False
+        waiting: list[JobSnapshot] = []
+        for other_id, job in jobs:
+            if other_id == job_id:
+                behind = True
+                continue
+            if behind and job.queued:
+                waiting.append(job.snapshot())
+        return tuple(waiting)
+
     def _forget_old(self) -> None:
         """超出 history 就从最早的开始丢，**只丢跑完的**——在跑的丢掉就没人认得出它了。"""
         for job_id, job in list(self._jobs.items()):
@@ -265,6 +306,7 @@ class ImportJobs:
         """工作线程：一批接一批地跑，**一批炸了不能让线程死掉**——死了队列就永远堵着。"""
         while True:
             job = self._queued.get()
+            job.start()
             try:
                 self._run(job)
             except Exception as exc:  # 兜住是这一层的职责，理由同上

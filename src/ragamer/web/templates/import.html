@@ -23,9 +23,12 @@
     action／method 与 hx-post 同时写着，这不是冗余：htmx 在时它接管提交、只换下面那张结果表；
     htmx 不在（脚本没加载出来）时浏览器走原生提交，回的是同一份结果的整页。
     文件与网址是同一次提交的两半，所以只有一张表单、一个提交按钮。
+
+    `hx-disabled-elt` 把提交按钮在请求期间禁掉：连着点两下的结果是**同一批内容提交两次**
+    （实测发生过，两个任务内容一模一样），而第二次那批要排在第一次后面白等一遍。
   #}
   <form method="post" action="/import" enctype="multipart/form-data"
-        hx-post="/import" hx-encoding="multipart/form-data"
+        hx-post="/import" hx-encoding="multipart/form-data" hx-disabled-elt="find button"
         hx-target="#import-result" hx-swap="innerHTML" hx-indicator="#import-busy"
         class="space-y-4">
     <div class="grid gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_minmax(0,2fr)]">

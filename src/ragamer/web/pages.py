@@ -311,7 +311,11 @@ def create_router(container: Container, stack: ChatStack) -> APIRouter:
             {
                 "result": None
                 if snapshot is None
-                else _job_view(snapshot, accept=_accept(container)),
+                else _job_view(
+                    snapshot,
+                    accept=_accept(container),
+                    behind=jobs.queued_behind(snapshot.job_id),
+                ),
                 "notice": "" if snapshot is not None else _GONE,
                 "empty": EMPTY,
             },
@@ -389,18 +393,29 @@ def create_router(container: Container, stack: ChatStack) -> APIRouter:
             version=version or UNVERSIONED,
             vocabulary=vocabulary,
         )
-        where = f"/import?{urlencode({'game_id': game_id, 'job': job_id})}"
+        # **显示正在跑的那一批，不是刚提交的这批**（`jobs.latest`）：同一次会话里连着提交
+        # 几批时，刚交的那批多半还在排队，屏幕上换成它的话，正在跑的那批进度就整块消失了
+        # ——而人还会以为没提交上，再点一次（实测发生过）。刚交的那批排在哪，由结果区里
+        # 那一行「后面还排着…」说（`_queued_text`）。
+        shown = jobs.latest(game_id) or jobs.snapshot(job_id)
+        where = f"/import?{urlencode({'game_id': game_id, 'job': shown.job_id})}"
         if request.headers.get("HX-Request"):
             response = templates.TemplateResponse(
                 request,
                 "partials/import_result.html",
                 {
-                    "result": _job_view(jobs.snapshot(job_id), accept=_accept(container)),
+                    "result": _job_view(
+                        shown,
+                        accept=_accept(container),
+                        behind=jobs.queued_behind(shown.job_id),
+                    ),
                     "notice": "",
                     "empty": EMPTY,
                 },
             )
-            # 地址栏跟着变：刷新之后还看得见这一批，而不是回到一张空表单
+            # 地址栏跟着变：刷新之后还看得见这一批，而不是回到一张空表单。
+            # 推的是**显示出来的那个任务号**：推刚提交那个的话，刷新会换成排队中那批，
+            # 地址栏与屏幕上的东西就对不上了
             response.headers["HX-Push-Url"] = where
             return response
         # 不带脚本那条路：提交 → 重定向 → 重新渲染（与本仓别的写入路径同一条规矩）
@@ -1188,7 +1203,13 @@ def _import_page(
         version=version,
         accept=_accept(container),
         message=message,
-        result=None if snapshot is None else _job_view(snapshot, accept=_accept(container)),
+        result=None
+        if snapshot is None
+        else _job_view(
+            snapshot,
+            accept=_accept(container),
+            behind=jobs.queued_behind(snapshot.job_id),
+        ),
         # 跑着的时候整页自己刷新（没脚本那条路的进度）；有 htmx 时不需要它
         running=bool(snapshot is not None and snapshot.running),
         status_code=status_code,
@@ -1300,12 +1321,20 @@ def _status_of(exc: Exception) -> int:
     return int(getattr(exc, "status", 400))
 
 
-def _job_view(snapshot: JobSnapshot, *, accept: str) -> dict[str, Any]:
+def _job_view(
+    snapshot: JobSnapshot, *, accept: str, behind: Sequence[JobSnapshot] = ()
+) -> dict[str, Any]:
     """一个导入任务在界面上的样子。跑着的、跑完的、整批没跑起来的，都用同一份形状。
 
     跑着的每一秒被重新渲染一次（htmx 轮询这个片段），所以这里**不许有副作用**，
     也不要在模板里做判断——数字与句子都在这里算好。任务号认不出来时**不叫它**：
     由调用方统一说「这个任务不在了」那一句。
+
+    `behind` 是这一批后面**排着**的那几批（`ImportJobs.queued_behind`）：工作线程一次
+    跑一批，它们在轮到自己之前一条进度都没有，所以要把它们自己的回执一并摆出来——
+    只显示正在跑的那批的话，人刚提交完看到的就是「我提交了但屏幕上没有它」。
+
+    **不往下递归**：排在后面的批次的 `behind` 一律留空（它们后面还有什么，等轮到了再说）。
     """
     results = list(snapshot.results)
     ok = [result for result in results if result.ok]
@@ -1315,8 +1344,10 @@ def _job_view(snapshot: JobSnapshot, *, accept: str) -> dict[str, Any]:
         "game_id": snapshot.game_id,
         "accept": accept,
         "running": snapshot.running,
+        "queued": snapshot.queued,
         "error": snapshot.error,
         "headline": _headline(snapshot, ok=len(ok), failed=len(failed)),
+        "behind": [_job_view(item, accept=accept) for item in behind],
         # 这一批实际落下的东西：进了多少切片、覆盖到哪些标签（验收要的那两句）。
         # 跑着的时候不报——那是半截账，读了会当成总数。
         "summary": _labels_text(ok) if snapshot.finished else "",
@@ -1330,6 +1361,9 @@ def _headline(snapshot: JobSnapshot, *, ok: int, failed: int) -> str:
     """结果区顶上那一行。跑着的时候说的是「已经跑完几条」，不是最终账单。"""
     if snapshot.error:
         counts = f"共 {snapshot.total} 条：这一批没能跑起来"
+    elif snapshot.queued:
+        # 还没轮到它：一条进度都没有，别跟着说「还在跑」——那句话说的是别人
+        counts = f"共 {snapshot.total} 条，排队中：一次只跑一批，前面那批跑完才轮到它"
     elif snapshot.running:
         counts = f"共 {snapshot.total} 条，已跑完 {len(snapshot.results)} 条 · 还在跑"
     else:
