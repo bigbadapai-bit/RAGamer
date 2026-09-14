@@ -96,7 +96,7 @@ def test_预置一批候选时引用的顺序与条数():
 
 
 def test_引用的编号与提示词里的父块一一对应():
-    """正文里的 [2] 要能顺着编号找回第二个父块。"""
+    """清单上第 2 条要能顺着编号找回第二个父块——编号是给人核对来源列表用的。"""
     store = chunk_store(
         GAME,
         make_chunk(1, content="二郎神怎么打：先定身", doc_title="二郎神"),
@@ -112,6 +112,18 @@ def test_引用的编号与提示词里的父块一一对应():
         assert f"[{citation.index}] {citation.label}" in system.content
     assert system.content.index("[1]") < system.content.index("[2]")
     assert llm.calls[0].messages[1] == Message("user", QUESTION)
+
+
+def test_提示词不让把编号写进正文():
+    """编号是给清单对号、给人核对来源列表用的，**不进正文**：挂在句末既指不出是
+    清单上哪一条，又铺满整段——一段答案全出自同一个父块时，每一行都带 `[1]`。
+    来源由界面单独列出来（`turns.html` 那份清单），正文里不需要再挂一遍。
+    """
+    llm = FakeLlm(REPLY)
+
+    answerer(chunk_store(GAME, *BOSS_CHUNKS), llm).answer(QUESTION, game_id=GAME, version="1.0")
+
+    assert "不要写引用编号" in llm.calls[0].messages[0].content
 
 
 def test_附加文本也进提示词():
