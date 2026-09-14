@@ -2,8 +2,10 @@
 
     uv sync --extra models && uv run pytest -m integration
 
-需要可选的 `models` 组、几个 G 的权重，以及一次 HuggingFace 下载（默认缓存到
-`~/.cache/huggingface`，要换位置就设 `HF_HOME`）。
+**跑的是 `.env` 里配的那个模型**，不是写死的默认模型名：配了本地权重目录就直接读盘
+（那几个 G 不用再下一次），配的是 HuggingFace 上的名字才去下载（默认缓存到
+`~/.cache/huggingface`，要换位置就设 `HF_HOME`）。写死默认值会让下面几条在本地明明
+有权重时仍然联网下几个 G，而下的还不是应用实际会加载的那个模型。
 
 假件覆盖不到的是**效果**：中文语料上稠密向量是不是真的按语义靠近、长候选是不是真的
 整段被读进去。形状与接线那些事在默认测试里已经钉过了。
@@ -11,11 +13,12 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterator
 
 import pytest
 
-from ragamer.config import EmbedSettings, ModelSettings, RerankSettings
+from ragamer.config import Settings, get_settings
 from ragamer.vectors import DENSE_DIM, BgeM3Embedder, BgeReranker
 
 pytestmark = pytest.mark.integration
@@ -26,19 +29,30 @@ _LONG_FILLER = "这一节讲的是地图上的杂项，与问题无关。" * 120
 
 
 @pytest.fixture(scope="module")
-def embedder() -> Iterator[BgeM3Embedder]:
-    pytest.importorskip(
-        "FlagEmbedding", reason="真实模型在可选的 models 组里：uv sync --extra models"
-    )
-    yield BgeM3Embedder(EmbedSettings(), ModelSettings())
+def settings() -> Settings:
+    """应用自己那份配置。
+
+    `get_settings` 是带缓存的，而它读的是相对工作目录的 `.env`——集成测试从仓库根跑，
+    拿到的就是使用者配好的那份。`settings_env` 那类 fixture 用完会清缓存并还原环境变量，
+    所以这里不会读到测试用的假值。
+    """
+    return get_settings()
 
 
 @pytest.fixture(scope="module")
-def reranker() -> Iterator[BgeReranker]:
+def embedder(settings: Settings) -> Iterator[BgeM3Embedder]:
     pytest.importorskip(
         "FlagEmbedding", reason="真实模型在可选的 models 组里：uv sync --extra models"
     )
-    yield BgeReranker(RerankSettings(), ModelSettings())
+    yield BgeM3Embedder(settings.embed, settings.models)
+
+
+@pytest.fixture(scope="module")
+def reranker(settings: Settings) -> Iterator[BgeReranker]:
+    pytest.importorskip(
+        "FlagEmbedding", reason="真实模型在可选的 models 组里：uv sync --extra models"
+    )
+    yield BgeReranker(settings.rerank, settings.models)
 
 
 def _cosine(left: tuple[float, ...], right: tuple[float, ...]) -> float:
@@ -101,3 +115,27 @@ def test_精排读得进长候选不截断(reranker: BgeReranker):
     long_score, irrelevant_score = reranker.rerank(query, [long_relevant, irrelevant])
 
     assert long_score > irrelevant_score
+
+
+def test_本地目录存在时不去联网下载(settings: Settings, monkeypatch: pytest.MonkeyPatch):
+    """配了本地权重目录就该直接读盘，**一个字节都不该再下**。
+
+    这条钉的是「本地优先」本身，而不只是 FlagEmbedding 当下的内部行为：那个判据是
+    `os.path.exists(model_name_or_path)`，写在它自己的源码里，改了这里就会红。
+
+    没配本地目录时跳过——那种配置本来就要下载，这条没有可验的东西。
+    """
+    if not os.path.isdir(settings.embed.model):
+        pytest.skip(f"配置的向量化模型不是本地目录（{settings.embed.model}），这条无从验证")
+
+    module = pytest.importorskip("FlagEmbedding.finetune.embedder.encoder_only.m3.runner")
+
+    def refuse(*args: object, **kwargs: object) -> None:
+        raise AssertionError(
+            f"本地目录已在（{settings.embed.model}），却仍走了下载：{args} {kwargs}"
+        )
+
+    monkeypatch.setattr(module, "snapshot_download", refuse)
+    embedding = BgeM3Embedder(settings.embed, settings.models).embed(["二郎神怎么打"])
+
+    assert embedding.dense, "本地权重应当直接读得出来"

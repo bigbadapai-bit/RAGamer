@@ -131,7 +131,14 @@ class BgeReranker:
 
 
 def load_bge_m3(config: EmbedSettings, shared: ModelSettings) -> _M3Model:
-    """真实加载 BGE-M3。"""
+    """真实加载 BGE-M3。
+
+    `config.model` 既可以是 HuggingFace 上的模型名，也可以是本地权重目录，**这条由
+    FlagEmbedding 自己分流**：它拿 `os.path.exists` 判，路径在就直接读盘、不在才
+    `snapshot_download`。本地优先因此是白来的，不必在这里再判一次——判成两条路反而
+    会出现「本地明明有、却因为我们的判断与它不一致而下了一遍」。
+    回归测试见 `tests/test_vectors_integration.py` 的 `test_本地目录存在时不去联网下载`。
+    """
     try:
         from FlagEmbedding import BGEM3FlagModel
     except ImportError as exc:
@@ -146,7 +153,11 @@ def load_bge_m3(config: EmbedSettings, shared: ModelSettings) -> _M3Model:
 
 
 def load_bge_reranker(config: RerankSettings, shared: ModelSettings) -> _RerankerModel:
-    """真实加载长上下文 reranker。"""
+    """真实加载长上下文 reranker。
+
+    与上面同一条：本地目录优先、没有才下载。这一条由 `transformers` 的
+    `from_pretrained` 分流（它认本地目录，也认仓库名）。
+    """
     try:
         from FlagEmbedding import FlagReranker
     except ImportError as exc:
