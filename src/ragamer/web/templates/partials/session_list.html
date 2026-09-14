@@ -4,11 +4,21 @@
   所以第一页与后面几页长得一模一样。
 #}
 {% for item in sessions %}
-<li>
+{#
+  一行 = 一条会话 + 一个删除按钮。按钮是**真的表单**而不是链接：没有脚本时也要删得掉，
+  与页面里别的写入路径同一条规矩（`GET /chat/{库}/{会话}/delete` 那种「点一下就删」的
+  地址还会被浏览器预取）。**不二次确认**——一次会话就是一段问答，删错了重问一遍就是。
+#}
+<li class="flex items-center gap-1">
   <a href="/chat/{{ game_id }}/{{ item.session_id }}"
-     class="block rounded px-2 py-1 {% if item.session_id == selected %}bg-slate-200 font-medium{% else %}hover:bg-slate-200{% endif %}">
+     class="min-w-0 flex-1 truncate rounded px-2 py-1 {% if item.session_id == selected %}bg-slate-200 font-medium{% else %}hover:bg-slate-200{% endif %}">
     {{ item.title or "（还没问过）" }}
   </a>
+  <form method="post" action="/chat/{{ game_id }}/{{ item.session_id }}/delete">
+    <button type="submit" title="删除这个会话"
+            aria-label="删除会话：{{ item.title or '（还没问过）' }}"
+            class="rounded px-1 leading-none text-slate-400 hover:text-red-700">✕</button>
+  </form>
 </li>
 {% endfor %}
 {% if next %}

@@ -571,6 +571,28 @@ def create_router(container: Container, stack: ChatStack) -> APIRouter:
             )
         return RedirectResponse(f"/chat/{game_id}/{session_id}", status_code=303)
 
+    @router.post("/chat/{game_id}/{session_id}/delete")
+    def delete_session(request: Request, game_id: str, session_id: str) -> Response:
+        """删掉一次会话，回到这个库的会话列表。
+
+        **不要二次确认**（与删库那一套不同）：一次会话就是一段问答，删错了重问一遍就是，
+        而删库是不可逆地清掉语料。按钮上写着「删除」，不再多一步。
+        """
+        try:
+            stack.chat.delete(session_id)
+        except ConversationNotFound as exc:
+            # 那一页已经不是最新的了（另一个标签页删过、或者会话早被删掉）：照实说
+            return _chat_page(
+                request,
+                container,
+                stack,
+                game_id=game_id,
+                session_id=session_id,
+                error=str(exc),
+                status_code=404,
+            )
+        return RedirectResponse(f"/chat/{game_id}", status_code=303)
+
     @router.get(IMAGE_ROUTE + "/{key:path}")
     def image(key: str) -> Response:
         """原图。库里存的图片地址就是对象 key，答案带回来的也是它，页面照它取。

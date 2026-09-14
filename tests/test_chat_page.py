@@ -155,6 +155,47 @@ def test_点开会话把那一轮问答读回来():
     assert REPLY in page
 
 
+# --- 删会话 ---
+
+
+def test_左栏每条会话都能删():
+    """按钮是真的表单：没有脚本时也要删得掉（页面里别的写入路径同一条规矩）。"""
+    client = client_with(FakeLlm(said("二郎神怎么打"), REPLY), DOC)
+    session_id = start(client)
+    ask(client, session_id)
+
+    page = client.get(f"/chat/{GAME}").text
+
+    assert f'action="/chat/{GAME}/{session_id}/delete"' in page
+
+
+def test_删掉会话之后它从左栏消失():
+    client = client_with(FakeLlm(said("二郎神怎么打"), REPLY, said("二郎神掉什么"), REPLY), DOC)
+    first = start(client)
+    ask(client, first, "二郎神怎么打")
+    second = start(client)
+    ask(client, second, "二郎神掉什么")
+
+    response = client.post(f"/chat/{GAME}/{first}/delete", follow_redirects=False)
+
+    assert response.status_code == 303
+    assert response.headers["location"] == f"/chat/{GAME}"
+    listed = client.get(f"/chat/{GAME}").text
+    assert first not in listed
+    assert second in listed  # 删的是这一个，不是这个库
+    assert client.get(f"/api/chat/sessions/{first}").status_code == 404
+
+
+def test_删一个已经不在了的会话当场说清():
+    """另一个标签页删过、或者这一页已经过期：照实说，不静默成功。"""
+    client = client_with(FakeLlm(), DOC)
+
+    response = client.post(f"/chat/{GAME}/nope/delete")
+
+    assert response.status_code == 404
+    assert "不存在" in response.text
+
+
 def test_一个会话都没有时列出的是空列表不是_404():
     client = client_with(FakeLlm())
 

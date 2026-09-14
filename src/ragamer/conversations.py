@@ -361,6 +361,22 @@ class Chat:
             raise ConversationNotFound(f"会话 {session_id} 不存在")
         return _read(session_id, payload)
 
+    def delete(self, session_id: str) -> None:
+        """删掉一次会话。**不可逆**：那一串问答连同它的引用与图片地址一起没了。
+
+        先 `open` 再删：读不到就当场报出来，而不是让一次已经过期的删除静默成功。
+        界面上那个按钮是照当前这一页的会话渲染的——报出「没有这个会话」，说的是那一页
+        已经不是最新的了，比什么都不说强。
+
+        删的只有会话本身：澄清反问的待答记录不挂在会话上（`ragamer.clarifying`），
+        缓存也是按问题存的、不按会话（`ragamer.caching`），两者都不需要连带清理。
+
+        :raises ConversationNotFound: 没有这个会话。
+        """
+        self.open(session_id)
+        self.docs.delete(CONVERSATIONS, session_id)
+        logger.info("删除会话 %s", session_id)
+
     def ask(
         self,
         session_id: str,
