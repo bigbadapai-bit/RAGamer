@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -24,6 +25,7 @@ from ragamer.vectors import (
     ModelOutputError,
     ModelUnavailableError,
 )
+from ragamer.vectors.bge import _looks_like_path, _require_local_dir, load_bge_m3, load_bge_reranker
 
 
 class _Loader:
@@ -297,3 +299,48 @@ def test_精排只加载一次并复用():
         reranker.rerank("二郎神怎么打", ["甲"])
 
     assert len(loader.calls) == 1
+
+
+@pytest.mark.parametrize("value", ["BAAI/bge-m3", "bge-m3", "BAAI/bge-reranker-v2-m3"])
+def test_模型名不算路径(value: str):
+    """仓库名带斜杠，所以判据不能是「含斜杠」——否则模型名会被当成路径拦下来。"""
+    assert not _looks_like_path(value)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        r"D:\models\bge-m3",
+        "D:/models/bge-m3",
+        "/opt/models/bge-m3",
+        "~/models/bge-m3",
+        "./models/bge-m3",
+        "../models/bge-m3",
+        r"\\host\share\bge-m3",
+    ],
+)
+def test_这些形态算路径(value: str):
+    assert _looks_like_path(value)
+
+
+def test_目录不在时当场说清而不是去下载():
+    """不让它拿着路径串去当 HuggingFace 仓库名下——那句报错与「目录不在」毫无关系。"""
+    missing = "D:/这个目录不存在/bge-m3"
+
+    with pytest.raises(ModelUnavailableError, match="目录不存在"):
+        load_bge_m3(EmbedSettings(model=missing), ModelSettings())
+    with pytest.raises(ModelUnavailableError, match="目录不存在"):
+        load_bge_reranker(RerankSettings(model=missing), ModelSettings())
+
+
+def test_模型名不拦():
+    """填模型名时本来就该联网下，这道判别不该插手。
+
+    只调判别本身，不走 `load_bge_m3`——那会真的去下载，那是集成测试的事。
+    """
+    _require_local_dir("BAAI/bge-m3", "向量化模型")
+    _require_local_dir("BAAI/bge-reranker-v2-m3", "精排模型")
+
+
+def test_目录在时不拦(tmp_path: Path):
+    _require_local_dir(str(tmp_path), "向量化模型")
