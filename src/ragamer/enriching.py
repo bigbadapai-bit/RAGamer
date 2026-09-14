@@ -18,9 +18,13 @@ MinerU 把版面分成「文字区域」与「图片区域」两块，**图片�
 （22 张里 8 张如此），对这种图二次 OCR 等于把整页重新识别一遍。实验没有定下任何
 识别阈值，所以这里也不留阈值配置（§11）。
 
-**只认带条目级结构的产物。** `content_list` 是 MinerU 那条路的产物标记，md／txt
-与网页没有它：那几种来源的图要么是外链、要么作者自己写好了说明，不归这一层管。
-少了这个门，一次 md 导入会把每张外链图都当成「取不到的原图」报一遍警。
+**三条来源一起管。** 早先只有 MinerU 那条路进来（它带 `content_list`），网页与 md
+的图是外链、按对象 key 取不到，一张都补不上。现在归一化那一层把外链也收进了对象存储
+（`ragamer.sources.fetch_images`），所以这一层的输入又只剩一种形态：**正文里的图片引用
+是对象 key**，按 key 取原图即可，不必知道这份资料从哪来。
+
+只有一件事仍按来源分：**展开折叠块**只对 MinerU 那类产物做——md 与网页里的
+`<details>` 可能是作者真的在讲这个元素，拆掉是在改用户写的东西。
 
 **一张图补不上不让整份资料失败**（与 `ragamer.sources._unmapped` 同一条规矩）：
 取不到原图、识别不出来、摘要调用失败，各留一条日志接着走——但**引擎级**的失败
@@ -38,12 +42,14 @@ from ragamer.llm import ImagePart, LlmClient, LlmError, LlmRequest, Message
 from ragamer.logging import get_logger
 from ragamer.ocr import OcrEngine, OcrError, OcrUnavailable
 from ragamer.sources import (
+    ImageRef,
     NormalizedDoc,
     image_refs,
     image_refs_in,
     set_image_alt,
+    strip_image_refs,
 )
-from ragamer.stores.base import ObjectStore, StoreError
+from ragamer.stores.base import ObjectStore, StoreError, is_image_key
 
 logger = get_logger(__name__)
 
@@ -85,6 +91,49 @@ _SUMMARY_PROMPT = (
 #: 8000 下有一次截断、另一次又通过。卡在实测边界上等于让它偶发失败，而失败是静默的。
 _SUMMARY_MAX_TOKENS = 16000
 
+#: 上下文跟着提示词走的那一段。
+#:
+#: **「只写图上才有、前后文字里没说过的」这句是必须的**：不这么写，模型会把周围正文
+#: 复述一遍，那句摘要进了切片只是把同一段话算两遍分，榨不出新东西。
+#:
+#: **试过也否掉了一版**：曾经加过一句「说得出它属于谁、是哪一件就点出来」，想让摘要
+#: 自报家门。实测同一段上下文里并列着九转金丹、太乙紫金丹、碧藕金丹三个名字，而图是
+#: 碧藕金丹，模型报了「九转金丹」——**它有候选可挑，就一定会挑一个**。这与提示词上面
+#: 那条「不要交代出处」是同一类事：错名字一旦进了语料就会被搜出来，而检索上不赚什么
+#: （正文本就在同一片切片里，那个名字本来就检索得到）。所以只让它**认**图，不让它**报**名。
+_SUMMARY_CONTEXT_PROMPT = (
+    "\n\n这张图前后的原文如下，供你认出图上的是什么。"
+    "只写图上才有、前后文字里没说过的信息，不要把前后文字复述一遍"
+    "——点名它是谁、是哪一件也属于复述，不要写。\n"
+)
+
+#: 给视觉模型的上下文取多宽：图片前后各这么多字符。
+#:
+#: 量级按切片上限（`ragamer.chunking.DEFAULT_MAX_CHARS` = 800）的四分之一取：
+#: 够认出「这是谁、这是哪一处」，又不至于把整节正文喂进去。与别的阈值一样，
+#: **要调先有评测集**（§11）。
+CONTEXT_CHARS = 100
+
+
+def _context(stripped: str, item: ImageRef) -> str:
+    """图片前后的一段原文，给视觉模型认人用。入参是**摘完地址**的正文。
+
+    为什么要用摘完的那一份：窗口是硬切的 100 字符，边界会从中间切断邻居的地址，
+    而半截地址 `strip_image_refs` 认不出来，就留在上下文里了——留给模型的是
+    `thumb/b/b1/77u19lle…png/18px-%E5%9B%BE%E6%A0%87.png` 这种半截 URL 加一串
+    百分号转义（真跑出来的样子）。那正是「地址混进正文」这件事，从提示词这条路
+    又回来了。在摘完的正文上取窗口，就不存在被切断的地址。
+
+    压平空白、修掉边上的碎片：取到的常常是表格行的尾巴（`| 说明 |`）。
+    """
+    start = max(0, item.start - CONTEXT_CHARS)
+    end = min(len(stripped), item.end + CONTEXT_CHARS)
+    return " ".join(stripped[start:end].split()).strip("|·-— ")
+
+
+def _summary_message(context: str) -> str:
+    return f"{_SUMMARY_PROMPT}{_SUMMARY_CONTEXT_PROMPT}{context}" if context else _SUMMARY_PROMPT
+
 
 @dataclass(frozen=True)
 class ImageEnricher:
@@ -103,30 +152,46 @@ class ImageEnricher:
     def enrich(self, doc: NormalizedDoc) -> NormalizedDoc:
         """展开折叠块、补二次 OCR 的文字、给空 alt 写摘要。
 
-        没有条目级结构的产物原样返回。**这道门是有意的**：T10 说的「见到就展开」指的是
-        别的 MinerU 输入形态（那场实验只覆盖了截图），那些产物同样带 `content_list`，
-        这道门拦不住它们；它拦的是 md／txt 与网页——那几种来源里 `<details>` 可能是作者
-        真的在讲这个元素，而且没有条目级结构就没法按图取原图做 OCR（见模块文档）。
+        三条来源都过这里。**折叠块只对 MinerU 那类产物展开**：那对标记在 md 与网页里
+        可能是作者真的在讲这个元素（理由见模块文档）。
+
+        二次 OCR 也仍只对 MinerU 的条目做：网页与 md 的图，文字大多就在页面正文里；
+        而识别是本地 CPU，实测 4.4–11.7 秒一张，铺开去等于把一次导入从几分钟拖成
+        几十分钟（docs/experiments/second-pass-ocr.md）。
         """
-        if not doc.content_list:
-            return doc
-        markdown = unfold(doc.markdown)
+        markdown = unfold(doc.markdown) if doc.content_list else doc.markdown
         entries = _image_entries(doc.content_list)
-        if not entries:
-            return replace(doc, markdown=markdown)
-        assets = self._assets(entries)
-        markdown = _backfill(markdown, self._texts(entries, assets))
+        assets = self._assets(markdown, entries)
+        if doc.content_list:
+            markdown = _backfill(markdown, self._texts(entries, assets))
         markdown = set_image_alt(markdown, self._alt_texts(markdown, assets))
         return replace(doc, markdown=markdown, images=image_refs(markdown))
 
-    def _assets(self, entries: Sequence[Mapping[str, Any]]) -> dict[str, bytes]:
-        """按 `img_path` 取原图。取不到的留一条痕就跳过。
+    def _assets(self, markdown: str, entries: Sequence[Mapping[str, Any]]) -> dict[str, bytes]:
+        """要处理的那些图对应的原图字节，按对象 key 取。取不到的留一条痕就跳过。
+
+        两个来源取并集：**正文里引用到的**，加上**条目级结构里点名的**。后者可能没在
+        正文里留下引用（MinerU 偶尔会切出这样的条目），它的文字照样不该丢——
+        `_backfill` 会把找不到落点的那段接到文末。
+
+        **只认对象 key**（`is_image_key`）。归一化之后正文里的引用本该全是它
+        （`ragamer.sources`）；剩下的不是故意没收的行内图标，就是取不到的相对路径。
+        按 key 去取它们只会得到一串「原图取不到」的假警报，而那些图本来就没有原图
+        在这一层。
 
         一张图缺了不该让整份资料进不了库，但静默跳过也不行——这一层存在的理由
         就是「图里的内容别再悄悄丢掉」。
         """
+        wanted = dict.fromkeys(
+            [
+                *(item.ref for item in image_refs_in(markdown)),
+                *(ref for ref in map(_img_path, entries) if ref),
+            ]
+        )
         assets: dict[str, bytes] = {}
-        for ref in _refs(entries):
+        for ref in wanted:
+            if not is_image_key(ref):
+                continue
             try:
                 assets[ref] = self.objects.get(ref)
             except StoreError as exc:
@@ -172,19 +237,24 @@ class ImageEnricher:
 
         Markdown 与 HTML 两种引用都做：表格内嵌的图是 HTML 那种，而它恰恰是
         「图里没有文字」概率最高的一类（图标、示意图），不补就一点可检索的文本都没有。
+
+        **遍历的是 `strip_image_refs` 给出的那批引用**，不是 `image_refs_in` 的：
+        上下文要在摘完地址的正文上取，而只有它给出的落点是在那份正文里的（见 `_context`）。
+        两者认的是同一批引用，`ImageRef` 上该有的都在。
         """
         vision = self.vision
         if vision is None:
             return {}
+        stripped, refs = strip_image_refs(markdown)
         alt_by_ref: dict[str, str] = {}
-        for item in image_refs_in(markdown):
+        for item in refs:
             if item.alt.strip() or item.ref in alt_by_ref:
                 continue
             data = assets.get(item.ref)
             if data is None:
                 continue
             try:
-                summary = self._summarize(vision, data)
+                summary = self._summarize(vision, data, _context(stripped, item))
             except LlmError as exc:
                 logger.warning("%s：这张图的摘要没取到（%s），它的 alt 留空", item.ref, exc)
                 continue
@@ -192,14 +262,14 @@ class ImageEnricher:
                 alt_by_ref[item.ref] = summary
         return alt_by_ref
 
-    def _summarize(self, vision: LlmClient, data: bytes) -> str:
+    def _summarize(self, vision: LlmClient, data: bytes, context: str) -> str:
         """一次带图的调用换一句话。返回值已压成一行、去掉方括号（见 `_alt_text`）。"""
         answer = vision.complete(
             LlmRequest(
                 messages=[
                     Message(
                         "user",
-                        _SUMMARY_PROMPT,
+                        _summary_message(context),
                         images=(ImagePart(data=data, content_type=_media_type(data)),),
                     )
                 ],
@@ -234,15 +304,6 @@ def _image_entries(content_list: Sequence[Mapping[str, Any]]) -> tuple[Mapping[s
 def _img_path(entry: Mapping[str, Any]) -> str:
     ref = entry.get("img_path")
     return ref if isinstance(ref, str) else ""
-
-
-def _refs(entries: Sequence[Mapping[str, Any]]) -> tuple[str, ...]:
-    """这一批图片条目的原图地址，按第一次出现的顺序、去掉重复。
-
-    同一张图被两个条目指着（MinerU 偶尔会切出重叠的图片区域）时只取一次：
-    取两次是白跑一趟，识别两次则会把同一段文字回填两遍。
-    """
-    return tuple(dict.fromkeys(ref for ref in map(_img_path, entries) if ref))
 
 
 def _given_text(entry: Mapping[str, Any]) -> str:

@@ -92,21 +92,30 @@ def settings_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[di
 
 
 class FakeCrawler:
-    """不发请求的抓取器：地址 → 事先排好的正文。
+    """不发请求的抓取器：地址 → 事先排好的正文与图片字节。
 
     没排过的地址当场炸，而不是返回一份空文档——静默返回会把「链路走通了」与
-    「假件其实什么都没做」混成同一件事。
+    「假件其实什么都没做」混成同一件事。图片同理（那边炸了只会落一条 warning，
+    见 `ragamer.sources.fetch_images`，所以一张没排的图不会把整份资料带下去）。
     """
 
-    def __init__(self, **pages: str) -> None:
+    def __init__(self, images: Mapping[str, bytes] | None = None, **pages: str) -> None:
         self._pages = pages
+        self._images = dict(images or {})
         self.requested: list[str] = []
+        self.images_requested: list[str] = []
 
     def crawl(self, url: str) -> NormalizedDoc:
         self.requested.append(url)
         if url not in self._pages:
             raise CrawlError(f"{url}：假件里没有排这一页")
         return NormalizedDoc(markdown=self._pages[url], source_url=url)
+
+    def image(self, url: str) -> bytes:
+        self.images_requested.append(url)
+        if url not in self._images:
+            raise CrawlError(f"{url}：假件里没有排这张图")
+        return self._images[url]
 
 
 def make_container(

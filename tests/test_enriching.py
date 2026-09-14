@@ -105,11 +105,11 @@ def test_摘要里是真的正文时留着():
     assert "<summary>" not in unfolded
 
 
-def test_没有条目级结构的产物原样返回():
-    """md／txt 与网页的图要么是外链、要么作者自己写好了说明，不归这一层管。
+def test_没有条目级结构时不展开折叠块():
+    """md／txt 与网页里那对标记可能是作者真的在讲这个元素，拆掉就是改用户写的东西。
 
-    少了这个门，一次 md 导入会把每张外链图都当成「取不到的原图」报一遍警，
-    而且会把用户正文里真的在讲 `<details>` 的那段拆掉。
+    **只有这一件事仍按来源分**：图片的补全三条来源一起管（见
+    `test_外链来源的图也补摘要`）。
     """
     doc = make_doc(
         markdown="<details>\n<summary>text_image</summary>\n正文\n</details>\n",
@@ -118,7 +118,24 @@ def test_没有条目级结构的产物原样返回():
 
     enriched = make_enricher().enrich(doc)
 
-    assert enriched is doc
+    assert "<details>" in enriched.markdown
+    assert "text_image" in enriched.markdown
+
+
+def test_外链来源的图也补摘要():
+    """网页与 md 的图以前是外链，按对象 key 取不到，一张都补不上。
+
+    归一化那一层现在把外链也收进了对象存储（`ragamer.sources.fetch_images`），
+    到了这里两者的输入是同一种形态：引用就是对象 key。
+    """
+    vision = FakeLlm("二郎神立绘，全身正面")
+
+    enriched = make_enricher(vision=vision).enrich(
+        make_doc(markdown=f"# 二郎神\n\n![]({A})\n", content_list=[])
+    )
+
+    assert f"![二郎神立绘，全身正面]({A})" in enriched.markdown
+    assert len(vision.calls) == 1
 
 
 # ── 二次 OCR 回填 ──
@@ -237,6 +254,59 @@ def test_正文里找不到引用的文字接到文末():
 
 
 # ── 视觉摘要 ──
+
+
+def test_摘要带上图片前后的原文():
+    """给上下文是为了让它认出「这是谁、这是哪一处」——没上下文时它只能猜，
+    而猜错的游戏名会混进语料（实测同一张燕云截图被猜成过《永劫无间》与《逆水寒手游》）。"""
+    vision = FakeLlm("血条 12000")
+    doc = make_doc(
+        markdown=f"# 二郎神\n\n第二阶段会先蓄力，\n\n![]({A})\n\n然后横扫。\n",
+        content_list=[],
+    )
+
+    make_enricher(vision=vision).enrich(doc)
+
+    prompt = vision.calls[0].messages[-1].content
+    assert "第二阶段会先蓄力" in prompt
+    assert "然后横扫" in prompt
+    assert A not in prompt  # 地址自己不进提示词，它没有可读的信息
+
+
+def test_上下文里不留别的图片地址():
+    """wiki 页面的图是成片的，前后 100 字符里往往夹着邻居的地址。
+
+    不摘的话那段上下文有一大半是地址，等于把「地址混进正文」这件事从提示词这条路
+    放回来——而它正是这一层旁边刚摘掉的东西。
+    """
+    vision = FakeLlm("血条 12000")
+    doc = make_doc(markdown=f"前面 ![邻居]({B}) 中间 ![]({A}) 结尾\n", content_list=[])
+
+    make_enricher(vision=vision).enrich(doc)
+
+    prompt = vision.calls[0].messages[-1].content
+    assert B not in prompt
+    # 邻居的**替代文本**留着：那是可读的字，有用
+    assert "邻居" in prompt
+
+
+def test_窗口边界切到的半截地址也不进上下文():
+    """窗口是硬切的 100 字符，边界会从中间切断邻居的地址。
+
+    在**原始正文**上取窗口再摘地址的话，半截地址认不出来就留下了——真跑出来过：
+    给模型的是 `thumb/b/b1/77u19lle…png/18px-%E5%9B%BE%E6%A0%87.png` 这种半截 URL
+    加一串百分号转义。上下文改在摘完地址的正文上取，被切断的地址就不可能露出来。
+    """
+    long_url = "https://cdn.test/" + "x" * 200 + ".png"
+    vision = FakeLlm("血条 12000")
+    # 邻居那张图够长，窗口的左边界正好落在它的地址当中
+    doc = make_doc(markdown=f"![邻居]({long_url})![]({A})\n", content_list=[])
+
+    make_enricher(put={A: b"png-a"}, vision=vision).enrich(doc)
+
+    prompt = vision.calls[0].messages[-1].content
+    assert "xxxx" not in prompt
+    assert "https" not in prompt
 
 
 def test_视觉摘要写进空的_alt():

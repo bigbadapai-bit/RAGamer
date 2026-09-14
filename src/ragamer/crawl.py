@@ -93,16 +93,23 @@ class RobotsDisallowedError(AccessDeniedError):
 
 @dataclass(frozen=True)
 class _Fetched:
-    """一次出网的产物。
+    """一次出网的产物。**存字节**——图片那条路要的就是字节，按文本读会把图毁掉。
 
-    一次请求只走一跳：`redirect` 非空时 `text` 是空的，调用方拿着 `redirect`
+    一次请求只走一跳：`redirect` 非空时正文是空的，调用方拿着 `redirect`
     再走一跳——**每一跳都要重新过 robots 与限频**，所以跟随的动作留在调用方。
     """
 
-    text: str
-    url: str
+    body: bytes = b""
+    url: str = ""
+    #: 响应头声明的编码。头里没说时留给 `_decode_body` 去正文开头找 `meta`。
+    encoding: str | None = None
     #: 这一跳指向哪里（`Location` 头的原样值）；不是重定向时是空串。
     redirect: str = ""
+
+    @property
+    def text(self) -> str:
+        """正文按它自己声明的编码读出来。**图片一类的二进制不要走这里**，直接取 `body`。"""
+        return _decode_body(self.body, self.encoding)
 
 
 class HttpCrawler:
@@ -142,6 +149,18 @@ class HttpCrawler:
             if wiki is not None:
                 return wiki
         return self._from_page(page)
+
+    def image(self, url: str) -> bytes:
+        """取一张图的原图字节（`ragamer.sources.PageCrawler` 那一条）。
+
+        **走的是与抓页面同一条出网路径**：robots、每主机限频、标明身份的 UA 一样不少
+        （见模块说明「出网只有一条路」）。图片往往在另一台主机上（bwiki 的正文在
+        `wiki.biligame.com`、图在 `patchwiki.biligame.com`），那一台的 robots 是它自己的，
+        按主机分开判、分开限频，所以这里不必另立一套。
+
+        :raises CrawlError: 站点不可达、被拒绝、图不存在或超过字节上限。
+        """
+        return self._get(checked_url(url)).body
 
     # ── 出网 ──────────────────────────────────────────────
 
@@ -184,10 +203,10 @@ class HttpCrawler:
             ) as response:
                 target = response.headers.get("location")
                 if response.is_redirect and target:
-                    return _Fetched(text="", url=str(response.url), redirect=target)
+                    return _Fetched(url=str(response.url), redirect=target)
                 raise_for_status(response, url)
                 body = _read_capped(response, self._config.max_bytes, url)
-                return _Fetched(text=_decode_body(body, response.encoding), url=str(response.url))
+                return _Fetched(body=body, url=str(response.url), encoding=response.encoding)
         except httpx.HTTPError as exc:
             # 域名解析不了、连接被拒、读超时都落在这里。翻成一句话，别把 httpx 的
             # 异常类型甩给用户看
@@ -438,7 +457,7 @@ def _read_capped(response: httpx.Response, limit: int, url: str) -> bytes:
         total += len(chunk)
         if total > limit:
             raise CrawlError(
-                f"{url}：页面超过 {limit} 字节的上限。真需要它就调大 RAGAMER_CRAWL_MAX_BYTES"
+                f"{url}：内容超过 {limit} 字节的上限。真需要它就调大 RAGAMER_CRAWL_MAX_BYTES"
             )
         chunks.append(chunk)
     return b"".join(chunks)

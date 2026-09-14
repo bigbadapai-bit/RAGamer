@@ -807,3 +807,109 @@ def test_没接抓取器时导入网址当场报错():
     那样它就跟在一批正常的业务失败里，谁也不觉得要去修。"""
     with pytest.raises(ValueError):
         make_importer(InMemoryChunkStore()).import_url(PAGE_URL, game_id=GAME)
+
+
+# --- 图片收进对象存储 ---
+
+
+#: 网页来源的图：正文在 wiki.test、图在 cdn.test（bwiki 就是这个形状）。
+#: 130px 那份是立绘、18px 那份是行内图标——判据在 `ragamer.sources.is_icon`。
+CDN_IMAGE = "https://cdn.test/thumb/abc.png/130px-立绘.png"
+CDN_ICON = "https://cdn.test/thumb/abc.png/18px-图标.png"
+
+
+def test_网址导入时外链图落进对象存储():
+    """网页来源的图以前是外链，而补图那一层按对象 key 取原图，那些图一张都补不上。
+
+    归一化那一层现在把它们收进来，「出了这一层只剩对象 key 一种形态」这句话
+    对网页来源也才成立。
+    """
+    chunks = InMemoryChunkStore()
+    objects = InMemoryObjectStore()
+    crawler = FakeCrawler(
+        images={CDN_IMAGE: b"PNG"},
+        **{PAGE_URL: f"# 二郎神\n\n![立绘]({CDN_IMAGE})\n\n正文。\n"},
+    )
+    importer = make_importer(chunks, crawler=crawler, objects=objects)
+
+    result = importer.import_url(PAGE_URL, game_id=GAME)
+
+    assert result.ok, result.error
+    keys = objects.list_keys(image_prefix(GAME))
+    assert len(keys) == 1
+    assert objects.get(keys[0]) == b"PNG"
+    # 正文里的引用改指对象 key，切片带着它去回显（正文里只有替代文本）
+    assert all(keys[0] in chunk.image_urls for chunk in stored(chunks))
+    assert all(CDN_IMAGE not in chunk.content for chunk in stored(chunks))
+
+
+def test_本地_md_里的外链图同样收进来():
+    """md 与网页一样带着外链——攻略站另存成 md 是常事，那份资料的图也该收进来。"""
+    chunks = InMemoryChunkStore()
+    objects = InMemoryObjectStore()
+    importer = make_importer(
+        chunks, crawler=FakeCrawler(images={CDN_IMAGE: b"PNG"}), objects=objects
+    )
+
+    result = importer.import_one(
+        markdown(text=f"# 二郎神\n\n![立绘]({CDN_IMAGE})\n\n正文。\n"), game_id=GAME
+    )
+
+    assert result.ok, result.error
+    assert len(objects.list_keys(image_prefix(GAME))) == 1
+
+
+def test_行内图标不收进对象存储():
+    """18px 的图标不值得占一份存储，也不值得为它调一次视觉模型。"""
+    chunks = InMemoryChunkStore()
+    objects = InMemoryObjectStore()
+    crawler = FakeCrawler(**{PAGE_URL: f"# 二郎神\n\n![图标]({CDN_ICON})\n\n正文。\n"})
+    importer = make_importer(chunks, crawler=crawler, objects=objects)
+
+    result = importer.import_url(PAGE_URL, game_id=GAME)
+
+    assert result.ok, result.error
+    assert objects.list_keys(image_prefix(GAME)) == []
+    assert crawler.images_requested == []
+    # 图标原样留着：地址进切片的图片字段，答案里照样显示得出来
+    assert any(CDN_ICON in chunk.image_urls for chunk in stored(chunks))
+
+
+def test_图取不到时那份资料照常入库(caplog):
+    """与「一张图补不上不让整份资料失败」同一条规矩。"""
+    chunks = InMemoryChunkStore()
+    crawler = FakeCrawler(**{PAGE_URL: f"# 二郎神\n\n![立绘]({CDN_IMAGE})\n\n正文。\n"})
+    importer = make_importer(chunks, crawler=crawler, objects=InMemoryObjectStore())
+
+    with caplog.at_level("WARNING"):
+        result = importer.import_url(PAGE_URL, game_id=GAME)
+
+    assert result.ok, result.error
+    assert stored(chunks)
+    assert "取不到" in caplog.text
+
+
+def test_没接抓取器时外链图留痕(caplog):
+    """接线漏了与「这份资料本来就没有外链图」长得一模一样，所以要留一条痕。"""
+    importer = make_importer(InMemoryChunkStore())  # 没接抓取器
+
+    with caplog.at_level(logging.WARNING, logger="ragamer.importing"):
+        result = importer.import_one(
+            markdown(text=f"# 二郎神\n\n![立绘]({CDN_IMAGE})\n\n正文。\n"), game_id=GAME
+        )
+
+    assert result.ok, result.error
+    assert "外链图" in caplog.text
+
+
+def test_同一个网址重导时图片原地覆盖():
+    """来源摘要取自地址本身，与文件那条路取自字节是同一套幂等思路。"""
+    objects = InMemoryObjectStore()
+    crawler = FakeCrawler(**{PAGE_URL: f"# 二郎神\n\n![立绘]({CDN_IMAGE})\n\n正文。\n"})
+    importer = make_importer(crawler=crawler, objects=objects)
+
+    importer.import_url(PAGE_URL, game_id=GAME)
+    keys = objects.list_keys(image_prefix(GAME))
+    importer.import_url(PAGE_URL, game_id=GAME)
+
+    assert objects.list_keys(image_prefix(GAME)) == keys

@@ -5,8 +5,11 @@
 切分与打标不必知道内容从哪来，新增一种来源也只动它自己的适配器。适配器由
 `ParserRouter` 按扩展名挑；网页没有扩展名可挑，它走另一个入口（`PageCrawler`）。
 
-归一化的**最后一步是发布附件**（`publish_assets`）：解析产物里的原图进对象存储，
-正文里的引用改指对象 key。出了这一层，图片地址只有对象 key 一种形态。
+归一化的**最后两步都在收拢图片地址**：`fetch_images` 把正文里的外链图下载成附件
+（解析产物自带的附件早在手上），`publish_assets` 把附件发进对象存储、正文里的引用
+改指对象 key。出了这一层，图片地址只有对象 key 一种形态——这句话今天才真的成立：
+网页与 md 来源的图一直是外链，而补图那一层是按对象 key 取原图的，那些图因此
+一张都补不上。
 
 `Enricher` 的缝也开在这里：补图吃一份 `NormalizedDoc`、吐一份 `NormalizedDoc`，
 位置在归一化与切分之间。它要处理的三件事（VLM 摘要进 alt、展开 MinerU 的 `<details>`
@@ -17,11 +20,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Protocol, runtime_checkable
+from urllib.parse import unquote, urlsplit
 
 from ragamer.logging import get_logger
 from ragamer.stores.base import IMAGE_PREFIX, ObjectStore, image_key
@@ -55,15 +60,20 @@ class SourceDocument:
 
 @dataclass(frozen=True)
 class SourceAsset:
-    """解析产物里附带的二进制附件。MinerU 结果包里的原图就是它。
+    """一份随资料来的二进制附件：MinerU 结果包里的原图，或从外链拉下来的图。
 
-    `name` 是正文引用它时用的那个相对路径（`images/xxx.jpg`）——它同时是
-    「正文里的哪一处引用该改指哪个对象」的依据。
+    `name` 是**正文引用它时用的那个字面**（`images/xxx.jpg`，或网页来源的一整条地址）
+    ——它是「正文里的哪一处引用该改指哪个对象」的依据，所以必须与正文里逐字一致，
+    不能顺手规整（解码百分号转义、去掉查询串都会让那一处引用对不上）。
     """
 
     name: str
     data: bytes
     content_type: str = "application/octet-stream"
+    #: 它在对象存储里的名字。空即从 `name` 推（MinerU 的产物名去掉那层 `images/`）。
+    #: 外链那条路必须单独给：`name` 是一整条地址，拿它当对象名会把一串 URL
+    #: 原样写进 key 里。
+    key_name: str = ""
 
 
 @dataclass(frozen=True)
@@ -120,6 +130,18 @@ class PageCrawler(Protocol):
 
     def crawl(self, url: str) -> NormalizedDoc:
         """抓不了时抛 :class:`SourceError`。"""
+        ...
+
+    def image(self, url: str) -> bytes:
+        """取一张图的原图字节。取不了时抛 :class:`SourceError`。
+
+        与 :meth:`crawl` 分开、而不是让它顺手把图也带回来：一份资料里几十张图，
+        抓哪些、要不要抓由归一化那一层定（见 :func:`fetch_images`），抓取层只管出网。
+
+        **必须与抓页面受同一套约束**（robots、每主机限频、标明身份）：图常在另一台主机上
+        （bwiki 的正文在 `wiki.biligame.com`、图在 `patchwiki.biligame.com`），
+        对那一台就是一次新的请求——绕过这层等于悄悄多抓了一台站，而且不报错。
+        """
         ...
 
 
@@ -206,6 +228,9 @@ class ImageRef:
 
     #: 引用地址：Markdown 的 `![](…)` 取括号里那段，HTML 的 `<img src="…">` 取 `src`。
     ref: str
+    #: 这段引用在正文里**开始**的位置（`![` 的那个感叹号）。
+    #: 补图要取它前面的那段文字当上下文，见 `ragamer.enriching`。
+    start: int
     #: 这段引用在正文里**结束**的位置。二次 OCR 的文字插在它之后。
     end: int
     #: 替代文本。Markdown 的 `![alt](…)` 取方括号里那段，HTML 的 `<img>` 取 `alt`
@@ -217,7 +242,7 @@ class ImageRef:
 def image_refs_in(markdown: str) -> tuple[ImageRef, ...]:
     """正文里的图片引用，按出现顺序。两种形式都认。"""
     found = [
-        ImageRef(match.group(3), match.end(), match.group(1))
+        ImageRef(match.group(3), match.start(), match.end(), match.group(1))
         for match in _MD_IMAGE.finditer(markdown)
     ]
     found += [
@@ -235,12 +260,37 @@ def _html_image_ref(match: re.Match[str]) -> ImageRef | None:
     if src is None:
         return None
     alt = _HTML_ALT.search(tag)
-    return ImageRef(src.group(1), match.end(), alt.group(1) if alt is not None else "")
+    return ImageRef(
+        src.group(1), match.start(), match.end(), alt.group(1) if alt is not None else ""
+    )
 
 
 def image_refs(markdown: str) -> tuple[str, ...]:
     """正文里引用到的图片地址，按出现顺序、去重前原样。"""
     return tuple(item.ref for item in image_refs_in(markdown))
+
+
+#: MediaWiki 缩略图地址里的**显示宽度**：`…/thumb/<a>/<b>/<哈希>.png/18px-图标-丹药.png`。
+#: 它是页面上那张图实际显示的宽度，一个行内图标与一张立绘的差别就落在这一段上。
+_THUMB_WIDTH = re.compile(r"/(\d+)px-")
+
+#: 显示宽度不超过它的图当行内图标：不下载、不占对象存储、也不调视觉模型。
+#:
+#: 实测 bwiki 一个词条的 127 张图里绝大多数落在 18／25／30px——那是表格与正文里的
+#: 行内图标（`18px-图标-丹药.png`）；60px 与 130px 的是物品图，算正经内容，阈值取在
+#: 两者之间。**这只是个经验值，要调先有评测集**（§11），所以留成一个常量。
+ICON_MAX_PX = 32
+
+
+def is_icon(ref: str) -> bool:
+    """这个地址指的是不是一张行内图标。
+
+    **只有带缩略宽度标记的地址判得了**，也就是 MediaWiki 那条路（wikitext 转换出来的
+    外链）。别的来源没有尺寸信息，一律不当图标——MinerU 那条路上每个 `type == "image"`
+    的条目都是真截图（T10 实测），那里也没有图标成灾的问题。
+    """
+    found = _THUMB_WIDTH.search(urlsplit(ref).path)
+    return found is not None and int(found.group(1)) <= ICON_MAX_PX
 
 
 def strip_image_refs(text: str) -> tuple[str, tuple[ImageRef, ...]]:
@@ -290,8 +340,8 @@ def strip_image_refs(text: str) -> tuple[str, tuple[ImageRef, ...]]:
         written += start - cursor
         cursor = _end_of_ref(text, match, markdown_ref)
         out.append(alt)
+        refs.append(ImageRef(ref, written, written + len(alt), alt))
         written += len(alt)
-        refs.append(ImageRef(ref, written, alt))
     out.append(text[cursor:])
     return "".join(out), tuple(refs)
 
@@ -386,23 +436,116 @@ def rewrite_image_refs(markdown: str, mapping: Mapping[str, str]) -> str:
 
 
 def _unmapped(matched: str, ref: str) -> str:
-    logger.warning("正文里的图片引用 %s 在解析产物里找不到对应文件，原样留着", ref)
+    """这一处引用没有对应的原图，原样留着。
+
+    **只留 debug**：走到这里说明它没进 `mapping`，而「为什么没进来」只有
+    :func:`fetch_images` 说得清（它才是出网取图的那一处）。两处各报一条 warning，
+    同一张图会被说两遍，后一遍还说不出原因。
+    """
+    logger.debug("正文里的图片引用 %s 没有对应的原图，原样留着", ref)
     return matched
+
+
+def fetch_images(doc: NormalizedDoc, *, crawler: PageCrawler) -> NormalizedDoc:
+    """把正文里的外链图下载下来，变成附件交给 :func:`publish_assets` 发出去。
+
+    **归一化那一层的契约靠它兑现**：模块文档写着「出了这一层，图片地址只有对象 key
+    一种形态」，而网页与 md 这两种来源的图一直是外链，从来没兑现过——补图那一层是按
+    对象 key 取原图的，这些图因此一张都没被补过。MinerU 的附件本来就到手了，
+    这里补的是外链那一条。
+
+    三种引用不动它：
+
+    - **相对路径**（`![](images/a.png)`）：没有基准地址可取，下载不了。它与「下载失败」
+      是同一种处境，处置也就一样——原样留着并留一条痕。
+    - **行内图标**（:func:`is_icon`）：不值得为它占一份对象存储，也不值得为它调一次
+      视觉模型。它在正文里仍是外链，答案里照样显示得出来。
+    - **已经在附件里的**（MinerU 的产物）：跳过，别重复下载。
+
+    一张图取不到不让整份资料失败（与补图那一层同一条规矩）：留一条痕接着走。
+
+    这里是**图片地址的唯一一处出网**，所以「取不到」的痕也都在这一处：跳到的那张图为什么
+    没有原图，只有这里说得清（相对路径、被站点挡了、超了字节上限、还是它本来就是个图标）。
+    `rewrite_image_refs` 那边因此只留一条 debug——同一张图报两遍，第二遍还说不出原因。
+    """
+    known = {asset.name for asset in doc.assets}
+    taken = {_key_name(asset) for asset in doc.assets}
+    assets = list(doc.assets)
+    for ref in dict.fromkeys(item.ref for item in image_refs_in(doc.markdown)):
+        if ref in known:
+            continue  # 解析产物自带的（MinerU 那条路），附件已经到手
+        if is_icon(ref):
+            logger.debug("%s：行内图标，不下载、也不补摘要", ref)
+            continue
+        if not _is_external(ref):
+            logger.warning("%s：相对路径的图没有基准地址可取，正文里的引用原样留着", ref)
+            continue
+        try:
+            data = crawler.image(ref)
+        except SourceError as exc:
+            logger.warning("%s：这张图取不到（%s），正文里的引用原样留着", ref, exc)
+            continue
+        if not data:
+            logger.warning("%s：这张图是空的，正文里的引用原样留着", ref)
+            continue
+        name = _external_name(ref, taken)
+        taken.add(name)
+        assets.append(SourceAsset(name=ref, data=data, key_name=name))
+    return replace(doc, assets=tuple(assets)) if len(assets) != len(doc.assets) else doc
+
+
+def _is_external(ref: str) -> bool:
+    return urlsplit(ref).scheme in ("http", "https")
+
+
+#: 对象名的长度上限。地址最后一段可以是任意长，而对象名要能一眼看出是什么图。
+_MAX_STEM_CHARS = 120
+
+#: 对象名里排掉的字符：它们要么是路径分隔符、要么在 URL 片段里有特殊含义。
+_UNSAFE_IN_NAME = re.compile(r"""[\s/\\?#%"'<>|:*]+""")
+
+
+def _external_name(ref: str, taken: set[str]) -> str:
+    """外链图在对象存储里的名字：地址最后一段（解码过），重名时再并上地址的短摘要。
+
+    重名**必须在这里解决**：`image_key` 那层来源摘要只隔开不同资料之间的重名；
+    同一份资料里两张不同的图落到同一个名字上时，后写的那张会把前一张原地覆盖掉，
+    而且不报错。名字由地址算出来，所以重导同一份资料仍落在同一批 key 上。
+    """
+    raw = unquote(PurePosixPath(urlsplit(ref).path).name)
+    cleaned = _UNSAFE_IN_NAME.sub("_", raw).strip("._") or "image"
+    stem, dot, suffix = cleaned.rpartition(".")
+    if not dot:  # 没有后缀：整个名字都是主干
+        stem, dot, suffix = cleaned, "", ""
+    stem = stem[:_MAX_STEM_CHARS]
+    if f"{stem}{dot}{suffix}" not in taken:
+        return f"{stem}{dot}{suffix}"
+    digest = hashlib.blake2b(ref.encode("utf-8"), digest_size=4).hexdigest()
+    return f"{stem}.{digest}{dot}{suffix}"
+
+
+def _key_name(asset: SourceAsset) -> str:
+    """这份附件在对象存储里的名字。"""
+    return asset.key_name or _attachment_name(asset.name)
 
 
 def publish_assets(
     doc: NormalizedDoc, objects: ObjectStore, *, game_id: str, digest: str
 ) -> NormalizedDoc:
-    """把解析产物里的附件存进对象存储，正文与条目级结构的引用一并改指对象 key。
+    """把附件存进对象存储，正文与条目级结构的引用一并改指对象 key。
 
     这是归一化的最后一步：出了这一层，「图片地址」只有对象 key 一种形态，
-    补图与展示都按 key 取。md／txt 没有附件，原样返回，一次也不碰对象存储。
+    补图与展示都按 key 取。附件来自两头——解析产物自带的（MinerU），
+    以及 :func:`fetch_images` 从外链拉下来的。两条都没有就是一次也不碰对象存储。
+
+    **每个附件的对象名由 `_key_name` 一处定**：写入与按前缀清理要对得上，
+    两处各推一遍名字，推岔了就是把图写进一个谁也清不掉的地方。
     """
     if not doc.assets:
         return doc
     mapping: dict[str, str] = {}
     for asset in doc.assets:
-        key = image_key(game_id, digest, _attachment_name(asset.name))
+        key = image_key(game_id, digest, _key_name(asset))
         objects.put(key, asset.data, content_type=asset.content_type)
         mapping[asset.name] = key
     markdown = rewrite_image_refs(doc.markdown, mapping)

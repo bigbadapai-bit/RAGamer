@@ -474,6 +474,18 @@ def image_folder(game_id: str) -> str:
     return f"{image_prefix(game_id)}/"
 
 
+def is_image_key(address: str) -> bool:
+    """这个地址是不是一张原图的对象 key（`images/<游戏>/<来源摘要>/<名字>`）。
+
+    补图那一层用它把「收进来的原图」与「故意没收的、取不到的」分开：外链与相对路径
+    按 key 去取只会得到一串「原图取不到」的假警报，而它们本来就没有原图在那儿。
+
+    **按段数判，不按前缀**：解析产物里的相对路径（`images/shot.png`）也以同一个前缀
+    开头，但它不是 key——真 key 的游戏与来源摘要那两层是必有的。
+    """
+    return address.startswith(f"{IMAGE_PREFIX}/") and address.count("/") >= 3
+
+
 def image_key(game_id: str, digest: str, name: str) -> str:
     """一个附件的对象 key。
 

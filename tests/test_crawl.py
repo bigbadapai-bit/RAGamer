@@ -658,3 +658,69 @@ def test_只有引擎声明时给出两种脚本路径():
     )
 
     assert mediawiki_api(html, f"{WIKI}/wiki/二郎神") == (f"{WIKI}/w/api.php", f"{WIKI}/api.php")
+
+
+# ── 取图 ──────────────────────────────────────────────────
+
+#: 一张最小的 PNG。取的是字节，所以它长什么样不重要，重要的是**不能被当文本读**。
+PNG_BYTES = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
+IMAGE_URL = "https://cdn.test/a.png"
+
+
+def image_reply(request: httpx.Request) -> httpx.Response:
+    return httpx.Response(200, content=PNG_BYTES)
+
+
+def test_取图拿到的是字节():
+    """图片是二进制，按文本读会把它毁掉——所以 `_Fetched` 存的是字节。"""
+    site = FakeSite().route(IMAGE_URL, image_reply)
+
+    assert make_crawler(site).image(IMAGE_URL) == PNG_BYTES
+
+
+def test_取图也先看_robots():
+    """图常在另一台主机上（正文在一个域、图在另一个域），对那一台就是一次新请求。
+
+    绕过 robots 等于悄悄多抓了一台站——而且不报错。
+    """
+    site = FakeSite()
+    site.route("https://cdn.test/robots.txt", "User-agent: *\nDisallow: /\n")
+    site.route(IMAGE_URL, image_reply)
+
+    with pytest.raises(RobotsDisallowedError):
+        make_crawler(site).image(IMAGE_URL)
+
+
+def test_取图也受限频约束_且与页面共用同一个计时():
+    """限的是主机：同一台站上抓完页面紧接着取图，中间一样要留间隔。"""
+    site = page_site(**{IMAGE_URL: image_reply})
+    crawler = make_crawler(site)
+
+    crawler.crawl("https://page.test/a")
+    crawler.image(IMAGE_URL)
+
+    # 抓页面（读 robots + 取正文）之后取的图，落在同一台主机上
+    assert site.paths()[-1] == "/a.png"
+    assert site.clock.sleeps[-1] == 1.0
+
+
+def test_取图被拒时报的是被拒绝():
+    site = FakeSite().route(IMAGE_URL, lambda request: httpx.Response(403, text="no"))
+
+    with pytest.raises(AccessDeniedError):
+        make_crawler(site).image(IMAGE_URL)
+
+
+def test_取图超过字节上限时当场报错():
+    """与抓页面同一条口径：超限报错，不截断——截断的图是一张坏图，而且看着是成功的。"""
+    site = FakeSite().route(IMAGE_URL, lambda request: httpx.Response(200, content=b"x" * 70_000))
+
+    with pytest.raises(CrawlError) as excinfo:
+        make_crawler(site, settings=crawl_settings(max_bytes=64_000)).image(IMAGE_URL)
+
+    assert "上限" in str(excinfo.value)
+
+
+def test_取图只收_http_地址():
+    with pytest.raises(CrawlError):
+        make_crawler(FakeSite()).image("file:///etc/passwd")

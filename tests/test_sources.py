@@ -6,6 +6,8 @@ PDF／图片与网页两条路在后面的票里接上，这里的断言到时�
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 from ragamer.sources import (
@@ -18,14 +20,16 @@ from ragamer.sources import (
     SourceError,
     SourceParser,
     UnsupportedSourceError,
+    fetch_images,
     image_refs,
     image_refs_in,
+    is_icon,
     publish_assets,
     rewrite_image_refs,
     set_image_alt,
     strip_image_refs,
 )
-from ragamer.stores.base import image_key, image_prefix
+from ragamer.stores.base import image_key, image_prefix, is_image_key
 from ragamer.stores.memory import InMemoryObjectStore
 
 PARSER = MarkdownParser()
@@ -155,6 +159,182 @@ def test_alt_在_src_前面也读得出来():
     assert [(item.ref, item.alt) for item in refs] == [("a.png", "甲")]
 
 
+# --- 行内图标 ---
+
+#: bwiki 那种缩略图地址：路径最后一段带显示宽度。同一个哈希目录下，
+#: 18px 那份是正文里的行内图标，130px 那份是物品图。
+_THUMB = (
+    "https://patchwiki.biligame.com/images/wukong/thumb/b/b1/abc.png/{}px-%E5%9B%BE%E6%A0%87.png"
+)
+
+
+def test_缩略图按显示宽度认出图标():
+    assert is_icon(_THUMB.format(18)) is True
+    assert is_icon(_THUMB.format(32)) is True
+
+
+def test_物品图不算图标():
+    """60／130px 是物品与武器的图，算正经内容——阈值取在 32，两者之间。"""
+    assert is_icon(_THUMB.format(60)) is False
+    assert is_icon(_THUMB.format(130)) is False
+
+
+def test_没有尺寸信息的地址不当图标():
+    """只有 MediaWiki 那条路判得了。判不了就不判——MinerU 那些条目都是真截图。"""
+    assert is_icon("https://img1.gamersky.com/image2024/08/1303_S.jpg") is False
+    assert is_icon("images/black_myth/ab12/a.jpg") is False
+
+
+# --- 外链图收进对象存储 ---
+
+
+class StubFetcher:
+    """一个只会回字节的抓取器。没排过的地址当场炸——与 `FakeCrawler` 同一条口径。"""
+
+    def __init__(self, **images: bytes) -> None:
+        self._images = images
+        self.requested: list[str] = []
+
+    def image(self, url: str) -> bytes:
+        self.requested.append(url)
+        if url not in self._images:
+            raise SourceError(f"{url}：假件里没有排这张图")
+        return self._images[url]
+
+
+def test_外链图下载下来变成本份资料的附件():
+    doc = NormalizedDoc(markdown="正文 ![](https://cdn.example.com/a.png) 继续\n")
+    fetcher = StubFetcher(**{"https://cdn.example.com/a.png": b"PNG"})
+
+    collected = fetch_images(doc, crawler=fetcher)
+
+    assert [asset.name for asset in collected.assets] == ["https://cdn.example.com/a.png"]
+    assert [asset.data for asset in collected.assets] == [b"PNG"]
+    assert [asset.key_name for asset in collected.assets] == ["a.png"]
+
+
+def test_附件名与正文里的引用逐字一致():
+    """`publish_assets` 靠这个名字对上正文里的那一处引用：规整过（解码百分号、
+    去掉查询串）就对不上，图会连着引用一起悬空。"""
+    url = "https://cdn.example.com/thumb/%E5%9B%BE.png?cb=123"
+    doc = NormalizedDoc(markdown=f"![]({url})\n")
+
+    collected = fetch_images(doc, crawler=StubFetcher(**{url: b"PNG"}))
+
+    assert collected.assets[0].name == url
+    # 对象名是解码过、去掉查询串的那一份：能读，也不会把 `?` 带进对象 key
+    assert collected.assets[0].key_name == "图.png"
+
+
+def test_图标不下载():
+    """行内图标不值得占一份对象存储，也不值得为它调一次视觉模型。"""
+    doc = NormalizedDoc(markdown=f"![]( {_THUMB.format(18)} )\n".replace(" ", ""))
+    fetcher = StubFetcher(**{_THUMB.format(18): b"PNG"})
+
+    collected = fetch_images(doc, crawler=fetcher)
+
+    assert collected.assets == ()
+    assert fetcher.requested == []
+
+
+def test_相对路径的图下载不了_原样留着并留一条痕(caplog):
+    doc = NormalizedDoc(markdown="![](images/a.png)\n")
+
+    with caplog.at_level("WARNING"):
+        collected = fetch_images(doc, crawler=StubFetcher())
+
+    assert collected.assets == ()
+    assert collected.markdown == doc.markdown
+    assert "相对路径" in caplog.text
+
+
+def test_一张图取不到不让整份资料失败(caplog):
+    """与补图那一层同一条规矩：留一条痕接着走，其余照常收。"""
+    doc = NormalizedDoc(
+        markdown="![](https://cdn.example.com/a.png)\n![](https://cdn.example.com/b.png)\n"
+    )
+    fetcher = StubFetcher(**{"https://cdn.example.com/b.png": b"PNG"})
+
+    with caplog.at_level("WARNING"):
+        collected = fetch_images(doc, crawler=fetcher)
+
+    assert [asset.key_name for asset in collected.assets] == ["b.png"]
+    assert "a.png" in caplog.text
+
+
+def test_已经带来附件的引用不重复下载():
+    """MinerU 那条路的原图早在手上，名字对得上就跳过。"""
+    doc = NormalizedDoc(
+        markdown="![](images/a.png)\n",
+        assets=(SourceAsset("images/a.png", b"PNG"),),
+    )
+    fetcher = StubFetcher()
+
+    collected = fetch_images(doc, crawler=fetcher)
+
+    assert collected.assets == doc.assets
+    assert fetcher.requested == []
+
+
+def test_同一份资料里两张不同的图重名时不会互相覆盖():
+    """`image_key` 那层来源摘要只隔开不同资料之间的重名，资料内部的重名得在这里解决。"""
+    first = "https://a.example.com/x/icon.png"
+    second = "https://b.example.com/y/icon.png"
+    doc = NormalizedDoc(markdown=f"![]({first})\n![]({second})\n")
+
+    collected = fetch_images(doc, crawler=StubFetcher(**{first: b"ONE", second: b"TWO"}))
+    names = [asset.key_name for asset in collected.assets]
+
+    assert len(set(names)) == 2, names
+    assert names[0] == "icon.png"  # 先来的用本名，后来的并上地址的短摘要
+    assert names[1].startswith("icon.") and names[1].endswith(".png")
+
+
+def test_重名时算出来的名字是稳定的():
+    """名字由地址算出来，重导同一份资料落在同一批对象 key 上（幂等重导靠它）。"""
+    first = "https://a.example.com/x/icon.png"
+    second = "https://b.example.com/y/icon.png"
+    doc = NormalizedDoc(markdown=f"![]({first})\n![]({second})\n")
+    fetcher = StubFetcher(**{first: b"ONE", second: b"TWO"})
+
+    once = fetch_images(doc, crawler=fetcher)
+    again = fetch_images(doc, crawler=fetcher)
+
+    assert [asset.key_name for asset in once.assets] == [asset.key_name for asset in again.assets]
+
+
+def test_认得出对象_key_也认得出不是的():
+    """补图那一层靠它把「收进来的原图」与「故意没收的、取不到的」分开。
+
+    按段数判而不是按前缀：解析产物里的相对路径（`images/a.png`）也以同一个前缀
+    开头，但它不是 key——真 key 的游戏与来源摘要那两层是必有的。
+    """
+    assert is_image_key(image_key("black_myth", "a1b2", "立绘.png")) is True
+
+    assert is_image_key("images/a.png") is False  # 相对路径
+    assert is_image_key("https://cdn.test/a.png") is False  # 外链
+    assert is_image_key("images") is False
+
+
+def test_外链与自带的附件一起发出去():
+    """两步合起来的出口：正文里的引用全变成对象 key。"""
+    objects = InMemoryObjectStore()
+    url = "https://cdn.example.com/a.png"
+    doc = NormalizedDoc(
+        markdown=f"![](images/local.png)\n\n![]({url})\n",
+        assets=(SourceAsset("images/local.png", b"LOCAL"),),
+    )
+
+    collected = fetch_images(doc, crawler=StubFetcher(**{url: b"REMOTE"}))
+    published = publish_assets(collected, objects, game_id="black_myth", digest="ab12")
+
+    keys = objects.list_keys(image_prefix("black_myth"))
+    assert len(keys) == 2
+    assert all(key in published.markdown for key in keys)
+    assert "http" not in published.markdown
+    assert published.assets == ()
+
+
 # --- 摘走地址 ---
 
 
@@ -242,10 +422,16 @@ def test_换掉两种形式的引用():
 
 
 def test_认不出的引用原样留着并留一条痕(caplog):
-    """静默留着就是答案里一条坏图，还没人知道为什么；抛错又太重——一张图不该毁一份资料。"""
+    """静默留着就是答案里一条坏图，还没人知道为什么；抛错又太重——一张图不该毁一份资料。
+
+    **痕只留 debug**：「为什么没有原图」只有 `fetch_images` 说得清（它才是出网取图的那
+    一处），这里再报一条 warning 就是同一张图说两遍，后一遍还说不出原因。
+    """
     text = "![甲](a.png)\n\n![乙](b.png)\n"
 
-    with caplog.at_level("WARNING"):
+    # 级别点名给这个 logger：`setup_logging` 把项目根 logger 钉在 INFO，
+    # 不点名的话这条 debug 根本不会被发出来（跑全量时上一条用例刚调用过它）
+    with caplog.at_level(logging.DEBUG, logger="ragamer.sources"):
         rewritten = rewrite_image_refs(text, {"a.png": "K1"})
 
     assert rewritten == "![甲](K1)\n\n![乙](b.png)\n"

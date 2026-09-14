@@ -49,6 +49,8 @@ from ragamer.sources import (
     SourceDocument,
     SourceError,
     SourceParser,
+    fetch_images,
+    image_refs,
     publish_assets,
 )
 from ragamer.stores.base import UNVERSIONED, Chunk, ChunkStore, ObjectStore
@@ -247,6 +249,15 @@ def _source_digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()[:16]
 
 
+def _url_digest(url: str) -> str:
+    """网址的来源摘要，与 :func:`_source_digest` 同一个用处。
+
+    文件那条路摘要取自文件的字节；网址没有字节可摘，取地址本身——同一个网址重导
+    落在同一批 key 上，图片原地覆盖。
+    """
+    return hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
+
+
 @dataclass(frozen=True)
 class Importer:
     """一次导入的接线。外部依赖由组合根注入（见 `ragamer.container`）。
@@ -293,7 +304,7 @@ class Importer:
         total = len(sources) + len(urls)
         claimed: dict[tuple[str, str], _Entry] = {}
         entries = [self._file_entry(source, game_id) for source in sources]
-        entries += [self._url_entry(url) for url in urls]
+        entries += [self._url_entry(url, game_id) for url in urls]
         results = tuple(
             self._run(
                 entry,
@@ -379,7 +390,7 @@ class Importer:
         而「这一批里是哪一条失败了」总得有个能指认的东西。
         """
         return self._run(
-            self._url_entry(url),
+            self._url_entry(url, game_id),
             game_id=game_id,
             version=version,
             vocabulary=vocabulary,
@@ -392,19 +403,30 @@ class Importer:
         return _Entry(
             source=source.filename,
             kind=SourceKind.FILE,
-            # 抓回来的网页没有附件，附件这一步只在文件这条路上
-            normalize=lambda: self._publish(self.parser.parse(source), source, game_id),
+            normalize=lambda: self._collect(
+                self.parser.parse(source),
+                game_id=game_id,
+                # 来源文件的字节摘要进对象 key（见 `image_key`）：同一份文件重导
+                # 算出的 key 完全一致，图片原地覆盖
+                digest=_source_digest(source.data),
+                label=source.filename,
+            ),
             # 同一批里再提交一次同一份文件是幂等的，靠它认出来
             identity=_source_digest(source.data),
         )
 
-    def _url_entry(self, url: str) -> _Entry:
+    def _url_entry(self, url: str, game_id: str) -> _Entry:
         """一个网址 → 这一次要跑的那条。抓不了的当场报错，不兜成一条失败的结果。"""
         crawler = self.crawler
         if crawler is None:
             raise ValueError("这个导入器没有接上抓取器，导入不了网址（组合根里接）")
         return _Entry(
-            source=url, kind=SourceKind.URL, normalize=lambda: crawler.crawl(url), identity=url
+            source=url,
+            kind=SourceKind.URL,
+            normalize=lambda: self._collect(
+                crawler.crawl(url), game_id=game_id, digest=_url_digest(url), label=url
+            ),
+            identity=url,
         )
 
     def _run(
@@ -497,23 +519,51 @@ class Importer:
             progress=tuple(reported),
         )
 
-    def _publish(self, doc: NormalizedDoc, source: SourceDocument, game_id: str) -> NormalizedDoc:
-        """解析产物里的原图进对象存储，正文与条目级结构的引用改指对象 key（`sources`）。
+    def _collect(
+        self, doc: NormalizedDoc, *, game_id: str, digest: str, label: str
+    ) -> NormalizedDoc:
+        """把这份资料里的图片收进对象存储：外链先拉下来，再连同自带的附件一起发出去。
 
-        没有附件（md／txt 来源）就直接过。**有附件却没接对象存储是接线错了**：
-        图片会连着正文里的引用一起悬空，而且整份资料照样报成功——宁可当场炸，
-        让那一个文件带着原因失败。
+        两条来源都走它——网页与 md 的图之前一直是外链，补图那一层按对象 key 取原图，
+        那些图因此一张都补不上（见 `ragamer.sources.fetch_images`）。
+
+        没接抓取器时外链取不回来，那就留着它们在正文里当外链。**留一条 warning**：
+        那多半是接线漏了（网页那条来源干脆是当场报错，见 `_url_entry`），
+        而静默跳过的样子与「这份资料本来就没有外链图」一模一样。
+        """
+        if self.crawler is None:
+            # 数的是**正文里**的引用，不是 `doc.images`：后者由解析适配器填，
+            # 而这一层要问的是「这份资料手上到底有几张取不到的图」
+            external = [
+                ref for ref in image_refs(doc.markdown) if ref.startswith(("http://", "https://"))
+            ]
+            if external:
+                logger.warning(
+                    "%s：有 %d 张外链图，但这个导入器没接抓取器，取不回来——"
+                    "它们不会进对象存储，也补不上摘要",
+                    label,
+                    len(external),
+                )
+        else:
+            doc = fetch_images(doc, crawler=self.crawler)
+        return self._publish(doc, game_id=game_id, digest=digest, label=label)
+
+    def _publish(
+        self, doc: NormalizedDoc, *, game_id: str, digest: str, label: str
+    ) -> NormalizedDoc:
+        """附件进对象存储，正文与条目级结构的引用改指对象 key（`sources`）。
+
+        没有附件就直接过。**有附件却没接对象存储是接线错了**：图片会连着正文里的引用
+        一起悬空，而且整份资料照样报成功——宁可当场炸，让那一条带着原因失败。
         """
         if not doc.assets:
             return doc
         if self.objects is None:
             raise SourceError(
-                f"{source.filename}：解析产物里有 {len(doc.assets)} 个附件，但没有接对象存储，"
+                f"{label}：资料里有 {len(doc.assets)} 张原图，但没有接对象存储，"
                 "它们会连同正文里的引用一起悬空"
             )
-        return publish_assets(
-            doc, self.objects, game_id=game_id, digest=_source_digest(source.data)
-        )
+        return publish_assets(doc, self.objects, game_id=game_id, digest=digest)
 
     def _vectorize(
         self,
