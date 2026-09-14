@@ -20,6 +20,8 @@ FlagEmbedding 拉进 torch 与 transformers，所以它放在可选的 `models` 
 
 from __future__ import annotations
 
+import os
+import re
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, Protocol
 
@@ -36,6 +38,33 @@ logger = get_logger(__name__)
 
 #: FlagEmbedding 没装时的提示。
 _INSTALL_HINT = "真实模型在可选的 models 组里，装法：uv sync --extra models"
+
+#: 长得像本地路径的取值前缀：盘符、绝对路径、`~` 或 `.` 开头的相对路径、UNC。
+#: **判据不能是「含斜杠」**——仓库名 `BAAI/bge-m3` 也带斜杠，那样会把模型名误判成路径。
+_PATH_LIKE = re.compile(r"^(?:[A-Za-z]:[\\/]|[\\/]|~[\\/]|\.{1,2}[\\/])")
+
+
+def _looks_like_path(value: str) -> bool:
+    """这个取值像不像本地路径。HuggingFace 的仓库名不像。"""
+    # 反斜杠只有 Windows 路径才用，仓库名里不会有
+    return "\\" in value or _PATH_LIKE.match(value) is not None
+
+
+def _require_local_dir(value: str, kind: str) -> None:
+    """配成了本地目录而目录不在时，当场说清楚。
+
+    FlagEmbedding 只判 `os.path.exists`，不在就 `snapshot_download(repo_id=取值)`——
+    于是一个写错或被挪走的路径会被它当成 HuggingFace 仓库名去下，报出来的是一句与
+    「目录不在」毫无关系、也看不出是路径问题的下载错误。这里先拦一道把话说明白。
+
+    只在「像路径」时才拦：填的是模型名（`BAAI/bge-m3`）时本来就该联网下，不拦。
+    """
+    if _looks_like_path(value) and not os.path.isdir(value):
+        raise ModelUnavailableError(
+            f"{kind}配成了本地目录，但这个目录不存在：{value}。"
+            "核对路径有没有写错、权重是不是被挪走了；"
+            "想让它去 HuggingFace 下载的话，这一项填模型名（形如 BAAI/bge-m3）而不是路径"
+        )
 
 
 class _M3Model(Protocol):
@@ -139,6 +168,7 @@ def load_bge_m3(config: EmbedSettings, shared: ModelSettings) -> _M3Model:
     会出现「本地明明有、却因为我们的判断与它不一致而下了一遍」。
     回归测试见 `tests/test_vectors_integration.py` 的 `test_本地目录存在时不去联网下载`。
     """
+    _require_local_dir(config.model, "向量化模型")
     try:
         from FlagEmbedding import BGEM3FlagModel
     except ImportError as exc:
@@ -158,6 +188,7 @@ def load_bge_reranker(config: RerankSettings, shared: ModelSettings) -> _Reranke
     与上面同一条：本地目录优先、没有才下载。这一条由 `transformers` 的
     `from_pretrained` 分流（它认本地目录，也认仓库名）。
     """
+    _require_local_dir(config.model, "精排模型")
     try:
         from FlagEmbedding import FlagReranker
     except ImportError as exc:
