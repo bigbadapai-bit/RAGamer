@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import os
 import re
+import threading
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, Protocol
 
@@ -93,6 +94,10 @@ class BgeM3Embedder:
 
     稠密向量开 `normalize_embeddings=True`（坑 #2：归一化后配 IP 度量等价余弦），
     这是接口的后置条件，不留给调用方自己做。
+
+    **一次只跑一批**（`_lock`）：一批导入里有几条并行时它们会同时喂模型，中间激活与
+    显存/内存按并发数翻倍，而 CPU 上并发只是把同一块 CPU 切来切去。锁只护这一次调用，
+    所以代价是「另一处最多等一批的时间」——导入在后台跑，查询侧的等待因此有界。
     """
 
     def __init__(
@@ -107,19 +112,21 @@ class BgeM3Embedder:
         self._lazy = LazyModel(
             _describe("向量化模型", config.model, shared), lambda: load(config, shared)
         )
+        self._lock = threading.Lock()
 
     def embed(self, texts: Sequence[str]) -> Embedding:
         batch = list(texts)
         if not batch:
             # 空批次不惊动模型：这一趟没有意义，还会白加载一次权重
             return Embedding(dense=(), sparse=())
-        result = self._lazy.get().encode(
-            batch,
-            batch_size=self._config.batch_size,
-            max_length=self._config.max_length,
-            return_dense=True,
-            return_sparse=True,
-        )
+        with self._lock:
+            result = self._lazy.get().encode(
+                batch,
+                batch_size=self._config.batch_size,
+                max_length=self._config.max_length,
+                return_dense=True,
+                return_sparse=True,
+            )
         return _to_embedding(result, len(batch))
 
 

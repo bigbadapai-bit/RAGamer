@@ -20,6 +20,7 @@ T10 的实测把代价量了出来：22 张真实截图里 56 个图片条目**�
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable
 from typing import Any, Protocol, runtime_checkable
 
@@ -87,9 +88,14 @@ class RapidOcrEngine:
     def __init__(self, *, loader: OcrLoader | None = None) -> None:
         load = loader if loader is not None else load_rapidocr
         self._lazy = LazyModel("二次 OCR 引擎", load)
+        #: 一次只识别一张。**引擎实例是不是线程安全没有查证**（RapidOCR 内部有会话与
+        #: 缓存的中间状态），而一批导入里有几条并行时它是共享的。本地重活串行化本来
+        #: 也不亏：CPU 上并发只是把同一块 CPU 切来切去，还多占一份内存。
+        self._lock = threading.Lock()
 
     def read(self, data: bytes) -> str:
-        result = self._run(data)
+        with self._lock:
+            result = self._run(data)
         return "\n".join(text for text in _texts(result) if text.strip())
 
     def _run(self, data: bytes) -> Any:

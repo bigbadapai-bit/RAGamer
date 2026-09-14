@@ -32,9 +32,12 @@ from __future__ import annotations
 
 import hashlib
 import re
+import threading
 from collections.abc import Callable, Iterable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
+from functools import partial
 from pathlib import Path
 
 from ragamer.caching.base import AnswerCache, CacheError
@@ -58,6 +61,10 @@ from ragamer.tagging import TaggedChunk, TagVocabulary, tag_document
 from ragamer.vectors.base import Embedder, ModelOutputError
 
 logger = get_logger(__name__)
+
+#: 一批里最多几条同时跑。见 `_in_parallel`：并行的是「等」，本地重活仍是串行的。
+#: 上限还受外部额度约束（MinerU 单账号并发、视觉模型限流），开大了会被挡回来。
+BATCH_WORKERS = 4
 
 #: 文档大标题。MediaWiki 页面的条目名就在这里。
 _TITLE = re.compile(r"^#\s+(.+?)\s*$", re.MULTILINE)
@@ -300,13 +307,19 @@ class Importer:
         **逐个独立**：某一条失败时其余照常入库。两类来源合成一个入口是因为它们本来
         就是「同一次提交」的两半——编号连着往后排，文档标识也共用一份认领表，
         同一次提交里一个文件与一个网址撞上才不会互相覆盖。
+
+        **最多 :data:`BATCH_WORKERS` 条同时跑**（见 `_in_parallel`）：一条接一条时，
+        等 MinerU 解析、等抓取、等视觉摘要、等打标的那几段全是空的，而这些正是这一批
+        的绝大部分时间。
         """
         total = len(sources) + len(urls)
-        claimed: dict[tuple[str, str], _Entry] = {}
+        claimed = _Claims()
         entries = [self._file_entry(source, game_id) for source in sources]
         entries += [self._url_entry(url, game_id) for url in urls]
-        results = tuple(
-            self._run(
+
+        def run(numbered: tuple[int, _Entry]) -> ImportResult:
+            number, entry = numbered
+            return self._run(
                 entry,
                 game_id=game_id,
                 version=version,
@@ -315,8 +328,8 @@ class Importer:
                 file_total=total,
                 claimed=claimed,
             )
-            for number, entry in enumerate(entries, start=1)
-        )
+
+        results = _in_parallel(run, entries)
         self._invalidate(game_id, results)
         return results
 
@@ -438,7 +451,7 @@ class Importer:
         vocabulary: TagVocabulary | None,
         file_number: int,
         file_total: int,
-        claimed: dict[tuple[str, str], _Entry] | None = None,
+        claimed: _Claims | None = None,
     ) -> ImportResult:
         """六个阶段走一遍。`entry.normalize` 是这里唯一的变量：本地资料读字节、网址去抓。
 
@@ -480,11 +493,13 @@ class Importer:
                 source_url=doc.source_url,
             )
             enter(ImportStage.STORE)
-            # 先看这个标识是不是已经被这一批里的别条占了——占了就不写，写下去就是覆盖
-            _check_claim(claimed, doc_title, version, entry)
-            self._store(game_id, doc_title, version, rows)
-            # 真写进去了才算占下：写失败的那条不该让后面的同名条报成「撞车」
-            _reserve(claimed, doc_title, version, entry)
+            # 查标识、写库、占下它三步连在一起（见 `_Claims.store`）：几条并行时中间插进
+            # 另一条同名资料，两条会都写下去，后写的那条把前一条整批删掉
+            write = partial(self._store, game_id, doc_title, version, rows)
+            if claimed is None:
+                write()
+            else:
+                claimed.store(doc_title, version, entry, write)
         # 兜住全部异常是「一个文件失败不牵连其余」要求的：读文件、抓网页、调模型、写库
         # 都可能以各自的异常类型挂掉，而这一批的其余文件不该跟着陪葬。兜住不等于吞掉
         # ——错误原文进结果、带调用栈进日志，两处都留痕。
@@ -653,28 +668,63 @@ def _unique(values: Iterable[str]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(values))
 
 
-def _check_claim(
-    claimed: dict[tuple[str, str], _Entry] | None,
-    doc_title: str,
-    version: str,
-    entry: _Entry,
-) -> None:
-    """这一批里「标题 + 版本」这个文档标识被别条占了吗？占了就当场失败，不写下去。
+def _in_parallel(
+    run: Callable[[tuple[int, _Entry]], ImportResult], entries: Sequence[_Entry]
+) -> tuple[ImportResult, ...]:
+    """一批按提交顺序编号、**最多 :data:`BATCH_WORKERS` 条同时跑**，结果按提交顺序返回。
 
-    文档标识同时是重导替换的范围：两条落成同一个标识时，后写的那条会把前一条整批删掉，
-    而两条结果都报成功——库里只剩一条，界面上却看着两份都进来了。宁可少一份、
-    并且说清为什么。同一份资料重复提交是例外：标识一样、内容也一样，写下去等于没写。
+    并行是为了把**等**重叠起来：MinerU 解析、抓取、视觉摘要、打标都是等网络，而这些
+    占了这一批的绝大部分时间。本地重活（向量化、二次 OCR）在各自的适配器里串行
+    （`BgeM3Embedder`、`RapidOcrEngine`），所以这个数不是「同时几个重活」。
+
+    **一条时不惊动线程池**：绝大多数提交就是一条，为它起一批线程不值当。
+
+    `Executor.map` 保序，所以结果与提交顺序一一对应——进度事件里的编号（`file_number`）
+    也是按这个顺序，界面上「第 3 条」在两处指的是同一条。
     """
-    if claimed is None:
-        return
-    first = claimed.get((doc_title, version))
-    if first is not None and first.identity != entry.identity:
-        raise DocumentCollision(first.source, doc_title)
+    numbered = list(enumerate(entries, start=1))
+    if len(numbered) <= 1:
+        return tuple(run(item) for item in numbered)
+    with ThreadPoolExecutor(
+        max_workers=min(BATCH_WORKERS, len(numbered)), thread_name_prefix="ragamer-import"
+    ) as pool:
+        return tuple(pool.map(run, numbered))
 
 
-def _reserve(
-    claimed: dict[tuple[str, str], _Entry] | None, doc_title: str, version: str, entry: _Entry
-) -> None:
-    """写进库了才算占下这个标识。写失败的那条不占——后面同名的那条该去写它自己的。"""
-    if claimed is not None:
-        claimed.setdefault((doc_title, version), entry)
+class _Claims:
+    """这一批里已经占下的文档标识。**带锁**：几条并行跑时，查与占之间有窗口。
+
+    文档标识（标题 + 版本）同时是重导替换的范围：两条落成同一个标识时，后写的那条会把
+    前一条整批删掉，而两条结果都报成功——库里只剩一条，界面上却看着两份都进来了。
+    宁可少一份、并且说清为什么。同一份资料重复提交是例外：标识一样、内容也一样，
+    写下去等于没写。
+
+    **查标识 → 写库 → 占下它三步连在一起**（`store`）：分开放的话，两条同名资料会同时
+    查到「没人占」，于是都写下去——正是上面那个后果。锁按标识分而不是整批一把：
+    不同标题之间没有互相等的理由，写库那一步不必跟着串行。
+    """
+
+    def __init__(self) -> None:
+        self._guard = threading.Lock()
+        self._taken: dict[tuple[str, str], _Entry] = {}
+        self._key_locks: dict[tuple[str, str], threading.Lock] = {}
+
+    def store(self, doc_title: str, version: str, entry: _Entry, write: Callable[[], None]) -> None:
+        """`write` 是真正入库那一步。查、写、占都在这一把（按标识的）锁里。
+
+        **写进库了才算占下**：写失败的那条不占，后面同名的那条该去写它自己的。
+        """
+        key = (doc_title, version)
+        with self._key_lock(key):
+            with self._guard:
+                first = self._taken.get(key)
+                if first is not None and first.identity != entry.identity:
+                    raise DocumentCollision(first.source, doc_title)
+            write()
+            with self._guard:
+                self._taken.setdefault(key, entry)
+
+    def _key_lock(self, key: tuple[str, str]) -> threading.Lock:
+        """这个标识的那把锁。**取锁本身也在锁里**：两个线程同时建会各拿一把，等于没锁。"""
+        with self._guard:
+            return self._key_locks.setdefault(key, threading.Lock())

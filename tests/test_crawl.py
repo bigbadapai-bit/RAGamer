@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+import threading
+import time
 from typing import Any
 
 import httpx
@@ -283,6 +285,88 @@ def test_不同主机之间不留间隔():
     first_other = min(at for host, at in timeline if host == "other.test")
     # B 站的第一跳与 A 站的最后一跳同时发生：中间一秒是给 A 站留的，B 站没等
     assert first_other == last_page_test
+
+
+class ConcurrentSleep:
+    """一个真会阻塞一会儿的 `sleep`，顺带记下**同时有几个线程在睡**。
+
+    一批导入里有几条并行时，限速破没破就看这个数：两个线程读到同一个「上次时刻」、
+    各自睡够同一段间隔、然后同时发出去——间隔就没了，而请求全成功，看不出来。
+    """
+
+    def __init__(self, clock: FakeClock, *, seconds: float = 0.1) -> None:
+        self._clock = clock
+        self._seconds = seconds
+        self._lock = threading.Lock()
+        self.inside = 0
+        self.most = 0
+
+    def __call__(self, seconds: float) -> None:
+        with self._lock:
+            self.inside += 1
+            self.most = max(self.most, self.inside)
+        # 真睡一会儿（钟等睡完再走：不想让先睡的那个顺手把别人的等待也算没了）
+        time.sleep(self._seconds)
+        self._clock.sleep(seconds)
+        with self._lock:
+            self.inside -= 1
+
+
+def _two_threads(crawl) -> None:
+    """两个线程同时开抓。起跑线卡在一起，好让它们真的撞在同一段临界区上。"""
+    start = threading.Barrier(2)
+
+    def go() -> None:
+        start.wait(timeout=5)
+        crawl()
+
+    threads = [threading.Thread(target=go) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+
+def test_并发抓同一台主机时限速照样生效():
+    """两个线程不许同时睡完同时发（见 `ConcurrentSleep`）。"""
+    site = page_site()
+    sleeper = ConcurrentSleep(site.clock)
+    crawler = HttpCrawler(
+        crawl_settings(),
+        client=httpx.Client(transport=httpx.MockTransport(site)),
+        sleep=sleeper,
+        clock=site.clock,
+    )
+    crawler.crawl("https://page.test/warm")  # 垫上「上次时刻」，两次并发请求才都要等
+
+    _two_threads(lambda: crawler.crawl("https://page.test/a"))
+
+    assert sleeper.most == 1, "两个线程同时在睡：间隔是各睡各的，等于没限速"
+    times = sorted(at for host, at in site.timeline() if host == "page.test")
+    assert times[-1] - times[-2] >= crawl_settings().min_interval
+
+
+def test_并发抓不同主机时互不等待():
+    """限速锁按主机分而不是全局一把：两站之间没有互相等的理由（见 `_origin_lock`）。"""
+    site = page_site()
+    site.route("https://other.test/robots.txt", "User-agent: *\nDisallow:\n")
+    site.route("https://other.test/", PAGE_HTML)
+    sleeper = ConcurrentSleep(site.clock)
+    crawler = HttpCrawler(
+        crawl_settings(),
+        client=httpx.Client(transport=httpx.MockTransport(site)),
+        sleep=sleeper,
+        clock=site.clock,
+    )
+    crawler.crawl("https://page.test/warm")
+    crawler.crawl("https://other.test/warm")
+    sleeper.most = 0
+
+    _two_threads(
+        lambda: (crawler.crawl("https://page.test/a"), crawler.crawl("https://other.test/a"))
+    )
+
+    assert sleeper.most == 2, "两站被一把全局锁串起来了：那是白等"
 
 
 def test_间隔可以配成零():

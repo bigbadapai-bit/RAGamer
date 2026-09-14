@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 import logging
+import threading
+from collections.abc import Sequence
 
 import pytest
 
@@ -26,7 +28,7 @@ from ragamer.sources import NormalizedDoc, SourceAsset, SourceDocument
 from ragamer.stores.base import UNVERSIONED, StoreUnavailableError, image_prefix
 from ragamer.stores.memory import InMemoryChunkStore, InMemoryObjectStore
 from ragamer.tagging import ContentNature, SubjectType, TagVocabulary
-from ragamer.vectors.base import ModelUnavailableError
+from ragamer.vectors.base import Embedding, ModelUnavailableError
 from ragamer.vectors.fake import FakeEmbedder
 
 from .conftest import FakeCrawler
@@ -341,6 +343,86 @@ def test_结果里带着来源的种类():
 
     assert [result.kind for result in results] == [SourceKind.FILE, SourceKind.URL]
     assert not results[1].ok  # 抓取失败那条也带得出种类，重试才知道往哪儿回填
+
+
+# --- 一批里并行（`BATCH_WORKERS`）---
+
+
+class BarrierEmbedder(FakeEmbedder):
+    """等齐 `size` 条才放行的假向量化。
+
+    串行跑时第一条会一直等到超时（`BrokenBarrierError`）而失败，所以「N 条都成功」
+    这件事本身就说明它们真的同时在跑；反过来，多出来的那几条等不到同伴，会失败——
+    上限是多少也就一并钉住了。
+    """
+
+    def __init__(self, size: int, *, timeout: float = 5.0) -> None:
+        super().__init__()
+        self.barrier = threading.Barrier(size, timeout=timeout)
+
+    def embed(self, texts: Sequence[str]) -> Embedding:
+        self.barrier.wait()
+        return super().embed(texts)
+
+
+def _small_docs(count: int) -> list[SourceDocument]:
+    """几份互不相干的小资料：各自有正文，所以每条都会走到向量化那一步。"""
+    return [
+        markdown(name=f"第{index}份.md", text=f"# 第{index}份\n\n这是第 {index} 份资料。\n")
+        for index in range(1, count + 1)
+    ]
+
+
+def test_一批里最多四条同时跑():
+    """四条一起到达向量化这一批才算过——一条一条跑的话第一条就等到超时了。"""
+    sources = _small_docs(importing.BATCH_WORKERS)
+
+    results = make_importer(embedder=BarrierEmbedder(importing.BATCH_WORKERS)).batch(
+        sources, game_id=GAME
+    )
+
+    assert [result.ok for result in results] == [True] * importing.BATCH_WORKERS
+    # 结果按提交顺序回来（进度事件里的编号也是这个顺序，界面上的「第 3 条」是同一个）
+    assert [result.source for result in results] == [source.filename for source in sources]
+
+
+def test_超过上限的那些要等前面跑完():
+    """六条一起提交、上限四条：前四条齐了就放行，后两条等不到同伴。
+
+    后两条失败是**假件**的判据（它要的正是一组四条），实际跑起来它们只是晚一点开始。
+    这一条钉的是「同时最多四条」。
+    """
+    size = importing.BATCH_WORKERS
+    sources = _small_docs(size + 2)
+
+    results = make_importer(embedder=BarrierEmbedder(size, timeout=0.5)).batch(
+        sources, game_id=GAME
+    )
+
+    assert [result.ok for result in results] == [True] * size + [False] * 2
+    # 失败的是排在后面的那两条，不是随便两条
+    assert [result.source for result in results] == [source.filename for source in sources]
+
+
+def test_两条同名资料同时跑也只有一条写进去():
+    """查标识与写库之间插进另一条的话，两条都会写下去——后写的那条把前一条整批删掉，
+    而两条结果都报成功（见 `_Claims`）。"""
+    chunks = InMemoryChunkStore()
+    sources = [
+        markdown(name="甲.md", text="# 二郎神\n\n甲写的正文。\n"),
+        markdown(name="乙.md", text="# 二郎神\n\n乙写的正文，与甲那份不一样。\n"),
+    ]
+
+    results = make_importer(chunks).batch(sources, game_id=GAME)
+
+    assert [result.ok for result in results].count(True) == 1
+    collided = next(result for result in results if not result.ok)
+    # 说清撞的是谁：界面要据此把这一条挡在「重试」之外
+    assert "也叫「二郎神」" in collided.error
+    assert collided.collides_with in {"甲.md", "乙.md"}
+    # 库里只有一条，而且是赢的那条写的
+    assert len(stored(chunks)) == 1
+    assert stored(chunks)[0].content in {"甲写的正文。", "乙写的正文，与甲那份不一样。"}
 
 
 def test_两个不同网址切成同一个标题时后一条失败():

@@ -412,9 +412,11 @@ def test_提交之后立刻返回_不用等这一批跑完(gated, gate):
     assert gate.entered.wait(timeout=JOB_TIMEOUT), "这一批没跑到向量化"
 
     live = gated.get(f"/import/result?job={job_id_of(response)}", headers={"HX-Request": "true"})
-    assert "正在向量化" in live.text
     assert "归一化 › 补图 › 切分 › 打标 › 向量化" in live.text
-    assert "排队中" in live.text  # 第二条还没轮到
+    # 这一批里的两条**同时**在跑（`BATCH_WORKERS`），不是一条一条来
+    assert live.text.count("正在向量化") == 2
+    # 排队是**批与批之间**的事（工作线程一次取一批），不是同一批里的条目
+    assert "排队中" not in live.text
 
     gate.opened.set()
     done = wait_for_done(gated, job_id_of(response), page=False)

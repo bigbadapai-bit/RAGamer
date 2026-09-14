@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
@@ -136,6 +137,9 @@ class HttpCrawler:
         #: robots.txt 只读一次——每页都读一遍是拿人家服务器当缓存用。
         self._last_request: dict[str, float] = {}
         self._robots: dict[str, RobotFileParser | None] = {}
+        #: 每台主机一把限速锁（见 `_throttle`），以及建锁时的那把守卫锁
+        self._locks: dict[str, threading.Lock] = {}
+        self._locks_guard = threading.Lock()
 
     def crawl(self, url: str) -> NormalizedDoc:
         """一个网址 → 一份归一化文档。
@@ -226,16 +230,29 @@ class HttpCrawler:
         """同一台主机两次请求之间至少隔 `min_interval` 秒。
 
         限的是**主机**不是页面：并发抓同一站的十个页面，压力全落在同一台服务器上。
+
+        **每个主机一把锁**：一批导入里有几条并行时，两个线程会读到同一个「上次时刻」、
+        各自睡够同一段间隔、然后同时发出去——限速当场破了，而且看不出来（请求都成功）。
+        锁按主机分而不是全局一把：不同站之间没有互相等的理由。
+
+        锁一直持有到「记下这次时刻」为止，中间那段 sleep 也在锁里——这正是限速的语义。
         """
         interval = self._config.min_interval
-        previous = self._last_request.get(origin)
-        now = self._clock()
-        if previous is not None and interval > 0:
-            wait = interval - (now - previous)
-            if wait > 0:
-                self._sleep(wait)
-                now = self._clock()
-        self._last_request[origin] = now
+        with self._origin_lock(origin):
+            previous = self._last_request.get(origin)
+            now = self._clock()
+            if previous is not None and interval > 0:
+                wait = interval - (now - previous)
+                if wait > 0:
+                    self._sleep(wait)
+                    now = self._clock()
+            self._last_request[origin] = now
+
+    def _origin_lock(self, origin: str) -> threading.Lock:
+        """这台主机的限速锁。**取锁本身也要在锁里**：两个线程同时建会各拿一把，
+        等于没锁。"""
+        with self._locks_guard:
+            return self._locks.setdefault(origin, threading.Lock())
 
     def _robots_for(self, origin: str) -> RobotFileParser | None:
         """一台主机的 robots 规则；`None` 表示没有规则、不限制。

@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import threading
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from typing import Any
@@ -326,6 +327,9 @@ class MilvusChunkStore:
         self._db = settings.db
         self._timeout = timeout
         self._milvus: MilvusClient | None = None
+        #: 建表那把锁（见 `ensure_collection`）。它不护客户端构造——`_client` 自己那一段
+        #: 由模块里那处已有的处理兜着
+        self._ensure_lock = threading.Lock()
 
     def check(self) -> None:
         """连通性自检：地址通不通、token 认不认，顺带确保本项目的 database 存在。
@@ -339,7 +343,16 @@ class MilvusChunkStore:
             raise unavailable(self.name, self.address, self._timeout, exc) from exc
 
     def ensure_collection(self, game_id: str) -> None:
-        """确保该游戏的 collection 存在、索引建好，**且表结构与代码里的那份对得上**。"""
+        """确保该游戏的 collection 存在、索引建好，**且表结构与代码里的那份对得上**。
+
+        **查与建在同一把锁里**：一批导入里有几条并行时，两条会同时看见「还没有表」，
+        然后各建一次——后建的那条拿到的是服务端的「已存在」错误，整条资料跟着失败。
+        建表是一次性的动作，串行化它没有任何代价。
+        """
+        with self._ensure_lock:
+            self._ensure_locked(game_id)
+
+    def _ensure_locked(self, game_id: str) -> None:
         client = self._client()
         name = collection_name(game_id)
         if not client.has_collection(name, timeout=self._timeout):
