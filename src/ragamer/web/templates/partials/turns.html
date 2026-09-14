@@ -10,7 +10,7 @@
 {% for turn in turns %}
 {% if turn.role == "user" %}
 <article class="ml-auto max-w-[85%] rounded-lg bg-slate-900 px-4 py-2 text-sm text-white">
-  {{ turn.content }}
+  {{ turn.body }}
 </article>
 {% else %}
 <article class="max-w-[95%] rounded-lg border border-slate-200 bg-white px-4 py-3">
@@ -22,15 +22,19 @@
     {% endif %}
   </div>
 
-  <p class="text-sm leading-relaxed whitespace-pre-wrap">{{ turn.content }}</p>
+  {# 正文按一个安全子集排过版（`ragamer.web.markdown`）：它已经转义过、只放行白名单，
+     所以这里是 Markup 而不是要再转义一遍的字符串。块级标签（列表、标题）装不进 `<p>`，
+     外面得是 `div`——用 `<p>` 的话浏览器会在列表前把段落截断。 #}
+  <div class="text-sm leading-relaxed">{{ turn.body }}</div>
 
   {% if turn.citations %}
   <details class="mt-3 text-xs">
     <summary class="cursor-pointer text-slate-500">来源 {{ turn.citations | length }} 条</summary>
+    {# 只列标题，不挂 `[编号]`：正文里已经不出现编号了（`ragamer.answering`），
+       这里再挂一个就成了没人对得上的号；`<ol>` 本身的序号就够了。 #}
     <ol class="mt-2 space-y-1">
       {% for citation in turn.citations %}
       <li class="text-slate-600">
-        <span class="text-slate-400">[{{ citation.index }}]</span>
         {# 标题与祖先标题路径的拼法由 `Citation.label` 一处定：页面自己再拼一遍，
            祖先路径以文档标题开头时就会念两遍（「二郎神 · 二郎神 › 掉落」）。 #}
         <span class="font-medium">{{ citation.label }}</span>

@@ -77,6 +77,7 @@ from ragamer.tagging import (
     SubjectType,
     TagVocabulary,
 )
+from ragamer.web.markdown import to_html
 
 #: 模板目录。跟着包走，装成 wheel 也在。
 TEMPLATES = Path(__file__).parent / "templates"
@@ -842,11 +843,19 @@ def _version_options(container: Container, game_id: str, *, selected: str) -> li
 
 
 def _turn_rows(turns: Sequence[Turn]) -> list[dict[str, Any]]:
-    """会话里的消息 → 模板要的那几样。用户那一侧只有原话，模型那一侧还带来源与图。"""
+    """会话里的消息 → 模板要的那几样。用户那一侧只有原话，模型那一侧还带来源与图。
+
+    `body` 是**排过版的那一份**（`ragamer.web.markdown` 认的那几种记号）：模型写的是
+    Markdown，而模板原先直接输出纯文本，星号与列表符会原样露在页面上。排版只做一次、
+    只在这一处：流式那一轮的正文由页面自己拼，答完被这整块换掉（`turns.html`）。
+
+    `content` 保留原样（存进会话、也走 API 的就是它），`body` 只给页面用。
+    """
     return [
         {
             "role": turn.role,
             "content": turn.content,
+            "body": to_html(turn.content),
             "version": turn.version,
             "citations": [
                 {

@@ -189,6 +189,26 @@ def test_引用来源带着文档标题与祖先标题路径():
     assert "二郎神 › 掉落" in page
 
 
+def test_答案按子集排版且来源不挂编号():
+    """模型写的是 Markdown，而模板原先直接输出纯文本：`**` 与 `- ` 会原样露在页面上
+    （实测一条答案里 `**` 出现 10 处）。排版的规则本身在 `tests/test_web_markdown.py`，
+    这里验的是它接在了页面上。
+
+    来源那一行同时不再挂 `[编号]`：正文里已经不出现编号了，再挂一个就成了没人对得上的号。
+    """
+    answer = "**打法**：\n- 先定身\n- 再贴身输出"
+    client = client_with(FakeLlm(said("二郎神怎么打"), answer), DOC)
+    session_id = start(client)
+
+    page = ask(client, session_id).text
+
+    assert "<strong>打法</strong>" in page
+    assert "**打法**" not in page
+    assert "<li>先定身</li>" in page
+    assert "来源 1 条" in page
+    assert "[1]" not in page
+
+
 def test_答案相关的图片直接显示在页面里():
     client = client_with(FakeLlm(said("二郎神怎么打"), REPLY), DOC)
     session_id = start(client)

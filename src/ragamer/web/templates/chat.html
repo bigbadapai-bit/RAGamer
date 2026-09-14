@@ -215,9 +215,11 @@
           );
           var list = document.createElement("ol");
           list.className = "mt-1 space-y-0.5";
+          // 只列标题，不挂 `[编号]`：正文里已经不出现编号了，这里再挂一个就成了
+          // 没人对得上的号（服务端渲染那一份也是这么列的，见 partials/turns.html）
           payload.citations.forEach(function (citation) {
             var item = document.createElement("li");
-            item.textContent = "[" + citation.index + "] " + citation.label;
+            item.textContent = citation.label;
             list.appendChild(item);
           });
           box.appendChild(list);
