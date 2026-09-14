@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import html
 import re
 import threading
 import time
@@ -952,6 +953,38 @@ def test_能设置这个库的现行版本(client, container):
     assert response.status_code == 303
     assert container.docs.get(KB_COLLECTION, GAME)["version"] == "2.0"
     assert "2.0" in kb_page(client).text
+
+
+def test_知识库页列出已导入的资料_每行能点进切分预览(client, container):
+    """从切片现算（`ChunkStore.documents`），不读台账——列出来的永远是库里真有的。"""
+    do_import(client)
+
+    page = kb_page(client).text
+
+    assert DOC_TITLE in page
+    assert "未标注版本" in page  # 这一批没标版本（ADR-0004），空串显示成空串像没渲染出来
+    link = re.search(r'href="(/kb/[^"]*preview[^"]*)"', page)
+    assert link is not None, page
+    preview = client.get(html.unescape(link.group(1)))
+    assert preview.status_code == 200
+    assert "先定身" in preview.text  # 点进去看的正是这一份的内容
+
+
+def test_两份资料都列出来_按标题与版本排(client, container):
+    do_import(client)
+    do_import(client, version="2.0")
+
+    rows = [row for row in rows_of(kb_page(client).text) if DOC_TITLE in row]
+
+    assert len(rows) == 2
+    assert "未标注版本" in rows[0] and "2.0" in rows[1]
+
+
+def test_一份资料都没导时给一句去导入(client, container):
+    page = kb_page(client).text
+
+    assert "还没有导入任何资料" in page
+    assert "/import?game_id=" in page
 
 
 def test_预览页不带版本时按现行版本取切片(client, container):

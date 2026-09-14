@@ -24,7 +24,7 @@ from ragamer.stores import (
     Store,
     StoreError,
 )
-from ragamer.stores.base import UNVERSIONED
+from ragamer.stores.base import UNVERSIONED, DocumentSummary
 
 from .conftest import fake_vector, make_chunk
 
@@ -149,6 +149,41 @@ def test_版本只按这个游戏列(memory_container):
     store.upsert("yanyun", [make_chunk(2, version="3.0", game_id="yanyun")])
 
     assert store.versions("black_myth") == ("1.0",)
+
+
+def test_数得出这个库里有哪些资料(memory_container):
+    """知识库管理页要回答「我导进了什么」，而这件事只落在切片自己的字段上。"""
+    store = memory_container.chunks
+    store.upsert(
+        "black_myth",
+        [
+            make_chunk(1, doc_title="二郎神", version=UNVERSIONED),
+            make_chunk(2, doc_title="二郎神", version=UNVERSIONED),
+            make_chunk(3, doc_title="白龙马", version=UNVERSIONED),
+            make_chunk(4, doc_title="二郎神", version="2.0"),
+        ],
+    )
+
+    # 字面升序（码点，不是拼音）：未标注版本（空串）排在同一份资料的最前
+    assert store.documents("black_myth") == (
+        DocumentSummary("二郎神", UNVERSIONED, 2),
+        DocumentSummary("二郎神", "2.0", 1),
+        DocumentSummary("白龙马", UNVERSIONED, 1),
+    )
+
+
+def test_还没有资料的库列出来是空的(memory_container):
+    """建了库、一份资料都没导：页面上那句「还没有导入任何资料」靠它。"""
+    assert memory_container.chunks.documents("black_myth") == ()
+
+
+def test_资料只按这个游戏列(memory_container):
+    """一个游戏一个 collection（ADR-0002）。"""
+    store = memory_container.chunks
+    store.upsert("black_myth", [make_chunk(1, doc_title="二郎神")])
+    store.upsert("yanyun", [make_chunk(2, doc_title="燕云", game_id="yanyun")])
+
+    assert [item.doc_title for item in store.documents("black_myth")] == ["二郎神"]
 
 
 def test_取一份文档的全部切片按顺序且不混版本(memory_container):

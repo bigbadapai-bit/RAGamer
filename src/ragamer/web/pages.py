@@ -62,6 +62,7 @@ from ragamer.knowledge import (
     vocabulary_of,
 )
 from ragamer.llm import LlmError
+from ragamer.logging import get_logger
 from ragamer.sources import SourceDocument
 from ragamer.stores.base import (
     IMAGE_PREFIX,
@@ -78,6 +79,8 @@ from ragamer.tagging import (
     TagVocabulary,
 )
 from ragamer.web.markdown import to_html
+
+logger = get_logger(__name__)
 
 #: 模板目录。跟着包走，装成 wheel 也在。
 TEMPLATES = Path(__file__).parent / "templates"
@@ -1012,11 +1015,42 @@ def _knowledge_base_page(
             for kind in knowledge_base.vocabulary.subject_types
         ],
         rows=_mapping_rows(knowledge_base),
+        documents=_document_rows(container, game_id),
         message=message,
         error=error,
         status_code=status_code,
         **fields,
     )
+
+
+def _document_rows(container: Container, game_id: str) -> list[dict[str, Any]]:
+    """知识库页上「已导入的资料」那一段：标题 · 版本 · 片数，每行链到切分预览。
+
+    **从切片现算**（`ChunkStore.documents`），不读台账：库里的资料就是切片本身，
+    另记一份迟早与它各说一套。
+
+    标识与答案引用是同一对取值（`doc_title` + `version`），所以答案里那条来源
+    「二郎神 › 掉落」能在这一页上找到「二郎神」那一行——切分预览认的也是它。
+
+    读不出来时（Milvus 连不上之类）**不留空白也不报错**：配置页本身还能改，
+    那一段少一份清单不该把它整个拦下来。空列表在模板里就是「还没有导入任何资料」。
+    """
+    try:
+        documents = container.chunks.documents(game_id)
+    except Exception as exc:  # noqa: BLE001 — 见 docstring：这一处不拦页面
+        logger.warning("列不出 %s 的资料：%s", game_id, exc)
+        return []
+    return [
+        {
+            "doc_title": document.doc_title,
+            # 空串是未标注版本（ADR-0004）：界面上直接显示空串像没渲染出来
+            "version": document.version,
+            "version_label": document.version or "未标注版本",
+            "chunk_count": document.chunk_count,
+            "preview_url": _preview_url(game_id, document.doc_title, document.version),
+        }
+        for document in documents
+    ]
 
 
 def _config_error(

@@ -69,6 +69,19 @@ class ChunkHit:
 
 
 @dataclass(frozen=True, slots=True)
+class DocumentSummary:
+    """库里一份资料的概况：标识 + 有多少片。
+
+    `doc_title` 与 `version` 就是 `Chunk` 上那两个字段，也是答案引用与切分预览认的
+    标识（见 :meth:`ChunkStore.documents`）。`version` 为空串即未标注版本。
+    """
+
+    doc_title: str
+    version: str
+    chunk_count: int
+
+
+@dataclass(frozen=True, slots=True)
 class ChunkFilter:
     """结构化过滤条件。
 
@@ -270,6 +283,23 @@ class ChunkStore(Store, Protocol):
           不同版本的切片，而且不会报错（ADR-0004）。
         - 传 `None`：不过滤。跟随 `ragamer.query.version_filter` 在问题与知识库都给不出
           版本时的收窄——聚合与检索必须是同一套口径，聚合另立一套就等于把版本判错两次。
+        """
+        ...
+
+    def documents(self, game_id: str) -> tuple[DocumentSummary, ...]:
+        """这个库里导过哪些资料：一片一片数出 `(文档标题, 版本)` 与各自的切片数。
+
+        知识库管理页要能回答「我导进了什么」，而这件事**没有第二处记得**：资料就是切片
+        本身，按 `doc_title` + `version` 组织。所以这里是从切片现算的，不是读一份台账
+        ——列出来的永远是库里真有的，不会与台账各说一套。
+
+        **标识与答案引用里的 `doc_title` 是同一个字段**：引用上写着「文档标题 › 祖先标题
+        路径」（`ragamer.answering.Citation`），页面上列的那一行要能对得回去；切分预览
+        （`fetch_document`）也按这一对取值取。
+
+        排序是 `(文档标题, 版本)` 字面升序，未标注版本（空串）排在最前。
+
+        库还不存在（建了库但一份资料都没导）时返回空元组，不报错。
         """
         ...
 

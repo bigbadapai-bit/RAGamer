@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -36,6 +37,7 @@ from ragamer.stores.base import (
     Chunk,
     ChunkFilter,
     ChunkHit,
+    DocumentSummary,
     StoreError,
     collection_name,
     require_vectors,
@@ -438,6 +440,36 @@ class MilvusChunkStore:
         finally:
             iterator.close()
         return tuple(sorted(found))
+
+    def documents(self, game_id: str) -> tuple[DocumentSummary, ...]:
+        """这个库里导过哪些资料。**扫的是整个 collection**（见协议里的说明）。
+
+        与 `versions` 同一个打法、同一笔代价：用迭代器分页扫，不落 `offset + limit`
+        那个 16384 的上限。只取 `doc_title` 与 `version` 两列，片数在本地数。
+
+        这个库还不存在（建了库、一份资料都没导）时返回空元组，不报错。
+        """
+        client = self._client()
+        name = collection_name(game_id)
+        if not client.has_collection(name, timeout=self._timeout):
+            return ()
+        iterator = client.query_iterator(
+            collection_name=name,
+            batch_size=VERSION_SCAN_BATCH,
+            filter="",
+            output_fields=["doc_title", "version"],
+            timeout=self._timeout,
+        )
+        counted: Counter[tuple[str, str]] = Counter()
+        try:
+            while batch := iterator.next():
+                counted.update((str(row["doc_title"]), str(row["version"])) for row in batch)
+        finally:
+            iterator.close()
+        return tuple(
+            DocumentSummary(doc_title, version, count)
+            for (doc_title, version), count in sorted(counted.items())
+        )
 
     def fetch_document(self, game_id: str, doc_title: str, *, version: str | None) -> list[Chunk]:
         client = self._client()

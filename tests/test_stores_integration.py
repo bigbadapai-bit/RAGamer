@@ -15,7 +15,7 @@ import pytest
 from ragamer.config import ConfigError, Settings, load_settings
 from ragamer.container import build_container
 from ragamer.logging import setup_logging
-from ragamer.stores.base import Chunk, ChunkFilter
+from ragamer.stores.base import Chunk, ChunkFilter, DocumentSummary
 from ragamer.stores.chunks import DENSE_DIM
 
 from .conftest import fake_vector, make_chunk
@@ -165,6 +165,53 @@ def test_列版本扫得完整且不漏未标注版本(settings: Settings, probe
         assert container.chunks.versions(PROBE_GAME) == ("1.0", "2.0")
     finally:
         container.chunks.drop(PROBE_GAME)
+
+
+def test_数资料要按标题与版本分组(settings: Settings, probe_chunks: list[Chunk]):
+    """知识库管理页靠它列「我导进了什么」。
+
+    分组、片数、以及未标注版本（空串）要原样回来——这三样都只有真库验得了：
+    换成分页迭代扫之后，同一份文档的切片会落在不同页上，数漏了页面上就少一片。
+    """
+    container = build_container(settings)
+    container.chunks.check()
+    other_doc = make_chunk(
+        3,
+        game_id=PROBE_GAME,
+        doc_title="另一份资料",
+        chunk_index=0,
+        dense_vector=fake_vector(3, DENSE_DIM),
+        sparse_vector={3: 0.5},
+    )
+    other_version = make_chunk(
+        4,
+        game_id=PROBE_GAME,
+        doc_title="探针文档",
+        chunk_index=2,
+        version="2.0",
+        dense_vector=fake_vector(4, DENSE_DIM),
+        sparse_vector={4: 0.5},
+    )
+    try:
+        container.chunks.ensure_collection(PROBE_GAME)
+        container.chunks.upsert(PROBE_GAME, [*probe_chunks, other_doc, other_version])
+
+        # 按 (标题, 版本) 字面升序——码点，不是拼音（「另」排在「探」前面）
+        assert container.chunks.documents(PROBE_GAME) == (
+            DocumentSummary("另一份资料", "1.0", 1),
+            DocumentSummary("探针文档", "1.0", 2),
+            DocumentSummary("探针文档", "2.0", 1),
+        )
+    finally:
+        container.chunks.drop(PROBE_GAME)
+
+
+def test_列一个还没有资料的库得到空(settings: Settings):
+    """建了库、一份资料都没导：页面上那句「还没有导入任何资料」靠它，扫不存在的表会炸。"""
+    container = build_container(settings)
+    container.chunks.check()
+
+    assert container.chunks.documents(PROBE_GAME) == ()
 
 
 def test_列一个还没有切片的库的版本得到空(settings: Settings):

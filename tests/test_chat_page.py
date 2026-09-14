@@ -196,6 +196,28 @@ def test_删一个已经不在了的会话当场说清():
     assert "不存在" in response.text
 
 
+def test_知识库页列的资料与答案里的来源对得上():
+    """答案里那条来源写的是「文档标题 › 祖先标题路径」（`Citation.label`），而知识库
+    管理页列的是同一个 `doc_title`——对不回去的话，那一页列的就只是另一份编号。
+
+    切分预览认的也是这一对取值（`ChunkStore.documents` 与 `fetch_document` 同一个字段），
+    所以顺着那一行点进去，看到的就是引用指的那一份。
+    """
+    client = client_with(FakeLlm(said("二郎神怎么打"), REPLY), DOC)
+    session_id = start(client)
+    ask(client, session_id)
+    cited = client.get(f"/api/chat/sessions/{session_id}").json()["turns"][1]["citations"][0]
+
+    page = client.get(f"/kb/{GAME}").text
+
+    assert cited["doc_title"] in page
+    link = re.search(r'href="(/kb/[^"]*preview[^"]*)"', page)
+    assert link is not None, page
+    preview = client.get(html.unescape(link.group(1)))
+    assert preview.status_code == 200
+    assert "三尖两刃刀" in preview.text  # DOC 的正文
+
+
 def test_一个会话都没有时列出的是空列表不是_404():
     client = client_with(FakeLlm())
 

@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -18,6 +19,7 @@ from ragamer.stores.base import (
     Chunk,
     ChunkFilter,
     ChunkHit,
+    DocumentSummary,
     StoreError,
     collection_name,
     matches,
@@ -97,6 +99,17 @@ class InMemoryChunkStore:
             if matches(chunk, where)
         ]
         return sorted(chunks, key=lambda chunk: chunk.chunk_index)
+
+    def documents(self, game_id: str) -> tuple[DocumentSummary, ...]:
+        """与真实适配器同一套口径：按 `(文档标题, 版本)` 数片数，字面升序。"""
+        counted: Counter[tuple[str, str]] = Counter(
+            (chunk.doc_title, chunk.version)
+            for chunk in self._collection(collection_name(game_id)).values()
+        )
+        return tuple(
+            DocumentSummary(doc_title, version, count)
+            for (doc_title, version), count in sorted(counted.items())
+        )
 
     def delete_document(self, game_id: str, doc_title: str, *, version: str) -> None:
         """与真实适配器同一套走法：先按文档查，再只删版本精确对上的那些。"""
