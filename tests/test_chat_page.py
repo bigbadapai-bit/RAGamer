@@ -23,6 +23,7 @@ from ragamer.knowledge import KB_COLLECTION
 from ragamer.llm import FakeLlm
 
 from .conftest import chunk_store, joint_reply, make_chunk, make_container
+from .test_web import nav_urls
 
 GAME = "black_myth"
 OTHER = "yanyun"
@@ -92,6 +93,26 @@ def test_左栏列出的是知识库不是聊过的游戏():
 
     assert "黑神话·悟空" in page
     assert "这个库还没聊过" not in page  # 没选库时连会话那一段都不该出现
+
+
+def test_导航在会话里指回这个会话():
+    """切到别的页再点「对话」应当回到正在看的这一条，而不是回到「选一个库」。"""
+    client = client_with(FakeLlm(said("二郎神怎么打"), REPLY))
+    session_id = start(client)
+
+    urls = nav_urls(client.get(f"/chat/{GAME}/{session_id}").text)
+
+    assert urls["对话"] == f"/chat/{GAME}/{session_id}"
+    assert urls["知识库管理"] == f"/kb/{GAME}"
+
+
+def test_还没开会话时导航回到那个库():
+    """只选到库这一层：回去就是那个库的会话列表，不必再选一次库。"""
+    client = client_with(FakeLlm(), kb=KB)
+
+    urls = nav_urls(client.get(f"/chat/{GAME}").text)
+
+    assert urls["对话"] == f"/chat/{GAME}"
 
 
 def test_选中一个库之后列出它的近期会话():

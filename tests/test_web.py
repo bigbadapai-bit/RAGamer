@@ -72,6 +72,21 @@ def plain_text(page: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", page))
 
 
+#: 导航那一段。它是外壳里唯一的 `<aside>`，按标签取向。
+_NAV_LINK = re.compile(r'<a href="([^"]+)"[^>]*>([^<]+)</a>', re.DOTALL)
+
+
+def nav_urls(page: str) -> dict[str, str]:
+    """导航四项各自的落点：标签 → href。
+
+    取的是 `<aside>` 那一段而不是整页——正文里也有指向同一个会话的链接，
+    整页搜会把「导航指对了」验成一句空话。
+    """
+    aside = re.search(r"<aside.*?</aside>", page, re.DOTALL)
+    assert aside is not None, "页面里没有导航"
+    return {label: href for href, label in _NAV_LINK.findall(aside.group(0))}
+
+
 def tags_of(chunk) -> list[str]:
     """这个切片在页面上该显示成哪些标签（中文叫法，不是落库的枚举值）。"""
     return [SUBJECT_TYPE_NAMES.get(kind, kind) for kind in chunk.subject_type] + [
@@ -422,6 +437,72 @@ def test_不带脚本时提交完跳到任务页_整页自己刷(gated, gate):
     gate.opened.set()
     done = wait_for_done(gated, job_id_of(response), page=True)
     assert '<noscript><meta http-equiv="refresh"' not in done.text  # 跑完就不刷了
+
+
+def test_切走再切回来还看得见在跑的那一批(gated, gate):
+    """导入在后台跑，地址栏里那个任务号却不跟着人走：切到别的页再切回来只剩库了。
+    这一批还在跑，就该接着显示它——而不是一张什么都没有的空表单。"""
+    response = submit(gated, upload("甲.md"), upload("白龙马.md", DRAGON))
+    assert gate.entered.wait(timeout=JOB_TIMEOUT)
+
+    page = gated.get(f"/import?game_id={GAME}").text
+
+    assert RUNNING_MARK in page
+    assert "正在向量化" in page
+    gate.opened.set()
+    wait_for_done(gated, job_id_of(response), page=True)
+
+
+def test_没带库时也认领得到在跑的那一批(gate):
+    """没选库时点「导入」落到的那个裸地址，会把下拉默认选到字母序第一个库。不跨库找的话
+    人看到的是另一个库的旧结果——比空白更误导，因为它看着像「我这一批」。"""
+    container = make_kb_container(embedder=gate)
+    create_knowledge_base(
+        container.docs, KnowledgeBase.new("aaa_first", "甲库", (SubjectType.CHARACTER,))
+    )
+    client = TestClient(create_app(container))
+
+    response = submit(client, upload("二郎神.md"), game_id=GAME)
+    assert gate.entered.wait(timeout=JOB_TIMEOUT)
+
+    page = client.get("/import").text
+
+    assert RUNNING_MARK in page
+    # 表单跟着这一批走：显示 A 库的结果、表单却停在 B 库，是同一个坑的另一半
+    assert f'<option value="{GAME}" selected>' in page
+    gate.opened.set()
+    wait_for_done(client, job_id_of(response), page=True)
+
+
+def test_认领不越库(gated, gate):
+    """那一批是导进别处的：这个库的导入页不该把它显示出来。"""
+    response = submit(gated, upload("甲.md"))
+    assert gate.entered.wait(timeout=JOB_TIMEOUT)
+
+    page = gated.get("/import?game_id=yanyun").text
+
+    assert RUNNING_MARK not in page
+    gate.opened.set()
+    wait_for_done(gated, job_id_of(response), page=True)
+
+
+def test_跑完的那一批不带任务号也看得到(client):
+    """切走之后跑完了、再切回来：看到这一批的结果比看到一张空表单强。"""
+    do_import(client)
+
+    page = client.get(f"/import?game_id={GAME}").text
+
+    assert "导入结果" in page
+    assert "看切分结果" in page
+    assert RUNNING_MARK not in page  # 跑完的不再轮询
+
+
+def test_一批都没跑过时导入页就是空表单(client):
+    """认领不能凭空造一条任务出来：一次都没导过时那一页照旧是空的。"""
+    page = client.get("/import").text
+
+    assert "导入结果" not in page
+    assert "这个导入任务不在了" not in page
 
 
 def test_任务号认不出来时说一句人话(client):
@@ -787,6 +868,31 @@ def test_每个页面都有四项导航(client, path):
 
     for label in ("对话", "知识库管理", "导入", "评测"):
         assert label in page, f"{path} 的导航里少了「{label}」"
+
+
+def test_导航带着所在库的上下文(client):
+    """在某个库里时导航指向那个库：切到别的页再点回来，不必从头挑一遍。"""
+    urls = nav_urls(client.get(f"/kb/{GAME}").text)
+
+    assert urls["知识库管理"] == f"/kb/{GAME}"
+    assert urls["导入"] == f"/import?game_id={GAME}"
+    assert urls["对话"] == f"/chat/{GAME}"
+    assert urls["评测"] == "/eval"  # 还没有「哪个库的评测」这回事，照旧
+
+
+def test_没选中库时导航是裸地址(client):
+    """列表页上没有「当前这个库」，四项照旧——不能凭空造一个出来。"""
+    urls = nav_urls(client.get("/kb").text)
+
+    assert urls["知识库管理"] == "/kb"
+    assert urls["导入"] == "/import"
+
+
+def test_导入页的导航指回那个库的管理页(client):
+    """导入页原先没有 `game_id`，「知识库管理」只能落回列表页。"""
+    urls = nav_urls(client.get("/import", params={"game_id": GAME}).text)
+
+    assert urls["知识库管理"] == f"/kb/{GAME}"
 
 
 def test_还没做的页面点进去是一句人话而不是_404(client):

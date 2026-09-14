@@ -170,7 +170,7 @@ class _Job:
 
 @dataclass
 class ImportJobs:
-    """导入任务的登记处：提交、排队、跑、按 id 查快照。
+    """导入任务的登记处：提交、排队、跑、按 id 或按库查快照。
 
     做成对象而不是一组模块级的函数，是为了没有模块级单例（见 `tests/test_conventions.py`）：
     由组合根造一个、注入给页面，测试里换得掉。
@@ -224,6 +224,27 @@ class ImportJobs:
         with self._lock:
             job = self._jobs.get(job_id)
         return None if job is None else job.snapshot()
+
+    def latest(self, game_id: str = "") -> JobSnapshot | None:
+        """这个库最近该看的那条任务，没有就是 `None`。
+
+        **在跑的那条优先**：换个页回来时人想看的是「我那一批跑到哪了」，不是上一批的旧
+        结果。同时在跑的取**最早**那条——工作线程一次只跑一批，最早未完成的正是它手上
+        那条，界面显示它才对得上实际的进度。
+
+        `game_id` 留空即不限库。导入页没带库时靠它兜住「总得让人看见还在跑的那批」：
+        那一页会把下拉默认选到字母序第一个库，与实际在跑的那个往往不是同一个。
+
+        任务早被丢掉时（服务重启过、或者超出 `history`）返回 `None`，与 `snapshot` 一致。
+        """
+        with self._lock:
+            candidates = [
+                job for job in self._jobs.values() if not game_id or job.game_id == game_id
+            ]
+        if not candidates:
+            return None
+        running = [job for job in candidates if not job.finished]
+        return (running[0] if running else candidates[-1]).snapshot()
 
     def _forget_old(self) -> None:
         """超出 history 就从最早的开始丢，**只丢跑完的**——在跑的丢掉就没人认得出它了。"""

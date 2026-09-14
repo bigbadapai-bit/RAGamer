@@ -233,6 +233,50 @@ def test_在跑的任务不会被丢掉():
     gate.opened.set()
 
 
+# --- 换个页回来还认得出那一批 ---
+
+
+def test_都跑完了就认领最后提交的那条():
+    jobs = make_jobs()
+
+    first = jobs.submit([doc("甲.md")], game_id=GAME, version="")
+    wait(jobs, first)
+    second = jobs.submit([doc("乙.md", SECOND_ARTICLE)], game_id=GAME, version="")
+    wait(jobs, second)
+
+    claimed = jobs.latest(GAME)
+    assert claimed is not None and claimed.job_id == second
+
+
+def test_认领时取正在跑的那条_不是排在后面的那条():
+    """工作线程一次只跑一批：同时提交两批时显示排队那条，等于报一个假的进度。"""
+    gate = Gate()
+    jobs = make_jobs(embedder=gate)
+
+    first = jobs.submit([doc("甲.md")], game_id=GAME, version="")
+    assert gate.entered.wait(timeout=TIMEOUT)
+    jobs.submit([doc("乙.md", SECOND_ARTICLE)], game_id=GAME, version="")
+
+    claimed = jobs.latest(GAME)
+    assert claimed is not None and claimed.job_id == first
+    gate.opened.set()
+
+
+def test_认领不越库_留空才不限库():
+    """留空那一支是给没带库的导入页用的：总得让人看见还在跑的那批。"""
+    jobs = make_jobs()
+
+    job_id = jobs.submit([doc("甲.md")], game_id=GAME, version="")
+    wait(jobs, job_id)
+
+    assert jobs.latest("别的库") is None
+    assert jobs.latest() is not None
+
+
+def test_一条任务都没有时认领给_None():
+    assert make_jobs().latest(GAME) is None
+
+
 def test_整批没跑起来时任务带着原因收场():
     """给了网址却没接抓取器是接线错，不是某一条资料的错——但界面也得有个交代，
     不能让那一页永远转圈。"""
