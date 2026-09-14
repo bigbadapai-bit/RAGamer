@@ -26,7 +26,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Any, Protocol, runtime_checkable
-from urllib.parse import unquote, urlsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 from ragamer.logging import get_logger
 from ragamer.stores.base import IMAGE_PREFIX, ObjectStore, image_key
@@ -274,6 +274,10 @@ def image_refs(markdown: str) -> tuple[str, ...]:
 #: 它是页面上那张图实际显示的宽度，一个行内图标与一张立绘的差别就落在这一段上。
 _THUMB_WIDTH = re.compile(r"/(\d+)px-")
 
+#: 缩略图地址最后一段开头的显示宽度（`130px-立绘.png`）。存下来的是原图，
+#: 名字里留着那个宽度是错的——它只是 wiki 当时要显示多大。
+_THUMB_NAME = re.compile(r"^\d+px-")
+
 #: 显示宽度不超过它的图当行内图标：不下载、不占对象存储、也不调视觉模型。
 #:
 #: 实测 bwiki 一个词条的 127 张图里绝大多数落在 18／25／30px——那是表格与正文里的
@@ -291,6 +295,27 @@ def is_icon(ref: str) -> bool:
     """
     found = _THUMB_WIDTH.search(urlsplit(ref).path)
     return found is not None and int(found.group(1)) <= ICON_MAX_PX
+
+
+def original_ref(ref: str) -> str:
+    """缩略图地址 → 原图地址。不是缩略图就原样返回。
+
+    MediaWiki 的缩略图是**另存的一份按显示宽度缩过的图**，地址形如
+    `/images/<库>/thumb/<a>/<ab>/<文件>/<宽>px-<名>`；原图在同一条路径去掉 `thumb`
+    与末尾那段宽度名之后：`/images/<库>/<a>/<ab>/<文件>`。
+
+    取原图而不是缩略图，是因为缩略图的宽度是 wiki 按版面挑的（实测 18／60／130px），
+    回显出来只有那么大，放大就糊。判不出这个形状的地址原样返回——真去取原图取不到时
+    会退回缩略图（见 :func:`_download`），所以这里判错也只是白跑一次请求，不会丢图。
+    """
+    parts = urlsplit(ref)
+    head, sep, tail = parts.path.partition("/thumb/")
+    if not sep:
+        return ref
+    parent, slash, _ = tail.rpartition("/")
+    if not slash or not parent:
+        return ref
+    return urlunsplit((parts.scheme, parts.netloc, f"{head}/{parent}", "", ""))
 
 
 def strip_image_refs(text: str) -> tuple[str, tuple[ImageRef, ...]]:
@@ -454,13 +479,19 @@ def fetch_images(doc: NormalizedDoc, *, crawler: PageCrawler) -> NormalizedDoc:
     对象 key 取原图的，这些图因此一张都没被补过。MinerU 的附件本来就到手了，
     这里补的是外链那一条。
 
+    **取的是原图**（:func:`original_ref`）：wiki 给的地址多半是它按版面缩过的缩略图，
+    拿缩略图回显出来只有 130px 宽。原图取不到时退回缩略图地址（:func:`_download`）。
+
     三种引用不动它：
 
     - **相对路径**（`![](images/a.png)`）：没有基准地址可取，下载不了。它与「下载失败」
       是同一种处境，处置也就一样——原样留着并留一条痕。
     - **行内图标**（:func:`is_icon`）：不值得为它占一份对象存储，也不值得为它调一次
-      视觉模型。它在正文里仍是外链，答案里照样显示得出来。
+      视觉模型。它是版面装饰不是内容，答案里也不显示。
     - **已经在附件里的**（MinerU 的产物）：跳过，别重复下载。
+
+    这三种都**没有对象 key**，切分时不会进 `image_urls`（`ragamer.chunking`）——
+    回显是拿地址去对象存储取的，取不到的地址带进答案只会是一条死图。
 
     一张图取不到不让整份资料失败（与补图那一层同一条规矩）：留一条痕接着走。
 
@@ -480,18 +511,37 @@ def fetch_images(doc: NormalizedDoc, *, crawler: PageCrawler) -> NormalizedDoc:
         if not _is_external(ref):
             logger.warning("%s：相对路径的图没有基准地址可取，正文里的引用原样留着", ref)
             continue
-        try:
-            data = crawler.image(ref)
-        except SourceError as exc:
-            logger.warning("%s：这张图取不到（%s），正文里的引用原样留着", ref, exc)
-            continue
-        if not data:
-            logger.warning("%s：这张图是空的，正文里的引用原样留着", ref)
+        data = _download(crawler, ref)
+        if data is None:
+            logger.warning("%s：这张图取不到，正文里的引用原样留着", ref)
             continue
         name = _external_name(ref, taken)
         taken.add(name)
         assets.append(SourceAsset(name=ref, data=data, key_name=name))
     return replace(doc, assets=tuple(assets)) if len(assets) != len(doc.assets) else doc
+
+
+def _download(crawler: PageCrawler, ref: str) -> bytes | None:
+    """取一张外链图的字节，两条路都取不到时返回 `None`。
+
+    **先按原图取，取不到再退回缩略图**（:func:`original_ref`）：原图那一路是新加的，
+    站点上偶尔会有只留了缩略图的（历史遗留、权限受限），为它丢掉一张本来取得到的图
+    不划算。两条路取到的是同一张图的不同尺寸，退回缩略图只是分辨率差一点。
+
+    留痕在**每一条路**上：最后报出去的是「这张图取不到」，而原图那条路为什么没成，
+    只有这里说得清。
+    """
+    for url in dict.fromkeys((original_ref(ref), ref)):
+        try:
+            data = crawler.image(url)
+        except SourceError as exc:
+            logger.warning("%s：取不到（%s）", url, exc)
+            continue
+        if not data:
+            logger.warning("%s：取回来是空的", url)
+            continue
+        return data
+    return None
 
 
 def _is_external(ref: str) -> bool:
@@ -511,9 +561,11 @@ def _external_name(ref: str, taken: set[str]) -> str:
     重名**必须在这里解决**：`image_key` 那层来源摘要只隔开不同资料之间的重名；
     同一份资料里两张不同的图落到同一个名字上时，后写的那张会把前一张原地覆盖掉，
     而且不报错。名字由地址算出来，所以重导同一份资料仍落在同一批 key 上。
+
+    缩略图地址里那段显示宽度（`_THUMB_NAME`）不带进名字：存的是原图。
     """
     raw = unquote(PurePosixPath(urlsplit(ref).path).name)
-    cleaned = _UNSAFE_IN_NAME.sub("_", raw).strip("._") or "image"
+    cleaned = _THUMB_NAME.sub("", _UNSAFE_IN_NAME.sub("_", raw)).strip("._") or "image"
     stem, dot, suffix = cleaned.rpartition(".")
     if not dot:  # 没有后缀：整个名字都是主干
         stem, dot, suffix = cleaned, "", ""

@@ -46,7 +46,7 @@ ARTICLE = "# 二郎神\n\n二郎神是隐藏 BOSS，需要三阶段打完。\n\n
 #: 带着图片地址的切片：地址随答案一起交回，缓存里也得有。正文里没有它——
 #: 切分时就把地址摘到切片自己的字段上了（`ragamer.chunking`）。
 WITH_IMAGE = "二郎神怎么打：先定身\n打法"
-IMAGE_URLS = ("images/black_myth/boss.jpg",)
+IMAGE_URLS = ("images/black_myth/ab12cd/boss.jpg",)
 
 
 def reader(store, llm, *, cache=None, embedder=None, reranker=None) -> CachedAnswerer:
@@ -157,7 +157,7 @@ def test_命中时引用与图片一并回来():
 
     second = cached.answer(QUESTION, game_id=GAME, version="1.0")
 
-    assert first.images == ("images/black_myth/boss.jpg",)
+    assert first.images == ("images/black_myth/ab12cd/boss.jpg",)
     assert second.citations == first.citations
     assert second.images == first.images
     assert [citation.label for citation in second.citations] == ["二郎神"]

@@ -12,9 +12,10 @@
 - **表格原子化**：Markdown 表格整表一块，装不下按行组切、**每块重复表头**；
   **长文本列整列降级进 `content_meta`，不进正文**（见 `_table_chunks`）；
   Infobox 与模板块整块保留，与表格同标 `table`。
-- **图片地址摘走**：正文里只留替代文本，地址进切片自己的 `image_urls`（见 `_piece_chunks`）。
-  它唯一用处是答案里显示原图，既不参与向量化也不交给生成；而留在正文里既占满字数预算、
-  又会被切分从中间切开，存下一条取不到原图的坏地址。
+- **图片地址摘走**：正文里只留替代文本，**取得到原图**的那些地址进切片自己的
+  `image_urls`（见 `_piece_chunks`）。它唯一用处是答案里显示原图，既不参与向量化
+  也不交给生成；而留在正文里既占满字数预算、又会被切分从中间切开，存下一条取不到
+  原图的坏地址。
 - **顺序**：`chunk_index` 从 0 起连续，聚合父块靠它还原文档顺序。
 
 只做切分。打标与图片补全不在这一层。
@@ -29,6 +30,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from ragamer.sources import ImageRef, strip_image_refs
+from ragamer.stores.base import is_image_key
 
 #: 祖先标题路径的分隔符，写法以 CONTEXT.md 的同名词条为准。
 PATH_SEPARATOR = " › "
@@ -104,10 +106,10 @@ class Chunk:
     #: 不参与向量化的附加文本：表格里的长文本列。随结果返回但没进 embedding，
     #: 也就不存在「超长被截断」这回事。取值与 `chunks` schema 的 `content_meta` 一致。
     content_meta: str = ""
-    #: 这片正文里出现过的图片地址，按出现顺序、去重前原样。**它不在正文里**——
-    #: 地址在切分之前就被摘走了（`strip_image_refs`），正文里留下的是替代文本。
-    #: 唯一的用处是答案里能显示原图（用户故事 52），既不参与向量化、
-    #: 也不随正文交给生成。网页来源是外链，MinerU 来源是对象 key（`ragamer.sources`）。
+    #: 这片正文里出现过、**且取得到原图**的图片地址，按出现顺序、去重前原样。
+    #: **它不在正文里**——地址在切分之前就被摘走了（`strip_image_refs`），正文里留下的是
+    #: 替代文本。唯一的用处是答案里能显示原图（用户故事 52），既不参与向量化、
+    #: 也不随正文交给生成。取不到原图的不带进来（`_servable`）。
     image_urls: tuple[str, ...] = ()
     #: `text` 正文 · `table` 结构化块（Markdown 表格、Infobox 与模板块）· `image` 图片。
     #: v1 的切分器只产出前两种：补图那一层是把图内文字**写回正文**（`ragamer.enriching`），
@@ -157,10 +159,12 @@ def _piece_chunks(piece: _Piece, index: int, rules: ChunkRules) -> list[Chunk]:
 
     图片地址在这一层就摘走，正文里只留替代文本（`strip_image_refs`）：地址留着会占满
     字数预算，还会被下面的切分从中间切开——那会存下一条取不到原图的坏地址，不报错。
+    摘下来的地址再过一道 `_servable`：取不到原图的不跟着切片走。
     """
     if piece.kind == "table":
         return _table_chunks(piece, index, rules)
     text, refs = strip_image_refs(piece.text)
+    refs = _servable(refs)
     if piece.kind == "template":
         # 切开就不是 Infobox 了，长度再超也不动它
         return [Chunk(text, index, piece.path, chunk_type="table", image_urls=_urls(refs))]
@@ -172,6 +176,19 @@ def _piece_chunks(piece: _Piece, index: int, rules: ChunkRules) -> list[Chunk]:
 
 def _urls(refs: Sequence[ImageRef]) -> tuple[str, ...]:
     return tuple(ref.ref for ref in refs)
+
+
+def _servable(refs: Sequence[ImageRef]) -> tuple[ImageRef, ...]:
+    """只留我们真取回了原图的那几处引用。
+
+    正文里的引用不都取得到原图：行内图标不下载，下载失败的与相对路径的原样留着
+    （`ragamer.sources.fetch_images`）。它们没有对象 key，而答案里的图是拿地址去
+    对象存储取的——带进 `image_urls` 只会在答案里多一条取不到的死图，页面上报一句
+    「没有这张图」，而取不到的原因在导入时就说过了。
+
+    取不到就不带着走，与补图那一层同一条口径（`is_image_key`）。
+    """
+    return tuple(ref for ref in refs if is_image_key(ref.ref))
 
 
 def _spread(
@@ -540,13 +557,17 @@ def _pad(cells: Sequence[str], width: int) -> list[str]:
 
 
 def _strip_cells(cells: Sequence[str]) -> tuple[list[str], list[tuple[str, ...]]]:
-    """一格一格地摘图片地址：返回摘完的格与每格的地址（顺序与格一一对应）。"""
+    """一格一格地摘图片地址：返回摘完的格与每格的地址（顺序与格一一对应）。
+
+    地址与正文那条路一样过一道 `_servable`：表格里的图标比正文里还多
+    （bwiki 的物品表整列都是 `18px-图标-…`）。
+    """
     stripped: list[str] = []
     urls: list[tuple[str, ...]] = []
     for cell in cells:
         text, refs = strip_image_refs(cell)
         stripped.append(text)
-        urls.append(_urls(refs))
+        urls.append(_urls(_servable(refs)))
     return stripped, urls
 
 

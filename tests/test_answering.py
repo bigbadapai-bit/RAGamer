@@ -15,7 +15,7 @@ import logging
 
 import pytest
 
-from ragamer.answering import NOT_FOUND, TEMPERATURE, Answer, Answerer, Citation
+from ragamer.answering import MAX_IMAGES, NOT_FOUND, TEMPERATURE, Answer, Answerer, Citation
 from ragamer.llm import FakeLlm, LlmTimeout, Message
 from ragamer.retrieval import MAX_PARENT_CHARS
 from ragamer.routing import RecallPath, Route
@@ -403,7 +403,7 @@ def test_答案带出切片自己的图片地址():
             1,
             content="二郎神怎么打\n打法",
             content_meta="| 图 | 第二形态 |",
-            image_urls=("images/black_myth/boss.jpg", "images/black_myth/phase2.jpg"),
+            image_urls=("images/black_myth/ab12cd/boss.jpg", "images/black_myth/ab12cd/phase2.jpg"),
         ),
     )
     llm = FakeLlm(REPLY)
@@ -411,8 +411,8 @@ def test_答案带出切片自己的图片地址():
     answer = answerer(store, llm).answer(QUESTION, game_id=GAME, version="1.0")
 
     assert answer.images == (
-        "images/black_myth/boss.jpg",
-        "images/black_myth/phase2.jpg",
+        "images/black_myth/ab12cd/boss.jpg",
+        "images/black_myth/ab12cd/phase2.jpg",
     )
 
 
@@ -420,17 +420,23 @@ def test_同一张图出现两次只交回一次():
     store = chunk_store(
         GAME,
         make_chunk(
-            1, content="二郎神怎么打", chunk_index=1, image_urls=("images/black_myth/boss.jpg",)
+            1,
+            content="二郎神怎么打",
+            chunk_index=1,
+            image_urls=("images/black_myth/ab12cd/boss.jpg",),
         ),
         make_chunk(
-            2, content="第二阶段", chunk_index=2, image_urls=("images/black_myth/boss.jpg",)
+            2,
+            content="第二阶段",
+            chunk_index=2,
+            image_urls=("images/black_myth/ab12cd/boss.jpg",),
         ),
     )
     llm = FakeLlm(REPLY)
 
     answer = answerer(store, llm).answer(QUESTION, game_id=GAME, version="1.0")
 
-    assert answer.images == ("images/black_myth/boss.jpg",)
+    assert answer.images == ("images/black_myth/ab12cd/boss.jpg",)
 
 
 def test_检索不到时没有图片与引用():
@@ -439,6 +445,50 @@ def test_检索不到时没有图片与引用():
     answer = answerer(InMemoryChunkStore(), llm).answer(QUESTION, game_id=GAME, version="1.0")
 
     assert answer.images == ()
+
+
+def test_至多带出_MAX_IMAGES_张图():
+    """聚合的是父块而不是命中的那几句，一个词条页整页进来时能带十几张——全铺在答案
+    下面会把正文淹掉。截的是**前**几张：顺序跟着引用走，头几张就是最相关那几个父块里的。
+    """
+    store = chunk_store(
+        GAME,
+        make_chunk(
+            1,
+            content="二郎神怎么打",
+            image_urls=tuple(f"images/black_myth/ab12cd/{index}.jpg" for index in range(20)),
+        ),
+    )
+    llm = FakeLlm(REPLY)
+
+    answer = answerer(store, llm).answer(QUESTION, game_id=GAME, version="1.0")
+
+    assert len(answer.images) == MAX_IMAGES
+    assert answer.images[0] == "images/black_myth/ab12cd/0.jpg"
+
+
+def test_不是对象_key_的地址不进答案():
+    """回显是拿地址去对象存储取的，所以只有对象 key 取得到原图。库里留着一条不是 key
+    的地址（这一层加上之前导进去的图标外链），答案里就多一条死图——页面只能报
+    「没有这张图」，而那是导入时说过的原因。
+    """
+    store = chunk_store(
+        GAME,
+        make_chunk(
+            1,
+            content="二郎神怎么打",
+            image_urls=(
+                "https://patchwiki.biligame.com/images/wukong/thumb/b/b1/x.png/18px-图标.png",
+                "images/a.png",
+                "images/black_myth/ab12cd/boss.jpg",
+            ),
+        ),
+    )
+    llm = FakeLlm(REPLY)
+
+    answer = answerer(store, llm).answer(QUESTION, game_id=GAME, version="1.0")
+
+    assert answer.images == ("images/black_myth/ab12cd/boss.jpg",)
 
 
 # --- 边界与失败 ---
@@ -499,7 +549,7 @@ def test_流式与一次给全用的是同一批引用与图片():
     图片同理：命中缓存与否会给出两种结果，说的就是这一条。"""
     store = chunk_store(
         GAME,
-        make_chunk(1, content="二郎神怎么打", image_urls=("images/black_myth/boss.jpg",)),
+        make_chunk(1, content="二郎神怎么打", image_urls=("images/black_myth/ab12cd/boss.jpg",)),
     )
 
     whole = answerer(store, FakeLlm(REPLY)).answer(QUESTION, game_id=GAME, version="1.0")
@@ -507,7 +557,7 @@ def test_流式与一次给全用的是同一批引用与图片():
     list(piecewise.deltas)
 
     assert piecewise.citations == whole.citations
-    assert piecewise.images == whole.images == ("images/black_myth/boss.jpg",)
+    assert piecewise.images == whole.images == ("images/black_myth/ab12cd/boss.jpg",)
 
 
 def test_流式时没检索到内容回同一段明确回复():

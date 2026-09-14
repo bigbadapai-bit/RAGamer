@@ -816,6 +816,9 @@ def test_没接抓取器时导入网址当场报错():
 #: 130px 那份是立绘、18px 那份是行内图标——判据在 `ragamer.sources.is_icon`。
 CDN_IMAGE = "https://cdn.test/thumb/abc.png/130px-立绘.png"
 CDN_ICON = "https://cdn.test/thumb/abc.png/18px-图标.png"
+#: 上面那张缩略图的**原图**：wiki 是按显示宽度另存一份缩略图，原图在 `thumb` 的上一层
+#: （`ragamer.sources.original_ref`）。收的是它——130px 那份放大就是糊的。
+CDN_ORIGINAL = "https://cdn.test/abc.png"
 
 
 def test_网址导入时外链图落进对象存储():
@@ -827,7 +830,7 @@ def test_网址导入时外链图落进对象存储():
     chunks = InMemoryChunkStore()
     objects = InMemoryObjectStore()
     crawler = FakeCrawler(
-        images={CDN_IMAGE: b"PNG"},
+        images={CDN_ORIGINAL: b"PNG"},
         **{PAGE_URL: f"# 二郎神\n\n![立绘]({CDN_IMAGE})\n\n正文。\n"},
     )
     importer = make_importer(chunks, crawler=crawler, objects=objects)
@@ -838,6 +841,8 @@ def test_网址导入时外链图落进对象存储():
     keys = objects.list_keys(image_prefix(GAME))
     assert len(keys) == 1
     assert objects.get(keys[0]) == b"PNG"
+    # 取的是原图：缩略图那份只有 130px 宽，回显出来放大就糊
+    assert crawler.images_requested == [CDN_ORIGINAL]
     # 正文里的引用改指对象 key，切片带着它去回显（正文里只有替代文本）
     assert all(keys[0] in chunk.image_urls for chunk in stored(chunks))
     assert all(CDN_IMAGE not in chunk.content for chunk in stored(chunks))
@@ -848,7 +853,7 @@ def test_本地_md_里的外链图同样收进来():
     chunks = InMemoryChunkStore()
     objects = InMemoryObjectStore()
     importer = make_importer(
-        chunks, crawler=FakeCrawler(images={CDN_IMAGE: b"PNG"}), objects=objects
+        chunks, crawler=FakeCrawler(images={CDN_ORIGINAL: b"PNG"}), objects=objects
     )
 
     result = importer.import_one(
@@ -860,7 +865,11 @@ def test_本地_md_里的外链图同样收进来():
 
 
 def test_行内图标不收进对象存储():
-    """18px 的图标不值得占一份存储，也不值得为它调一次视觉模型。"""
+    """18px 的图标不值得占一份存储，也不值得为它调一次视觉模型。
+
+    它也**不进切片的图片字段**：回显是拿地址去对象存储取的，没存下来的地址带进答案
+    只会是一条取不到的死图（页面上报「没有这张图」）。图标是版面装饰，本来也不该显示。
+    """
     chunks = InMemoryChunkStore()
     objects = InMemoryObjectStore()
     crawler = FakeCrawler(**{PAGE_URL: f"# 二郎神\n\n![图标]({CDN_ICON})\n\n正文。\n"})
@@ -871,8 +880,8 @@ def test_行内图标不收进对象存储():
     assert result.ok, result.error
     assert objects.list_keys(image_prefix(GAME)) == []
     assert crawler.images_requested == []
-    # 图标原样留着：地址进切片的图片字段，答案里照样显示得出来
-    assert any(CDN_ICON in chunk.image_urls for chunk in stored(chunks))
+    assert all(chunk.image_urls == () for chunk in stored(chunks))
+    assert all(CDN_ICON not in chunk.content for chunk in stored(chunks))
 
 
 def test_图取不到时那份资料照常入库(caplog):
@@ -905,7 +914,10 @@ def test_没接抓取器时外链图留痕(caplog):
 def test_同一个网址重导时图片原地覆盖():
     """来源摘要取自地址本身，与文件那条路取自字节是同一套幂等思路。"""
     objects = InMemoryObjectStore()
-    crawler = FakeCrawler(**{PAGE_URL: f"# 二郎神\n\n![立绘]({CDN_IMAGE})\n\n正文。\n"})
+    crawler = FakeCrawler(
+        images={CDN_ORIGINAL: b"PNG"},
+        **{PAGE_URL: f"# 二郎神\n\n![立绘]({CDN_IMAGE})\n\n正文。\n"},
+    )
     importer = make_importer(crawler=crawler, objects=objects)
 
     importer.import_url(PAGE_URL, game_id=GAME)

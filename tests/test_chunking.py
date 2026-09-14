@@ -13,6 +13,11 @@ from ragamer.chunking import ChunkRules, chunk_document, probe_structure
 #: 收窄后的切分参数：100 / 40 字，标题密度门槛照默认。
 RULES = ChunkRules(max_chars=100, min_chars=40, heading_density=0.02)
 
+#: 一个对象 key 的形状（`images/<游戏>/<来源摘要>/<名字>`）。走到切分这一步，图片地址
+#: 只剩这一种形态——外链在归一化时就下载进对象存储、引用改指 key 了（`ragamer.sources`），
+#: 取不到原图的那些则既不落库也不回显（见 `_servable`）。
+KEY = "images/black_myth/ab12cd/立绘.png"
+
 #: 一份有三级标题的词条页。
 WIKI_ARTICLE = """\
 # 二郎神
@@ -153,7 +158,7 @@ def test_切片正文里不残留折叠块标记():
     markdown = (
         "# 二郎神\n"
         "\n"
-        "![](images/1.jpg)\n"
+        f"![]({KEY})\n"
         "<details>\n"
         "<summary>text_image</summary>\n"
         "图内写着：血量 12000。\n"
@@ -167,9 +172,9 @@ def test_切片正文里不残留折叠块标记():
         assert marker not in chunks[0].content
     assert "图内写着：血量 12000。" in chunks[0].content
     # 地址摘走了，正文里连它的空壳（`![]()`）都不该留下
-    assert "images/1.jpg" not in chunks[0].content
+    assert KEY not in chunks[0].content
     assert "![" not in chunks[0].content
-    assert chunks[0].image_urls == ("images/1.jpg",)
+    assert chunks[0].image_urls == (KEY,)
 
 
 def test_代码块里的折叠块标记原样保留():
@@ -348,32 +353,49 @@ def _urls(chunks) -> list[tuple[str, ...]]:
 def test_地址从正文里摘走而替代文本留下():
     """地址留着会占满字数预算、还会进向量化；替代文本是这张图唯一的可检索文本
     （补图那一层的视觉摘要正写在这里），不能连它一起去掉。"""
-    markdown = "# 打法\n\n先看图 ![三阶段立绘](https://wiki.example.com/a.png) 再往下打。\n"
+    markdown = f"# 打法\n\n先看图 ![三阶段立绘]({KEY}) 再往下打。\n"
 
     chunks = chunk_document(markdown, RULES)
 
     assert len(chunks) == 1
-    assert "https://wiki.example.com/a.png" not in chunks[0].content
+    assert KEY not in chunks[0].content
     assert "![" not in chunks[0].content
     assert "先看图 三阶段立绘 再往下打。" == chunks[0].content
-    assert chunks[0].image_urls == ("https://wiki.example.com/a.png",)
+    assert chunks[0].image_urls == (KEY,)
+
+
+def test_取不到原图的地址不跟着切片走():
+    """回显是拿地址去对象存储取的，而正文里的引用不都取得到原图：行内图标不下载、
+    下载失败的与相对路径的原样留着（`ragamer.sources`）。带进 `image_urls` 就是在
+    答案里多一条取不到的死图——页面上只会报一句「没有这张图」。
+
+    替代文本照旧留下：那张图还在正文里，只是回显不了。
+    """
+    icon = "https://patchwiki.biligame.com/images/wukong/thumb/5/5c/x.png/18px-图标.png"
+    markdown = f"# 丹药\n\n![图标]({icon}) 与 ![立绘](images/a.png) 都在这段里。\n"
+
+    chunks = chunk_document(markdown, RULES)
+
+    assert chunks[0].image_urls == ()
+    assert "图标" in chunks[0].content and "立绘" in chunks[0].content
 
 
 def test_地址不会被切分器从中间切开():
     """地址比切片上限还长时，切完再摘会把它切两半——两半各自留在相邻两片里，
     存下的是一条取不到原图的坏地址，而且不报错。"""
-    url = "https://patchwiki.biligame.com/images/wukong/" + "x" * 200 + ".png"
-    markdown = f"# 打法\n\n![图标]({url})\n\n" + "正文。" * 60
+    key = f"images/black_myth/ab12cd/{'x' * 200}.png"
+    markdown = f"# 打法\n\n![立绘]({key})\n\n" + "正文。" * 60
 
     chunks = chunk_document(markdown, RULES)
 
-    assert all("patchwiki" not in chunk.content for chunk in chunks)
-    assert [url for chunk in chunks for url in chunk.image_urls] == [url]
+    assert all("ab12cd" not in chunk.content for chunk in chunks)
+    assert [url for chunk in chunks for url in chunk.image_urls] == [key]
 
 
 def test_地址归到它落的那一片():
     """几片正文是同一段切出来的连续几刀，地址跟着落点走，不落到别的小节去。"""
-    body = "第一段。" * 30 + "\n\n![图](https://a.example.com/1.png)\n\n" + "第二段。" * 30
+    first = "images/black_myth/ab12cd/一.png"
+    body = "第一段。" * 30 + f"\n\n![图]({first})\n\n" + "第二段。" * 30
     markdown = f"# 二郎神\n\n{body}\n"
 
     chunks = chunk_document(markdown, RULES)
@@ -381,26 +403,27 @@ def test_地址归到它落的那一片():
     assert len(chunks) > 1
     carrying = [index for index, urls in enumerate(_urls(chunks)) if urls]
     assert carrying == [1], _contents(chunks)
-    assert chunks[1].image_urls == ("https://a.example.com/1.png",)
+    assert chunks[1].image_urls == (first,)
 
 
 def test_表格里的地址按格摘走():
     """一格只有一个图标时，地址比那一格真正的文字还长：留着既占字数，
     又会把整整一列判成长文本列（`_long_columns` 量的是摘完之后的格）。"""
+    key = "images/black_myth/ab12cd/碧藕金丹.png"
     markdown = (
         "# 丹药\n"
         "\n"
         "| 名称 | 图标 | 说明 |\n"
         "| --- | --- | --- |\n"
-        "| 碧藕金丹 | ![图标](https://a.example.com/18px-icon.png) | 回血 |\n"
+        f"| 碧藕金丹 | ![丹药图]({key}) | 回血 |\n"
     )
 
     chunks = chunk_document(markdown, RULES)
 
     assert len(chunks) == 1
-    assert "https://a.example.com/18px-icon.png" not in chunks[0].content
+    assert key not in chunks[0].content
     assert "碧藕金丹" in chunks[0].content
-    assert chunks[0].image_urls == ("https://a.example.com/18px-icon.png",)
+    assert chunks[0].image_urls == (key,)
 
 
 def test_整段只有图片且没有替代文本时不产出空片():

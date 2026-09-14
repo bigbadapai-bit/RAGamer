@@ -52,7 +52,7 @@ from ragamer.logging import get_logger
 from ragamer.query import version_filter
 from ragamer.retrieval import ParentBlock, aggregate_parents, retrieve
 from ragamer.routing import Route
-from ragamer.stores.base import Chunk, ChunkStore
+from ragamer.stores.base import Chunk, ChunkStore, is_image_key
 from ragamer.vectors.base import Embedder, Reranker
 from ragamer.websearch import WebResult, WebSearch
 
@@ -86,6 +86,14 @@ _INSTRUCTION = (
 
 #: 正文里的引用编号。答案里出现范围之外的编号，指向的是一条不存在的来源。
 _MARKER = re.compile(r"\[(\d+)\]")
+
+#: 答案里最多带几张原图。
+#:
+#: 聚合的是父块而不是命中的那几句（§2.5），一个词条页整页进来时能带十几张，全铺在
+#: 答案下面会把正文淹掉——而图是**用来看出处的**，不是答案本身。按首次出现的顺序截
+#: 前几张：顺序跟着引用走，前几张就是最相关那几个父块里的。
+#: 与别的经验值一样，要调先有评测集（§11）。
+MAX_IMAGES = 6
 
 
 @dataclass(frozen=True)
@@ -191,8 +199,8 @@ class Answer:
 
     `images` 是交给生成的那批内容里出现过的图片地址：答案里要能直接展示原图，
     用户不必跳出去找（用户故事 52）。它是**跟着引用走**的，不是另一次检索的结果——
-    地址跟着切片走（`Chunk.image_urls`），切片跟着父块走，父块跟着引用走。
-    正文里没有它们：地址在切分时就摘走了（`ragamer.chunking`）。
+    地址跟着切片走（`Chunk.image_urls`），切片跟着父块走，父块跟着引用走。至多
+    :data:`MAX_IMAGES` 张。正文里没有它们：地址在切分时就摘走了（`ragamer.chunking`）。
     """
 
     text: str
@@ -320,18 +328,27 @@ def _block_images(block: ParentBlock) -> tuple[str, ...]:
 
     切片里的地址是**切分时从正文摘下来的**（`ragamer.chunking`），不再拿正则扫一遍
     正文——正文里已经没有地址了。所以这里是读字段，不是从交给模型的那段文字里挑。
+
+    **再按对象 key 过一道**（`is_image_key`）：切分那一层已经只留取得到原图的
+    （`_servable`），这里是读侧的兜底——回显是拿地址去对象存储取的，库里要是留着一条
+    不是 key 的旧地址（这一层加上之前导进去的），答案里就多一条取不到的死图。
     """
-    return tuple(dict.fromkeys(url for chunk in block.chunks for url in chunk.image_urls))
+    return tuple(
+        dict.fromkeys(
+            url for chunk in block.chunks for url in chunk.image_urls if is_image_key(url)
+        )
+    )
 
 
 def _image_urls(sources: Sequence[_Source]) -> tuple[str, ...]:
-    """交给生成的这批内容里出现过的图片地址，按首次出现的顺序去重。
+    """交给生成的这批内容里出现过的图片地址，按首次出现的顺序去重，至多 :data:`MAX_IMAGES` 张。
 
     **跟着引用走**：哪几条内容进得了提示词，它们带的图就在答案里显示。各来源自己的
-    图片在组装来源清单时就定下了（`_numbered`），这里只做去重与排序——同一个地址
-    经两个父块交回来是常事（同文档的两个小节各带一次）。
+    图片在组装来源清单时就定下了（`_numbered`），这里只做去重、排序与截断——同一个
+    地址经两个父块交回来是常事（同文档的两个小节各带一次）。
     """
-    return tuple(dict.fromkeys(url for source in sources for url in source.images))
+    addresses = dict.fromkeys(url for source in sources for url in source.images)
+    return tuple(list(addresses)[:MAX_IMAGES])
 
 
 @dataclass(frozen=True)

@@ -24,6 +24,7 @@ from ragamer.sources import (
     image_refs,
     image_refs_in,
     is_icon,
+    original_ref,
     publish_assets,
     rewrite_image_refs,
     set_image_alt,
@@ -235,6 +236,63 @@ def test_图标不下载():
 
     assert collected.assets == ()
     assert fetcher.requested == []
+
+
+#: `_THUMB` 那份缩略图地址对应的原图：去掉 `thumb` 那一段与末尾的宽度名。
+_THUMB_ORIGINAL = "https://patchwiki.biligame.com/images/wukong/b/b1/abc.png"
+
+
+def test_缩略图地址换得出原图地址():
+    """wiki 给的地址多半是它按版面缩过的缩略图，原图在 `thumb` 的上一层。"""
+    assert original_ref(_THUMB.format(130)) == _THUMB_ORIGINAL
+
+
+def test_不是缩略图的地址原样返回():
+    """判不出这个形状的不动它。判错了也只是白取一次（`_download` 会退回缩略图），
+    而按一个猜出来的路径去取，取回来的是不是那张图就没人知道了。
+    """
+    for ref in (
+        "https://cdn.example.com/a.png",
+        _THUMB_ORIGINAL,
+        "images/a.png",
+        "https://cdn.example.com/thumb/ab.png",  # `thumb` 底下没有那两层哈希目录
+    ):
+        assert original_ref(ref) == ref
+
+
+def test_外链图取的是原图不是缩略图():
+    """缩略图的宽度是 wiki 按版面挑的（实测 18／60／130px），回显出来只有那么大，
+    放大就糊。取原图才对得起「答案里能看清这张图」。
+    """
+    doc = NormalizedDoc(markdown=f"![立绘]({_THUMB.format(130)})\n")
+    fetcher = StubFetcher(**{_THUMB_ORIGINAL: b"ORIGINAL"})
+
+    collected = fetch_images(doc, crawler=fetcher)
+
+    assert [asset.data for asset in collected.assets] == [b"ORIGINAL"]
+    assert fetcher.requested == [_THUMB_ORIGINAL]
+
+
+def test_原图取不到时退回缩略图(caplog):
+    """只留了缩略图的站点（历史遗留、权限受限）不该因此丢掉一张图。"""
+    doc = NormalizedDoc(markdown=f"![立绘]({_THUMB.format(130)})\n")
+    fetcher = StubFetcher(**{_THUMB.format(130): b"THUMB"})
+
+    with caplog.at_level("WARNING"):
+        collected = fetch_images(doc, crawler=fetcher)
+
+    assert [asset.data for asset in collected.assets] == [b"THUMB"]
+    assert fetcher.requested == [_THUMB_ORIGINAL, _THUMB.format(130)]
+    assert _THUMB_ORIGINAL in caplog.text  # 原图那条路为什么没成，留一条痕
+
+
+def test_对象名里不留缩略图那段显示宽度():
+    """存下来的是原图，名字里留着 `130px-` 就是错的——它只是 wiki 当时要显示多大。"""
+    doc = NormalizedDoc(markdown=f"![立绘]({_THUMB.format(130)})\n")
+
+    collected = fetch_images(doc, crawler=StubFetcher(**{_THUMB_ORIGINAL: b"ORIGINAL"}))
+
+    assert [asset.key_name for asset in collected.assets] == ["图标.png"]
 
 
 def test_相对路径的图下载不了_原样留着并留一条痕(caplog):
