@@ -89,6 +89,17 @@ class Embedder(Protocol):
         """一批文本 → 稠密与稀疏两路，一次调用产出，顺序与 `texts` 一一对应。"""
         ...
 
+    def warm(self) -> None:
+        """把权重提前读进来。不产生任何输出，也不改变之后任何一次调用的结果。
+
+        **只为把冷启动那份等待从提问者头上挪到启动时**：真实适配器是懒加载的
+        （`ragamer.lazy`），不预热的话服务起来之后的第一条提问要先把几个 G 的权重
+        从盘上读进来——那不是「检索慢」，而它每次都落在第一个提问的人身上。
+
+        实现必须幂等：预热过再调一次什么也不做（`LazyModel.get` 本身就保证这一条）。
+        """
+        ...
+
 
 @runtime_checkable
 class Reranker(Protocol):
@@ -99,6 +110,10 @@ class Reranker(Protocol):
 
         分数与候选的条数必须一样多。候选可以是整篇长文，适配器不做截断。
         """
+        ...
+
+    def warm(self) -> None:
+        """把权重提前读进来。约定与 :meth:`Embedder.warm` 同一条。"""
         ...
 
 

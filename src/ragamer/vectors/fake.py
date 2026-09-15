@@ -45,6 +45,10 @@ class FakeEmbedder:
             sparse=tuple(_sparse(text) for text in texts),
         )
 
+    def warm(self) -> None:
+        """没有权重要加载。**接口上有它，是因为真实适配器有**——
+        启动预热那条路不该因为换成了假件就走不通。"""
+
 
 class FakeReranker:
     """按词重合度打分的假精排。
@@ -68,6 +72,9 @@ class FakeReranker:
         if not wanted:
             return [0.0 for _ in candidates]
         return [len(wanted & set(_tokens(candidate))) / len(wanted) for candidate in candidates]
+
+    def warm(self) -> None:
+        """没有权重要加载。理由见 :meth:`FakeEmbedder.warm`。"""
 
 
 def _dense(text: str) -> tuple[float, ...]:

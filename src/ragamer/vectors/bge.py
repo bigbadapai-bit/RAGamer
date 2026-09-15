@@ -129,6 +129,15 @@ class BgeM3Embedder:
             )
         return _to_embedding(result, len(batch))
 
+    def warm(self) -> None:
+        """把权重提前读进来（见 `ragamer.vectors.base.Embedder.warm`）。
+
+        **不进 `_lock`**：那把锁护的是「一次只跑一批」，而加载不是一批推理——
+        走它只是让启动时的预热与一次并发的导入互相堵着。
+        `LazyModel` 自己有锁，同时预热只加载一遍。
+        """
+        self._lazy.get()
+
 
 class BgeReranker:
     """长上下文精排（bge-reranker-v2-m3，上限 8192 token）。
@@ -164,6 +173,14 @@ class BgeReranker:
             normalize=True,
         )
         return _scores(scores, len(candidates))
+
+    def warm(self) -> None:
+        """把权重提前读进来（见 `ragamer.vectors.base.Reranker.warm`）。
+
+        这一条的收益比向量化那个更大：精排是整条链路上最贵的一段，而权重加载
+        同样要几十秒——不预热的话它整个压在第一个提问的人身上。
+        """
+        self._lazy.get()
 
 
 def load_bge_m3(config: EmbedSettings, shared: ModelSettings) -> _M3Model:

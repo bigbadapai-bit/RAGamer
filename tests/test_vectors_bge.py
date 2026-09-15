@@ -141,6 +141,42 @@ def test_并发首次调用也只加载一次():
     assert len(loads) == 1
 
 
+def test_预热之后第一次提问不再等加载():
+    """`app.main` 起服务时调的正是它。
+
+    不预热的话，服务起来之后的**第一条提问**要先把几个 G 的权重从盘上读进来
+    ——实测向量化那一段冷启 23.7 秒、热了 0.4 秒，精排冷启 53.3 秒、热了 43.9 秒，
+    三十几秒全落在第一个提问的人头上，而它跟那次提问问的是什么毫无关系。
+    """
+    embedder, loader, _ = _embedder()
+
+    embedder.warm()
+    embedder.embed(["二郎神怎么打"])
+
+    assert len(loader.calls) == 1
+
+
+def test_预热是幂等的():
+    """`warm` 与 `embed` 抢着加载时也只该加载一次——`LazyModel` 那把锁管的就是这个。"""
+    embedder, loader, _ = _embedder()
+
+    embedder.warm()
+    embedder.warm()
+    embedder.embed(["二郎神怎么打"])
+    embedder.warm()
+
+    assert len(loader.calls) == 1
+
+
+def test_预热的精排同样只加载一次():
+    reranker, loader, _ = _reranker()
+
+    reranker.warm()
+    reranker.rerank("二郎神怎么打", ["二郎神 打法"])
+
+    assert len(loader.calls) == 1
+
+
 def test_加载参数原样来自配置():
     config = EmbedSettings(model="BAAI/bge-m3")
     shared = ModelSettings(device="cuda:2", fp16=True)

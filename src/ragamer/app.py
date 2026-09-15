@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import argparse
+import threading
 from collections.abc import Sequence
 
 import uvicorn
@@ -60,6 +61,41 @@ def _ensure_session_index(container: Container) -> None:
         logger.error("会话列表的索引没建上，列表会退化成全表扫：%s", exc)
 
 
+def _warm_models(container: Container) -> threading.Thread:
+    """把两个本地模型的权重提前读进来。**丢在后台线程里，失败不拦启动。**
+
+    两个模型都是懒加载的（`ragamer.lazy`），不预热的话，服务起来之后的**第一条提问**
+    要先把几个 G 的权重从盘上读进来。实测这笔账是：向量化那一段冷启 23.7 秒、热了
+    0.4 秒；精排冷启 53.3 秒、热了 43.9 秒——**三十几秒全落在第一个提问的人头上**，
+    而它跟那次提问问的是什么毫无关系。
+
+    放后台线程而不是就地加载：加载要几十秒，就地做会把「服务起没起来」也一起拖住，
+    而这段时间里页面本来是可以开的（列知识库、翻历史走的是 Mongo／MinIO）。
+
+    失败只记一条 ERROR、不拦启动：存储已经自检过了，模型加载不出来该表现为
+    「这一条提问报错」，而不是「服务起不来」——后者会让人去查配置，而问题不在那里。
+    这里**宽泛地接 `Exception`**（与 `_ensure_session_index` 同一个理由）：加载器
+    自己承诺的是 `ModelError`，但 transformers 那条路会抛别的东西，而这条路径的
+    约定是「什么都不拦」。
+
+    返回那个线程**只是为了测试能 `join` 它**——调用方不必管它。
+    """
+
+    def load() -> None:
+        for name, model in (
+            ("向量化模型", container.embedder),
+            ("精排模型", container.reranker),
+        ):
+            try:
+                model.warm()
+            except Exception as exc:  # 见 docstring：这条路径不拦任何失败
+                logger.error("%s没预热上，第一次用到它时会再加载一次：%s", name, exc)
+
+    thread = threading.Thread(target=load, name="warm-models", daemon=True)
+    thread.start()
+    return thread
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """起界面与后端的本地服务。0 = 正常退出，2 = 配置有问题，3 = 服务不可达。"""
     parser = argparse.ArgumentParser(
@@ -85,6 +121,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return EXIT_STORE
 
     _ensure_session_index(container)
+    _warm_models(container)
     logger.info("界面在 http://%s:%d（Ctrl-C 停）", args.host, args.port)
     uvicorn.run(create_app(container), host=args.host, port=args.port)
     return EXIT_OK
