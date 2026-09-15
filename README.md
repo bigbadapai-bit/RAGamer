@@ -2,8 +2,6 @@
 
 **面向游戏攻略与资料的中文 RAG 助手。** 按游戏建库、用口语提问，系统先确认问的是哪款游戏、哪个版本，再检索并给出**带引用的回答**。
 
-[![CI](https://github.com/bigbadapai-bit/RAGamer/actions/workflows/ci.yml/badge.svg)](https://github.com/bigbadapai-bit/RAGamer/actions/workflows/ci.yml)
-
 游戏资料散在 wiki 词条、攻略站图文、PDF 手册和截图里。通用大模型直接答这类问题会编：专有名词（「妖王」「心法」「根器」）它不认识，版本差异它分不清，图片里的数值它读不到。RAGamer 把这些来源统一收进来，用一套中文检索栈把它们变成可检索、可引用的语料，再把答案连出处一起交回去。
 
 ## 架构
