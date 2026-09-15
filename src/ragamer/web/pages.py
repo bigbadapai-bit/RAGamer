@@ -144,7 +144,7 @@ def create_router(container: Container, stack: ChatStack) -> APIRouter:
             container,
             message=(
                 f"已删除知识库 {deleted}：清掉 {chunks} 条切片、{images} 个原图、"
-                f"{sessions} 条会话，缓存也一并清空了。"
+                f"{sessions} 条会话，缓存已清空。"
                 if deleted
                 else ""
             ),
@@ -185,12 +185,11 @@ def create_router(container: Container, stack: ChatStack) -> APIRouter:
     ) -> Response:
         """单个库的配置页：名称、启用的类目、术语映射、现行版本，以及删库入口。"""
         if saved:
-            message = "已保存。下一次导入打标与切分预览读的就是这一份。"
+            message = "已保存。下一次导入自动确认。"
         elif deleted_doc:
             # 回话里带上真清掉的条数，与确认页上写的「将要」对得上（删库那条路同一个道理）
             message = (
-                f"已删除《{deleted_doc}》：清掉 {chunks} 条切片、{images} 个原图，"
-                "这个库的答案缓存也按前缀清了一遍。"
+                f"已删除《{deleted_doc}》：清掉 {chunks} 条切片、{images} 个原图，缓存已清理。"
             )
         else:
             message = ""
@@ -248,7 +247,7 @@ def create_router(container: Container, stack: ChatStack) -> APIRouter:
         term = term.strip()
         if not term:
             return _knowledge_base_page(
-                request, container, game_id, error="先填一个这个游戏里的叫法", status_code=400
+                request, container, game_id, error="自定义条目未填写", status_code=400
             )
         try:
             set_term(container.docs, game_id, term, _subject_type(kind))
@@ -677,7 +676,7 @@ def create_router(container: Container, stack: ChatStack) -> APIRouter:
                 stack,
                 game_id=game_id,
                 session_id=session_id,
-                error=f"知识库 {game_id} 里没有版本 {version}。下拉里列的是这个库里真有的版本",
+                error=f"知识库 {game_id} 没有版本 {version}。下拉里列的是这个库里真有的版本",
             )
         try:
             stack.chat.set_version(session_id, version)
@@ -983,7 +982,7 @@ def _version_options(container: Container, game_id: str, *, selected: str) -> li
         options.append(
             {
                 "value": selected,
-                "label": f"{selected}（这个库里已经没有它了）",
+                "label": f"{selected}（该版本资料已缺失）",
                 "current": True,
             }
         )
@@ -1537,12 +1536,12 @@ def _job_view(
 def _headline(snapshot: JobSnapshot, *, ok: int, failed: int) -> str:
     """结果区顶上那一行。跑着的时候说的是「已经跑完几条」，不是最终账单。"""
     if snapshot.error:
-        counts = f"共 {snapshot.total} 条：这一批没能跑起来"
+        counts = f"共 {snapshot.total} 条：导入失败"
     elif snapshot.queued:
         # 还没轮到它：一条进度都没有，别跟着说「还在跑」——那句话说的是别人
-        counts = f"共 {snapshot.total} 条，排队中：一次只跑一批，前面那批跑完才轮到它"
+        counts = f"共 {snapshot.total} 条，排队中"
     elif snapshot.running:
-        counts = f"共 {snapshot.total} 条，已跑完 {len(snapshot.results)} 条 · 还在跑"
+        counts = f"共 {snapshot.total} 条，已导入 {len(snapshot.results)} 条 · 正在导入"
     else:
         counts = f"共 {snapshot.total} 条，成功 {ok} 条，失败 {failed} 条"
     # 空串就是未标注版本。界面上直接显示空串的话，那一行读起来像没渲染出来
@@ -1555,11 +1554,11 @@ def _job_row(item: JobItem, snapshot: JobSnapshot) -> dict[str, Any]:
     if result is None:
         # 整批没跑起来时，每一条都不该还挂着「排队中」——那一批永远不会轮到它
         if snapshot.error:
-            status, label = "unstarted", "没能开始"
+            status, label = "unstarted", "未开始"
         elif item.stage is not None:
             status, label = "running", f"正在{STAGE_LABELS[item.stage]}"
         else:
-            status, label = "queued", "排队中"
+            status, label = "queued", "等待中"
         return _empty_row(item, status=status, status_label=label)
     return _empty_row(
         item,
@@ -1701,7 +1700,7 @@ def _subject_type(value: str) -> SubjectType:
         return SubjectType(value)
     except ValueError as exc:
         known = "、".join(kind.value for kind in SubjectType)
-        raise ValueError(f"不认识的主体类型 {value!r}。可用的有：{known}") from exc
+        raise ValueError(f"不认识的主检索条目 {value!r}。可用的有：{known}") from exc
 
 
 def _subject_types(values: Sequence[str] | None) -> tuple[SubjectType, ...]:

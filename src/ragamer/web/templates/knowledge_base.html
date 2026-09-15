@@ -3,7 +3,7 @@
 
 <p class="mb-6 text-sm text-slate-500">
   <a class="underline" href="/kb">← 回到知识库列表</a> ·
-  游戏 id <span class="font-mono text-slate-900">{{ game_id }}</span>，它同时是向量库里的集合名（ADR-0002），建好之后当主键用、别改。
+  游戏 id <span class="font-mono text-slate-900">{{ game_id }}</span>
 </p>
 
 {% if problem %}
@@ -15,7 +15,7 @@
 
 <section class="mb-10 rounded border border-slate-200 bg-white p-5">
   <h2 class="mb-1 text-lg font-medium">基本配置</h2>
-  <p class="mb-4 text-sm text-slate-500">保存后立即生效：下一次导入打标、检索过滤读的就是这一份。</p>
+  <p class="mb-4 text-sm text-slate-500">保存后立即生效：用于下一次导入</p>
   <form method="post" action="/kb/{{ game_id }}" class="space-y-5">
     <div class="grid gap-4 sm:grid-cols-2">
       <label class="block text-sm">
@@ -29,14 +29,13 @@
         <input name="version" value="{{ version }}" autocomplete="off"
                class="w-full rounded border border-slate-300 px-3 py-2 text-sm">
         <span class="mt-1 block text-xs text-slate-500">
-          检索默认按它过滤，留空即未标注版本。新版本作为新文档导入、与旧版本并存（ADR-0004），
-          所以切版本不用重导资料。
+          检索默认按它过滤，留空即未标注版本。新版本作为新文档导入、与旧版本并存，切版本不用重导资料
         </span>
       </label>
     </div>
 
     <fieldset class="text-sm">
-      <legend class="mb-2 font-medium">启用的主体类型</legend>
+      <legend class="mb-2 font-medium">启用的主检索条目</legend>
       <div class="flex flex-wrap gap-x-5 gap-y-2">
         {% for option in subject_types %}
         <label class="flex items-center gap-2">
@@ -47,7 +46,7 @@
         {% endfor %}
       </div>
       <p class="mt-2 text-xs text-slate-500">
-        没启用的类目一律不落标，至少要留一个。改小之后，归到被去掉那几类的术语映射就不再生效了。
+        至少一个，未选择的对应术语映射也会失效
       </p>
     </fieldset>
 
@@ -60,17 +59,16 @@
 <section class="mb-10 rounded border border-slate-200 bg-white p-5">
   <h2 class="mb-1 text-lg font-medium">已导入的资料</h2>
   <p class="mb-4 text-sm text-slate-500">
-    这个库里现在有的资料。标题就是答案里那条来源写的标题，点进去看它的切分结果
-    ——检索时看见的就是那一份。
+    库中现有的资料。
   </p>
 
   {% if documents %}
   <table class="w-full border-collapse text-sm">
     <thead>
       <tr class="border-b border-slate-300 text-left text-slate-500">
-        <th class="py-2 pr-4 font-medium">文档标题</th>
+        <th class="py-2 pr-4 font-medium">标题</th>
         <th class="py-2 pr-4 font-medium">版本</th>
-        <th class="py-2 pr-4 font-medium">切片</th>
+        <th class="py-2 pr-4 font-medium">知识切片</th>
         <th class="py-2 font-medium"></th>
       </tr>
     </thead>
@@ -99,16 +97,15 @@
 <section class="mb-10 rounded border border-slate-200 bg-white p-5">
   <h2 class="mb-1 text-lg font-medium">术语映射</h2>
   <p class="mb-4 text-sm text-slate-500">
-    这个游戏自己的叫法 → 通用主体类型。语料里读到「妖王」时，靠它认出这是角色。
-    没配的叫法统一走模型兜底，标签会稀疏但不会漏。
+    自定义检索条目 → 映射到主检索条目，提高检索能力
   </p>
 
   {% if rows %}
   <table class="mb-5 w-full border-collapse text-sm">
     <thead>
       <tr class="border-b border-slate-300 text-left text-slate-500">
-        <th class="py-2 pr-4 font-medium">游戏里的叫法</th>
-        <th class="py-2 pr-4 font-medium">归到的类目</th>
+        <th class="py-2 pr-4 font-medium">自定义条目（游戏中的名称）</th>
+        <th class="py-2 pr-4 font-medium">主检索条目</th>
         <th class="py-2 font-medium"></th>
       </tr>
     </thead>
@@ -119,13 +116,13 @@
         <td class="py-2 pr-4">
           {{ row.kind }}
           {% if not row.enabled %}
-          <span class="ml-2 text-xs text-amber-700">这个库没启用这个类目，这条映射落不进标签</span>
+          <span class="ml-2 text-xs text-amber-700">该库未启用当前的主检索条目，无法进行术语映射</span>
           {% endif %}
         </td>
         <td class="py-2 text-right">
           <form method="post" action="/kb/{{ game_id }}/terms/delete">
             <input type="hidden" name="term" value="{{ row.term }}">
-            <button type="submit" class="text-sm text-red-700 underline">删掉</button>
+            <button type="submit" class="text-sm text-red-700 underline">删除</button>
           </form>
         </td>
       </tr>
@@ -134,23 +131,23 @@
   </table>
   {% else %}
   <p class="mb-5 text-sm text-slate-500">
-    还没有配。这个库的语料里的本地叫法一个也认不出，会统一走模型兜底那条路。
+    未设置
   </p>
   {% endif %}
 
   {% if problem %}
   <p class="text-sm text-slate-500">
-    配置读不出来，改不了映射——照着现在的样子写回去只会把它清空。先在上面保存一次，配置能读了再来。
+    配置读取错误，无法修改映射
   </p>
   {% else %}
   <form method="post" action="/kb/{{ game_id }}/terms" class="flex flex-wrap items-end gap-3">
     <label class="block text-sm">
-      <span class="mb-1 block font-medium">游戏里的叫法</span>
-      <input name="term" autocomplete="off" placeholder="妖王"
+      <span class="mb-1 block font-medium">自定义条目（游戏中的名称）</span>
+      <input name="term" autocomplete="off" placeholder="如：妖王"
              class="rounded border border-slate-300 px-3 py-2 font-mono text-sm">
     </label>
     <label class="block text-sm">
-      <span class="mb-1 block font-medium">归到</span>
+      <span class="mb-1 block font-medium">映射条目</span>
       <select name="kind" class="rounded border border-slate-300 px-3 py-2 text-sm">
         {% for option in mapping_kinds %}
         <option value="{{ option.value }}">{{ option.label }}</option>
@@ -158,11 +155,11 @@
       </select>
     </label>
     <button type="submit" class="rounded bg-slate-900 px-4 py-2 text-sm font-medium text-white">
-      加一条
+      新建
     </button>
   </form>
   <p class="mt-2 text-xs text-slate-500">
-    只能归到上面勾选启用的类目。加一条同一个叫法就是改它的归类，存完立即生效。
+    只能映射已启用的主检索条目
   </p>
   {% endif %}
 </section>
@@ -170,7 +167,7 @@
 <section class="rounded border border-red-300 bg-white p-5">
   <h2 class="mb-1 text-lg font-medium text-red-800">删除知识库</h2>
   <p class="mb-4 text-sm text-slate-500">
-    连同它导进来的切片、存下来的原图一起清掉。下一步会先把将要清理的东西列出来。
+    删除所有资料和缓存，显示删除结果
   </p>
   <a href="/kb/{{ game_id }}/delete"
      class="inline-block rounded border border-red-300 px-4 py-2 text-sm font-medium text-red-800">

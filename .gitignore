@@ -30,3 +30,7 @@ env/
 
 # 临时文件
 .scratch/
+test_data/
+
+# Claude Code 的本机状态：权限白名单与 worktree 检出，都不入库
+.claude/

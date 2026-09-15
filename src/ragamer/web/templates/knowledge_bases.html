@@ -23,19 +23,19 @@
         <input name="game_id" value="{{ form.game_id }}" required autocomplete="off"
                class="w-full rounded border border-slate-300 px-3 py-1.5 font-mono text-sm focus:border-slate-900 focus:outline-none">
         <span class="mt-1 block text-[11px] leading-4 text-slate-400">
-          字母或下划线开头。它同时是向量库里的集合名，建好之后当主键用。
+          字母或下划线开头，用于向量库的知识集合名称
         </span>
       </label>
       <label class="block">
         <span class="mb-1 block text-xs text-slate-500">显示名称</span>
         <input name="name" value="{{ form.name }}" autocomplete="off"
                class="w-full rounded border border-slate-300 px-3 py-1.5 text-sm focus:border-slate-900 focus:outline-none">
-        <span class="mt-1 block text-[11px] leading-4 text-slate-400">留空就用游戏 id。</span>
+        <span class="mt-1 block text-[11px] leading-4 text-slate-400">留空时默认为游戏id</span>
       </label>
     </div>
 
     <fieldset>
-      <legend class="mb-2 text-xs text-slate-500">启用的主体类型（没启用的类目一律不落标，至少要留一个）</legend>
+      <legend class="mb-2 text-xs text-slate-500">启用的主检索条目（至少一个）</legend>
       <div class="flex flex-wrap gap-1.5">
         {% for option in subject_types %}
         <label class="inline-flex cursor-pointer items-center gap-1.5 rounded border border-slate-200 bg-slate-50 px-2.5 py-1 text-xs">
@@ -61,7 +61,7 @@
         <th class="w-44 px-3 py-2.5 font-medium">游戏 id</th>
         <th class="w-44 px-3 py-2.5 font-medium">名称</th>
         <th class="w-28 px-3 py-2.5 font-medium">现行版本</th>
-        <th class="px-3 py-2.5 font-medium">启用的主体类型</th>
+        <th class="px-3 py-2.5 font-medium">启用的主检索条目</th>
         <th class="w-40 px-3 py-2.5 font-medium"></th>
       </tr>
     </thead>
@@ -75,7 +75,7 @@
         </td>
         <td class="px-3 py-2.5 text-xs">
           {% if base.problem %}
-          <span class="rounded bg-red-50 px-1.5 py-0.5 text-red-700">读不了：{{ base.problem }}</span>
+          <span class="rounded bg-red-50 px-1.5 py-0.5 text-red-700">读取错误：{{ base.problem }}</span>
           {% else %}
           {% for name in base.subject_types %}<span class="mr-1 inline-block rounded bg-slate-100 px-1.5 py-0.5">{{ name }}</span>{% endfor %}
           {% endif %}
@@ -89,7 +89,7 @@
     </tbody>
   </table>
   {% else %}
-  <p class="px-5 py-10 text-center text-sm text-slate-500">还没有知识库。上面建一个，就能往里传资料了。</p>
+  <p class="px-5 py-10 text-center text-sm text-slate-500">还没有知识库，点击创建</p>
   {% endif %}
 </section>
 

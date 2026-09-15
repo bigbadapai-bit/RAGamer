@@ -12,7 +12,7 @@
 <header class="mb-6 flex flex-wrap items-end justify-between gap-x-6 gap-y-2">
   <div>
     <h1 class="text-xl font-semibold tracking-tight">导入</h1>
-    <p class="mt-1 text-sm text-slate-500">归一化 → 切分 → 打标 → 向量化 → 入库，逐文件独立。</p>
+    <p class="mt-1 text-sm text-slate-500">归一化 → 切分 → 打标 → 向量化 → 入库，支持批量文件导入</p>
   </div>
   {% if bases %}<p class="text-sm text-slate-500"><span class="font-mono text-slate-900">{{ bases | length }}</span> 个可选的库</p>{% endif %}
 </header>
@@ -44,29 +44,28 @@
         <span class="mb-1 block text-xs text-slate-500">版本</span>
         <input name="version" value="{{ version }}" autocomplete="off"
                class="w-full rounded border border-slate-300 px-3 py-1.5 text-sm focus:border-slate-900 focus:outline-none">
-        <span class="mt-1 block text-[11px] leading-4 text-slate-400">留空即未标注版本（ADR-0004）</span>
+        <span class="mt-1 block text-[11px] leading-4 text-slate-400">留空即未标注版本</span>
       </label>
       <label class="block">
         <span class="mb-1 block text-xs text-slate-500">资料</span>
         <input type="file" name="files" multiple accept="{{ accept }}"
                class="block w-full rounded border border-slate-300 px-2 py-1 text-sm file:mr-3 file:rounded file:border-0 file:bg-slate-100 file:px-2 file:py-1 file:text-xs">
-        <span class="mt-1 block text-[11px] leading-4 text-slate-400">可多选。按扩展名挑处理方式，认得的是 {{ accept }}；一批里某一条失败不牵连其余</span>
+        <span class="mt-1 block text-[11px] leading-4 text-slate-400">可多选。支持PDF、md及图片</span>
       </label>
     </div>
 
     <label class="block">
       <span class="mb-1 block text-xs text-slate-500">网址</span>
-      <textarea name="urls" rows="3" placeholder="一行一个地址"
+      <textarea name="urls" rows="3" placeholder="支持批量抓取，按回车换行（一行一条网页地址）"
                 class="w-full rounded border border-slate-300 px-3 py-1.5 text-sm focus:border-slate-900 focus:outline-none"></textarea>
       <span class="mt-1 block text-[11px] leading-4 text-slate-400">
-        抓回来转成 Markdown 再入库，与本地文件走完全相同的后续链路。只抓允许复用的来源：
-        开放授权的 wiki、公开接口、官方公告；robots 挡下就报错，不绕。
+        转成md再入库，与本地文件走完全相同的后续链路。
       </span>
     </label>
 
     <div class="flex items-center gap-4">
       <button type="submit" class="rounded bg-slate-900 px-4 py-1.5 text-sm font-medium text-white hover:bg-slate-700">开始导入</button>
-      <span id="import-busy" class="htmx-indicator text-sm text-slate-500">交上去了，下面在跟着跑</span>
+      <span id="import-busy" class="htmx-indicator text-sm text-slate-500">已提交</span>
     </div>
   </form>
 </section>

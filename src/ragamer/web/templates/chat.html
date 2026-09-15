@@ -90,7 +90,7 @@
   <section class="min-w-0">
     {% if not game_id %}
     <p class="rounded border border-dashed border-slate-300 bg-white px-4 py-10 text-center text-sm text-slate-500">
-      左边选一个知识库，再开一个会话。
+      左边选一个知识库，再新建开一个会话。
     </p>
     {% elif not session_id %}
     <p class="rounded border border-dashed border-slate-300 bg-white px-4 py-10 text-center text-sm text-slate-500">
@@ -102,7 +102,7 @@
     <div class="mb-6 flex flex-wrap items-center gap-3 text-sm">
       <form method="post" action="/chat/{{ game_id }}/{{ session_id }}/version"
             class="flex flex-wrap items-center gap-2">
-        <label for="version" class="text-slate-500">按哪个版本检索</label>
+        <label for="version" class="text-slate-500">检索版本（未注明则默认全版本）</label>
         <select id="version" name="version" class="rounded border border-slate-300 bg-white px-2 py-1">
           {% for option in versions %}
           <option value="{{ option.value }}" {% if option.current %}selected{% endif %}>{{ option.label }}</option>
@@ -151,7 +151,6 @@
         <button type="submit" class="rounded bg-slate-900 px-4 py-1.5 text-sm text-white hover:bg-slate-700">
           提问
         </button>
-        <span class="text-xs text-slate-500">答案一个字一个字出来。</span>
       </div>
     </form>
 

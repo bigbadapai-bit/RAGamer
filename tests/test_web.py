@@ -367,7 +367,7 @@ def test_传一份_markdown_就完成导入并给出预览入口(client, contain
     assert "二郎神.md" in row
     assert DOC_TITLE in row  # 存成了哪个文档
     # 切了多少片。这一条是整批的账，在结果区顶上那一行，不在某一条上
-    assert f"这批入库 {len(stored(container))} 条切片" in response.text
+    assert f"入库 {len(stored(container))} 条切片" in response.text
 
     (href,) = re.findall(r'href="(/kb/[^"]+)"', row)
     page = client.get(href.replace("&amp;", "&"))
@@ -408,7 +408,7 @@ def test_提交之后立刻返回_不用等这一批跑完(gated, gate):
 
     assert response.status_code == 200
     assert RUNNING_MARK in response.text  # 结果区还会自己来问
-    assert "看切分结果" not in response.text  # 还没跑完，不给最终账单
+    assert "看导入结果" not in response.text  # 还没跑完，不给最终账单
     assert gate.entered.wait(timeout=JOB_TIMEOUT), "这一批没跑到向量化"
 
     live = gated.get(f"/import/result?job={job_id_of(response)}", headers={"HX-Request": "true"})
@@ -416,11 +416,11 @@ def test_提交之后立刻返回_不用等这一批跑完(gated, gate):
     # 这一批里的两条**同时**在跑（`BATCH_WORKERS`），不是一条一条来
     assert live.text.count("正在向量化") == 2
     # 排队是**批与批之间**的事（工作线程一次取一批），不是同一批里的条目
-    assert "排队中" not in live.text
+    assert "等待中" not in live.text
 
     gate.opened.set()
     done = wait_for_done(gated, job_id_of(response), page=False)
-    assert "看切分结果" in done.text
+    assert "看导入结果" in done.text
     assert RUNNING_MARK not in done.text  # 跑完就不再问了
 
 
@@ -548,7 +548,7 @@ def test_跑完的那一批不带任务号也看得到(client):
     page = client.get(f"/import?game_id={GAME}").text
 
     assert "导入结果" in page
-    assert "看切分结果" in page
+    assert "看导入结果" in page
     assert RUNNING_MARK not in page  # 跑完的不再轮询
 
 
@@ -584,12 +584,12 @@ def test_整批没跑起来时页面给原因而不是一直转圈():
     response = submit(client, urls=PAGE_URL)
     done = wait_for_done(client, job_id_of(response), page=False)
 
-    assert "这一批没能跑起来" in done.text
+    assert "导入失败" in done.text
     assert "抓取器" in done.text
     assert RUNNING_MARK not in done.text
-    # 每一条也不该还挂着「排队中」——那一批永远不会轮到它
-    assert "排队中" not in done.text
-    assert "没能开始" in done.text
+    # 每一条也不该还挂着「等待中」——那一批永远不会轮到它
+    assert "等待中" not in done.text
+    assert "未开始" in done.text
 
 
 # --- 验收：一次提交多条来源，每条各有各的状态 ---
@@ -707,7 +707,7 @@ def test_失败的是文件时重试表单说清要重新选中(client, containe
 def test_导入完成后报出切片数与覆盖到的标签(client, container):
     response = do_import(client)
 
-    assert f"这批入库 {len(stored(container))} 条切片" in response.text
+    assert f"入库 {len(stored(container))} 条切片" in response.text
     assert "覆盖到的标签：主体类型 角色" in response.text
     assert "内容性质 介绍、位置与获取、数值、打法流程" in response.text
     assert "游戏术语 妖王" in response.text
@@ -1099,7 +1099,7 @@ def test_映射里没填叫法时说一句(client, container):
     response = add_term(client, "   ", "skill")
 
     assert response.status_code == 400
-    assert "先填一个" in response.text
+    assert "自定义条目未填写" in response.text
     assert "心法" not in container.docs.get(KB_COLLECTION, GAME)["term_mapping"]
 
 
@@ -1107,7 +1107,7 @@ def test_映射里写了不认识的主体类型时报错而不是静默丢掉(c
     response = add_term(client, "心法", "hero")
 
     assert response.status_code == 400
-    assert "不认识的主体类型" in response.text
+    assert "不认识的主检索条目" in response.text
     assert "心法" not in container.docs.get(KB_COLLECTION, GAME)["term_mapping"]
 
 
