@@ -51,7 +51,7 @@ from ragamer.container import Container
 from ragamer.live import TurnRegistry, check_cancelled
 from ragamer.llm import Message
 from ragamer.logging import get_logger
-from ragamer.query import effective_version
+from ragamer.query import UnderstandingMemo, effective_version
 from ragamer.routing import DEFAULT_TABLE, QUERY_TYPE_LABELS, QueryType, RouteTable
 from ragamer.stores.base import DocStore
 
@@ -574,6 +574,9 @@ def build_chat(container: Container) -> ChatStack:
                 chunks=container.chunks,
                 docs=container.docs,
                 llm=container.llm,
+                # 一次接线一份，进程内共享：它省的是「同一句话问第二次」那次模型调用，
+                # 也是让答案缓存键稳下来的那一层（见 `ragamer.query.UnderstandingMemo`）
+                memo=UnderstandingMemo(),
             ),
         ),
         cache=cache,

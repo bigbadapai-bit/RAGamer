@@ -11,10 +11,13 @@ from __future__ import annotations
 
 import logging
 
+import pytest
+
 from ragamer.llm import FakeLlm, LlmRejected, LlmTimeout, Message
 from ragamer.query import (
     TEMPERATURE,
     Understanding,
+    UnderstandingMemo,
     normalize_query,
     understand,
     version_filter,
@@ -312,3 +315,130 @@ def test_标注版本的资料与未标注版本的资料都能被检索到():
     )
 
     assert {hit.chunk.content for hit in hits} == {"2.0 版打法", "世界观设定"}
+
+
+# ── 理解结果的备忘 ───────────────────────────────────────────────────────────
+#
+# 它要解决的是**改写会抖**：温度已经钉死在 0，模型在 0 下仍会给出不同的改写（实测
+# 同一个问题问 6 次得到 3 种）。而答案缓存的键建在改写之上（`ragamer.caching`），
+# 于是同一句话问两次有可能算成两个键、双双未命中，各花掉一次完整检索。
+# 记下之后，改写对「同一句话 + 同一段历史」就是确定的。
+
+
+def test_同一句问话配同一段历史只问一次模型():
+    llm = FakeLlm(_reply())
+    memo = UnderstandingMemo()
+
+    first = understand("二郎神怎么打", llm=llm, games=GAMES, versions=VERSIONS, memo=memo)
+    second = understand("二郎神怎么打", llm=llm, games=GAMES, versions=VERSIONS, memo=memo)
+
+    # 脚本只排了一条：第二次若真去问，FakeLlm 会当场炸
+    assert len(llm.calls) == 1
+    assert second == first
+
+
+def test_归一之后相同的问法共用一条():
+    """多打几个空格是同一句话——与缓存键、与 `_pick` 比候选用的是同一个归一口径。"""
+    llm = FakeLlm(_reply())
+    memo = UnderstandingMemo()
+
+    understand("二郎神  怎么打", llm=llm, games=GAMES, versions=VERSIONS, memo=memo)
+    understand(" 二郎神 怎么打 ", llm=llm, games=GAMES, versions=VERSIONS, memo=memo)
+
+    assert len(llm.calls) == 1
+
+
+def test_历史不同就是不同的问题():
+    """「那它怎么打」配上不同上文本来就是不同的问题。
+
+    只按问法记的话，后一个会话会拿到前一个会话的指代补全结果——而那一轮检索的是
+    另一个主体，界面上完全看不出来。
+    """
+    llm = FakeLlm(_reply(rewritten_query="二郎神怎么打"), _reply(rewritten_query="大圣怎么打"))
+    memo = UnderstandingMemo()
+
+    first = understand(
+        "那它怎么打",
+        llm=llm,
+        games=GAMES,
+        versions=VERSIONS,
+        history=[Message("user", "二郎神是谁")],
+        memo=memo,
+    )
+    second = understand(
+        "那它怎么打",
+        llm=llm,
+        games=GAMES,
+        versions=VERSIONS,
+        history=[Message("user", "大圣是谁")],
+        memo=memo,
+    )
+
+    assert len(llm.calls) == 2
+    assert first.rewritten_query != second.rewritten_query
+
+
+def test_候选变了就不再复用():
+    """冻住的取值必须仍是当前候选里的一个。
+
+    `_pick` 只接受候选里有的取值，所以算出来的游戏**一定曾是候选之一**；冻住之后
+    知识库被改名或删掉，那个标签就成了候选里根本没有的——而 `ragamer.clarifying._game`
+    认不出它是**当场抛 `NotACandidate`**，一条本来问得通的提问直接变成报错。
+    版本那侧不校验，轻一些但同样是错的：会照一个已经不在库里的版本去检索。
+    """
+    llm = FakeLlm(_reply(), _reply())
+    memo = UnderstandingMemo()
+
+    understand("二郎神怎么打", llm=llm, games=GAMES, versions=VERSIONS, memo=memo)
+    understand("二郎神怎么打", llm=llm, games=["燕云十六声"], versions=[], memo=memo)
+
+    assert len(llm.calls) == 2
+
+
+def test_降级的结果不入备忘():
+    """一次模型抖动不该被钉成整个进程生命周期里的固定行为。
+
+    降级交回的是「按原问法继续、游戏与版本留空」，它与「模型判出来就是空的」长得
+    一模一样——记进来的话，之后所有相同的提问都拿不到真判定，而且看不出为什么。
+    """
+    llm = FakeLlm(LlmTimeout("模型服务超时"), _reply())
+    memo = UnderstandingMemo()
+
+    degraded = understand("二郎神怎么打", llm=llm, games=GAMES, versions=VERSIONS, memo=memo)
+    recovered = understand("二郎神怎么打", llm=llm, games=GAMES, versions=VERSIONS, memo=memo)
+
+    assert degraded == Understanding("", "", "二郎神怎么打")
+    assert len(llm.calls) == 2  # 第二次照问，没有被那条降级顶掉
+    assert recovered == Understanding(
+        "黑神话·悟空", "2.0", "二郎神怎么打", 0.9, 0.8, QueryType.GUIDE
+    )
+
+
+def test_不给备忘就每次都问模型():
+    """`None` 就是「不记」：行为与没有这一层时完全一样，所以它是安全的缺省。"""
+    llm = FakeLlm(_reply(), _reply())
+
+    understand("二郎神怎么打", llm=llm, games=GAMES, versions=VERSIONS)
+    understand("二郎神怎么打", llm=llm, games=GAMES, versions=VERSIONS)
+
+    assert len(llm.calls) == 2
+
+
+def test_备忘满了丢最久没用过的那条():
+    """键里带着整段历史，不封顶就会随着「问过多少种问法」一直长下去。"""
+    llm = FakeLlm(_reply(), _reply(), _reply())
+    memo = UnderstandingMemo(size=2)
+
+    understand("一", llm=llm, games=GAMES, versions=VERSIONS, memo=memo)
+    understand("二", llm=llm, games=GAMES, versions=VERSIONS, memo=memo)
+    understand("一", llm=llm, games=GAMES, versions=VERSIONS, memo=memo)  # 一 → 最新
+    understand("三", llm=llm, games=GAMES, versions=VERSIONS, memo=memo)  # 挤掉最久没用的二
+    understand("一", llm=llm, games=GAMES, versions=VERSIONS, memo=memo)  # 还在，不再问
+
+    assert len(llm.calls) == 3
+
+
+def test_容量至少是一条():
+    """容量给 0 的话 `set` 会当场把刚记下的那条丢掉，而那是不报错的。"""
+    with pytest.raises(ValueError):
+        UnderstandingMemo(size=0)

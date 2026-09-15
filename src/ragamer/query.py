@@ -26,6 +26,8 @@
 
 from __future__ import annotations
 
+import threading
+from collections import OrderedDict
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -72,6 +74,75 @@ class Understanding:
     query_type: QueryType | None = None
 
 
+#: 备忘最多记多少条。**又是一个没有依据的占位**（§11）：能讲清的只有它必须有个上界
+#: ——键里带着整段历史，不封顶就会随着「问过多少种问法」一直长下去。
+MEMO_SIZE = 256
+
+#: 备忘的键：`understand` 除了模型客户端之外的**全部**入参。
+#:
+#: 候选（游戏、版本）也进来是有原因的，不是保险起见：`_pick` 会把候选之外的取值丢掉，
+#: 所以算出来的 `Understanding` 里那个游戏**一定曾是候选里的一个**。冻住之后知识库被
+#: 改名或删掉，那份取值就成了一个候选里根本没有的标签——而 `ragamer.clarifying._game`
+#: 拿 `_choice_of` 认它，认不出是**当场抛 `NotACandidate`**，一条本来问得通的提问直接
+#: 报错。版本那侧轻一些但同样是错的：它不校验，会照一个已经不在库里的版本去检索。
+#: 把候选放进键里，这两种都退化成「候选变了就重新算一次」，不需要另做失效。
+_MemoKey = tuple[str, tuple[Message, ...], tuple[str, ...], tuple[str, ...]]
+
+
+class UnderstandingMemo:
+    """`understand` 的记忆：同一句问话、同一段历史、同一批候选，只算一次。
+
+    存在的理由是**改写会抖**。温度已经钉死在 0，但模型在 0 下仍会给出不同的改写
+    （实测同一个问题问 6 次得到 3 种），而答案缓存的键正建立在改写之上
+    （`ragamer.caching.cache_key`）——于是同一个问题问两次**有可能算成两个键、
+    双双未命中**，各花掉一次完整检索。`CachedAnswerer._key` 把这条取舍写在明处，
+    并指明「真嫌命中率低，要动的是这个取舍本身」：记下理解结果就是动它，
+    而且**不动 `normalize_query`**（那个函数同时被用来比候选，收紧它会顺带收紧候选）。
+
+    记下来之后，改写对同一组入参就成了确定的：缓存键跟着稳定。顺带每次提问还省掉
+    这一次模型调用。
+
+    **只记成功的那些。** 这个判断在 :func:`understand` 里做，不在这里——降级那条路
+    交回的是「按原问法继续、游戏与版本留空」，把它记进来的话，一次模型抖动会被
+    钉成整个进程生命周期里的固定行为，而且看不出来。
+
+    键里带历史与候选都是有意的：「那它怎么打」配上不同上文本来就是不同的问题，
+    只按问法记会让后一个会话拿到前一个会话的指代补全结果；候选那一条的理由见
+    :data:`_MemoKey`。**模型客户端不在键里**：一次接线只有它一个，换客户端等于换
+    一套接线，那时连这个备忘对象也一起换了。
+
+    线程安全：界面后端把同步端点丢进线程池，两个人同时问同一句话是常事
+    ——`ragamer.lazy.LazyModel` 出于同一个理由加了锁。满了丢**最久没用过**的那条。
+    """
+
+    def __init__(self, size: int = MEMO_SIZE) -> None:
+        if size < 1:
+            raise ValueError(f"备忘的容量至少是 1，给的是 {size}")
+        self._size = size
+        self._lock = threading.Lock()
+        self._items: OrderedDict[_MemoKey, Understanding] = OrderedDict()
+
+    def get(self, key: _MemoKey) -> Understanding | None:
+        """取一条；取到就把它挪到最新，于是丢的永远是最久没用过的那条。"""
+        with self._lock:
+            found = self._items.get(key)
+            if found is not None:
+                self._items.move_to_end(key)
+            return found
+
+    def set(self, key: _MemoKey, value: Understanding) -> None:
+        """记一条，按容量丢最久没用过的那些。重复记同一个键就是刷新它的位置。"""
+        with self._lock:
+            self._items[key] = value
+            self._items.move_to_end(key)
+            while len(self._items) > self._size:
+                self._items.popitem(last=False)
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._items)
+
+
 def understand(
     question: str,
     *,
@@ -79,6 +150,7 @@ def understand(
     games: Sequence[str] = (),
     versions: Sequence[str] = (),
     history: Sequence[Message] = (),
+    memo: UnderstandingMemo | None = None,
 ) -> Understanding:
     """读一个问题：问的是哪款游戏、哪个版本、规范问法是什么、属于哪一类。
     **只调一次模型。**
@@ -89,10 +161,20 @@ def understand(
         此时游戏一律留空——不许模型自己编一个。
     :param versions: 该游戏真实存在的版本候选。空表示判不出，理由同上。
     :param history: 上一轮及更早的对话。指代（「那它怎么打」）要靠它才能补成主体名。
+    :param memo: 记下这次的判定的地方（:class:`UnderstandingMemo`）。给了就在算之前
+        先查、算完再记；不给就每次都问模型。**降级的结果不记**——理由见那个类。
     """
-    degraded = Understanding("", "", normalize_query(question))
+    asked = normalize_query(question)
+    degraded = Understanding("", "", asked)
     if not question.strip():
         return degraded  # 空问题没有可理解的，也别白调一次模型
+    # 键照算不误（都是几个短字符串），只在没给备忘时才不查不记——两处判断合成一处，
+    # 不给「查了这个键、记的却是另一个」留出机会
+    key = (asked, tuple(history), tuple(games), tuple(versions))
+    if memo is not None:
+        remembered = memo.get(key)
+        if remembered is not None:
+            return remembered
     try:
         guess = llm.complete_structured(_request(question, games, versions, history), _JointOutput)
     except LlmRejected as exc:
@@ -113,7 +195,7 @@ def understand(
         logger.warning("模型判出的查询类型不在词表里，本次按默认组合走：%r", guess.route)
     elif kind is None and "route" not in guess.model_fields_set:
         logger.warning("模型没给查询类型（这个字段整个缺席），本次按默认组合走")
-    return Understanding(
+    resolved = Understanding(
         game=game,
         version=version,
         rewritten_query=normalize_query(guess.rewritten_query) or degraded.rewritten_query,
@@ -123,6 +205,10 @@ def understand(
         version_confidence=guess.version_confidence if version else 0.0,
         query_type=kind,
     )
+    # 记在**这一条**返回路径上，不记上面那两个 `return degraded`：降级不是判定结果
+    if memo is not None:
+        memo.set(key, resolved)
+    return resolved
 
 
 def normalize_query(text: str) -> str:

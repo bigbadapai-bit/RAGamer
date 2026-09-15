@@ -40,7 +40,7 @@ from ragamer.answering import require_question
 from ragamer.knowledge import list_knowledge_bases
 from ragamer.llm import LlmClient, Message
 from ragamer.logging import get_logger
-from ragamer.query import Understanding, understand
+from ragamer.query import Understanding, UnderstandingMemo, understand
 from ragamer.routing import QueryType
 from ragamer.stores.base import ChunkStore, DocStore
 
@@ -216,6 +216,14 @@ class Clarifier:
     chunks: ChunkStore
     docs: DocStore
     llm: LlmClient
+    #: 同一句问话配同一段历史只理解一次的地方（`ragamer.query.UnderstandingMemo`）。
+    #: `None` 就是「不记」，与 :func:`ragamer.query.understand` 那一侧同一口径——
+    #: 不记只是每次多问一遍模型，行为与记之前完全一样，所以它是安全的缺省。
+    #:
+    #: **一次接线只该有一个真的**：它的用处正是让重复的提问拿到同一份改写，而改写是
+    #: 答案缓存键的原料（`ragamer.caching.cache_key`）。各接一个就各记一份，命中率
+    #: 按份数摊薄，而这件事在界面上看不出来。
+    memo: UnderstandingMemo | None = None
 
     def decide(
         self,
@@ -256,6 +264,7 @@ class Clarifier:
             games=[choice.label for choice in games],
             versions=[choice.label for choice in versions],
             history=history,
+            memo=self.memo,
         )
         resolved_game = self._game(understanding, games, game_id)
         if resolved_game is None:
