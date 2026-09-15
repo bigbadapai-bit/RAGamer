@@ -23,7 +23,7 @@ import threading
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from queue import SimpleQueue
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from ragamer.logging import get_logger
 
@@ -67,6 +67,33 @@ def check_cancelled(cancelled: Callable[[], bool] | None) -> None:
 
 
 @dataclass
+class TurnSnapshot:
+    """跑着的那一轮**此刻**的样子，给「切回来接着看」用。
+
+    只装页面要显示的那几样，字段形状与 SSE 的载荷对齐：`citations` 就是 `citations`
+    事件里那个对象，页面照同一套渲染即可——两处各拼一遍，迟早会长得不一样。
+
+    `question` 是这一层唯一知道、别处都还没有的东西：那一轮没跑完就不会落库，所以
+    「我问了什么」在历史里查不到，只能从这里拿。
+    """
+
+    question: str = ""
+    status: str = ""
+    text: str = ""
+    #: `citations` 事件那个载荷（引用、图片、版本）；还没有就是 `None`
+    citations: dict[str, Any] | None = None
+
+    def payload(self) -> dict[str, Any]:
+        """对外那副样子。`running` 由调用方补上——这一份只说自己跑到哪了。"""
+        return {
+            "question": self.question,
+            "status": self.status,
+            "text": self.text,
+            "citations": self.citations,
+        }
+
+
+@dataclass
 class LiveTurn:
     """一个会话上正在跑的那一轮。
 
@@ -79,6 +106,9 @@ class LiveTurn:
     cancelled: threading.Event = field(default_factory=threading.Event)
     queue: SimpleQueue[object] = field(default_factory=SimpleQueue)
     thread: threading.Thread | None = None
+    #: 这一刻的样子。**读写都要拿 `lock`**：跑这一轮的线程在写，端点那边在读。
+    snapshot: TurnSnapshot = field(default_factory=TurnSnapshot)
+    lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 class TurnRegistry:
@@ -93,7 +123,12 @@ class TurnRegistry:
         self._turns: dict[str, LiveTurn] = {}
 
     def start(
-        self, session_id: str, replies: Callable[[LiveTurn], Iterator[Reply]]
+        self,
+        session_id: str,
+        replies: Callable[[LiveTurn], Iterator[Reply]],
+        *,
+        question: str = "",
+        watch: Callable[[LiveTurn, Reply], None] | None = None,
     ) -> LiveTurn | None:
         """登记一轮并起一个线程把它跑完。**这个会话已经有一轮在跑时返回 `None`。**
 
@@ -104,15 +139,20 @@ class TurnRegistry:
 
         `replies` 本身是一个**还没开始跑的**生成器工厂，在后台线程里才第一次迭代它：
         传一个已经建好的生成器进来，理解与检索就会提前到调用方那一侧跑。
+
+        :param question: 这一轮问的那句话。**只有这里记得住它**——跑完之前不落库。
+        :param watch: 每收到一个事件调一次，用来更新 :attr:`LiveTurn.snapshot`。
+            **由调用方给**：`Status` / `Delta` / `Sources` 那几个类型住在
+            `ragamer.conversations`，这一层在运行时导入它就成环了。
         """
         with self._lock:
             if session_id in self._turns:
                 return None
-            turn = LiveTurn(session_id=session_id)
+            turn = LiveTurn(session_id=session_id, snapshot=TurnSnapshot(question=question))
             self._turns[session_id] = turn
         turn.thread = threading.Thread(
             target=self._pump,
-            args=(turn, replies),
+            args=(turn, replies, watch),
             name=f"ragamer-turn-{session_id[:8]}",
             daemon=True,
         )
@@ -138,15 +178,37 @@ class TurnRegistry:
         with self._lock:
             return session_id in self._turns
 
-    def _pump(self, turn: LiveTurn, replies: Callable[[LiveTurn], Iterator[Reply]]) -> None:
+    def snapshot(self, session_id: str) -> dict[str, Any] | None:
+        """这个会话上正在跑的那一轮此刻的样子。**没有在跑的返回 `None`。**
+
+        拿到的是复制出来的一份：调用方读它的同时，跑那一轮的线程还在往里写。
+        """
+        with self._lock:
+            turn = self._turns.get(session_id)
+        if turn is None:
+            return None
+        with turn.lock:
+            return turn.snapshot.payload()
+
+    def _pump(
+        self,
+        turn: LiveTurn,
+        replies: Callable[[LiveTurn], Iterator[Reply]],
+        watch: Callable[[LiveTurn, Reply], None] | None,
+    ) -> None:
         """把这一轮跑到底，事件推进队列。
 
         **这个线程不属于任何请求**：页面断开、刷新、切走都不影响它，跑完照常落库
         （落库在 `ragamer.conversations._replies` 的最后一行）。被取消时不落库——
         收手走的是异常，落库那行根本执行不到。
+
+        每收到一个事件先更新一次快照：**队列是给正在看的人用的，快照是给回来的人
+        用的**。前者取走就没了，后者一直在。
         """
         try:
             for reply in replies(turn):
+                if watch is not None:
+                    watch(turn, reply)
                 turn.queue.put(reply)
         except TurnCancelled:
             logger.info("会话 %s 的这一轮已取消，什么都没写", turn.session_id)

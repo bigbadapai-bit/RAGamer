@@ -432,6 +432,22 @@ def test_取消一个不存在的会话返回404():
     assert client.post("/api/chat/sessions/nope/cancel").status_code == 404
 
 
+def test_没有在跑的轮次时进度是空():
+    """切回来先问它一次：`running` 是假的就照常读历史。"""
+    client = client_with(FakeLlm(said(QUESTION), REPLY), DOC)
+    session_id = start(client)
+
+    state = client.get(f"/api/chat/sessions/{session_id}/live").json()
+
+    assert state == {"session_id": session_id, "running": False}
+
+
+def test_问一个不存在会话的进度返回404():
+    client = client_with(FakeLlm())
+
+    assert client.get("/api/chat/sessions/nope/live").status_code == 404
+
+
 # --- 边界 ---
 
 

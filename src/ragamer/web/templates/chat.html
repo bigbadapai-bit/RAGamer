@@ -175,6 +175,10 @@
     if (!turns || !form) return;
 
     var source = null;
+    // 切回来接着看时那条轮询。与 `source` 互斥：同一个会话同时只会有一轮在跑
+    var timer = null;
+    // 这一趟有没有真的接上过一轮在跑的。没接上就不必在结束时多刷一次历史
+    var following = false;
 
     function refresh() {
       htmx.ajax("GET", turns.dataset.turnsUrl, { target: "#turns", swap: "innerHTML" });
@@ -185,6 +189,7 @@
       if (source) source.close();
       // `#turns` 会被整块换掉，所以每轮都重新取一次，不缓存这三个节点
       document.getElementById("live").classList.remove("hidden");
+      document.getElementById("live-question").textContent = "";
       document.getElementById("live-status").textContent = "";
       document.getElementById("live-text").textContent = "";
       document.getElementById("live-sources").classList.add("hidden");
@@ -202,39 +207,7 @@
       });
       // 来源与正文是两件事，来源在检索那一步就定下来了：先摆出来，再等字
       source.addEventListener("citations", function (event) {
-        var payload = JSON.parse(event.data);
-        var box = document.getElementById("live-sources");
-        box.textContent = "";
-        if (payload.citations.length) {
-          box.classList.remove("hidden");
-          box.appendChild(
-            document.createTextNode(
-              "来源 " + payload.citations.length + " 条" +
-                (payload.version ? " · 版本 " + payload.version : "")
-            )
-          );
-          var list = document.createElement("ol");
-          list.className = "mt-1 space-y-0.5";
-          // 只列标题，不挂 `[编号]`：正文里已经不出现编号了，这里再挂一个就成了
-          // 没人对得上的号（服务端渲染那一份也是这么列的，见 partials/turns.html）
-          payload.citations.forEach(function (citation) {
-            var item = document.createElement("li");
-            item.textContent = citation.label;
-            list.appendChild(item);
-          });
-          box.appendChild(list);
-        }
-        var images = document.getElementById("live-images");
-        images.textContent = "";
-        if (payload.images.length) {
-          images.classList.remove("hidden");
-          payload.images.forEach(function (address) {
-            var image = document.createElement("img");
-            image.className = "max-h-32 rounded border border-slate-200";
-            image.src = "/images/" + address.replace(/^images\//, "");
-            images.appendChild(image);
-          });
-        }
+        showCitations(JSON.parse(event.data));
       });
       source.addEventListener("delta", function (event) {
         document.getElementById("live-status").textContent = "";
@@ -277,6 +250,8 @@
           // 收手这一步没成，界面也得收干净——不能把人卡在一个动不了的框里
         });
       stop();
+      if (timer) { clearInterval(timer); timer = null; }
+      document.getElementById("live-question").textContent = "";
       document.getElementById("live-text").textContent = "";
       document.getElementById("live-sources").classList.add("hidden");
       var images = document.getElementById("live-images");
@@ -284,6 +259,78 @@
       images.classList.add("hidden");
       // 这一轮停在原地，而它**不会**写进会话：刷新一下就没了
       document.getElementById("live-status").textContent = "已停止，这一轮没有写进会话。";
+    }
+
+    /*
+      来源那一块。**流上那条 `citations` 事件与切回来时的快照共用这一份**：两处各写
+      一遍，迟早会有一处漏掉后来的改动（比如图片地址要不要去掉 `images/` 前缀）。
+    */
+    function showCitations(payload) {
+      var box = document.getElementById("live-sources");
+      var citations = payload.citations || [];
+      box.textContent = "";
+      if (citations.length) {
+        box.classList.remove("hidden");
+        box.appendChild(
+          document.createTextNode(
+            "来源 " + citations.length + " 条" +
+              (payload.version ? " · 版本 " + payload.version : "")
+          )
+        );
+        var list = document.createElement("ol");
+        list.className = "mt-1 space-y-0.5";
+        // 只列标题，不挂 `[编号]`：正文里已经不出现编号了，这里再挂一个就成了
+        // 没人对得上的号（服务端渲染那一份也是这么列的，见 partials/turns.html）
+        citations.forEach(function (citation) {
+          var item = document.createElement("li");
+          item.textContent = citation.label;
+          list.appendChild(item);
+        });
+        box.appendChild(list);
+      }
+      var images = document.getElementById("live-images");
+      var addresses = payload.images || [];
+      images.textContent = "";
+      if (addresses.length) {
+        images.classList.remove("hidden");
+        addresses.forEach(function (address) {
+          var image = document.createElement("img");
+          image.className = "max-h-32 rounded border border-slate-200";
+          image.src = "/images/" + address.replace(/^images\//, "");
+          images.appendChild(image);
+        });
+      }
+    }
+
+    /*
+      切回来时那一轮还在跑：先把它此刻的样子摆出来（**连你问的那句一起**——那一轮跑完
+      之前不落库，历史里查不到它），然后隔一会儿再看一眼，直到它跑完。跑完那一刻历史
+      里已经有了，`refresh()` 拉回来就是正常的样子。
+
+      这里用轮询而不是接上原来那条 SSE：与导入页看进度是同一个姿势（后台跑 + 问一份
+      快照），不必让服务端为「后来的人」再留一份事件日志。
+    */
+    function follow() {
+      fetch("/api/chat/sessions/" + turns.dataset.sessionId + "/live")
+        .then(function (response) { return response.json(); })
+        .then(function (state) {
+          if (!state.running) {
+            if (timer) { clearInterval(timer); timer = null; }
+            // 只有真的接上过才刷新：页面刚打开、本来就没有在跑的轮次时不必多问一次
+            if (following) { following = false; refresh(); }
+            return;
+          }
+          following = true;
+          document.getElementById("live").classList.remove("hidden");
+          document.getElementById("live-question").textContent = state.question || "";
+          document.getElementById("live-status").textContent = state.status || "正在回答…";
+          document.getElementById("live-text").textContent = state.text || "";
+          if (state.citations) showCitations(state.citations);
+          if (!timer) timer = setInterval(follow, 700);
+        })
+        .catch(function () {
+          // 问不到就照常显示历史：这不是该让人看见的错误
+        });
     }
 
     function choices(payload, question) {
@@ -312,6 +359,9 @@
       box.appendChild(row);
       turns.appendChild(box);
     }
+
+    // 页面一进来先问一次：这个会话上是不是还有一轮在跑（切走又切回来就是这种情形）
+    follow();
 
     // 委托挂在 `#turns` 上：答完一轮之后 htmx 会把它里面的东西整个换掉，那个停止
     // 按钮跟着换新，直接绑在按钮上的监听会一起没

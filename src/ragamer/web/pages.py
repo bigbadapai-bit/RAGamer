@@ -534,7 +534,7 @@ def create_router(container: Container, stack: ChatStack) -> APIRouter:
 
     @router.get("/chat/{game_id}")
     def chat_game(request: Request, game_id: str, after: str = "", selected: str = "") -> Response:
-        """选中一个库：左栏列它的近期会话，右边提示开一个或点一个。
+        """选中一个库：左栏列它的近期会话，右边落在**最近活跃的那个会话**上。
 
         `after` 是上一页最后一条的位置——**左栏滚到底时 htmx 拿它取下一页**。
         片段与整页走同一份数据、同一段渲染（导入那条路是同一个打法），所以两条路
@@ -546,7 +546,26 @@ def create_router(container: Container, stack: ChatStack) -> APIRouter:
                 "partials/session_list.html",
                 _session_list(stack, game_id, after=after, selected=selected),
             )
+        latest = _latest_session(game_id)
+        if latest:
+            return RedirectResponse(f"/chat/{game_id}/{latest}", status_code=303)
         return _chat_page(request, container, stack, game_id=game_id)
+
+    def _latest_session(game_id: str) -> str:
+        """这个库最近活跃的会话 id；一个都没有、或者读不出来，就是空串。
+
+        **没点名会话时落到它**：离开对话页再回来时，别的地方不知道该带哪个会话——
+        左侧导航是别的页面渲染的，那一页手里没有这个信息，给出的「对话」链接只能是
+        个裸地址。落到最近那一个，回来的就还是刚才那一页。会话列表就在旁边，想换
+        一个照样点。
+        """
+        try:
+            page = stack.chat.list_for_game(game_id)
+        except StoreError as exc:
+            # 读不出来就照常渲染：这一页自己会把错误显示出来，不该在这个岔口断掉
+            logger.warning("读不出 %s 的会话列表，这次不自动打开会话：%s", game_id, exc)
+            return ""
+        return page.sessions[0].session_id if page.sessions else ""
 
     @router.get("/chat/{game_id}/{session_id}")
     def chat_session(request: Request, game_id: str, session_id: str) -> Response:

@@ -122,3 +122,37 @@ def test_检查点按信号抛():
     check_cancelled(lambda: False)
     with pytest.raises(TurnCancelled):
         check_cancelled(lambda: True)
+
+
+def test_没有在跑的一轮时快照是空():
+    assert TurnRegistry().snapshot("s1") is None
+
+
+def test_快照带着问的那句与已经吐出来的字():
+    """切回来接着看靠它：那一轮没跑完不落库，**「我问了什么」只有这里记得住**。"""
+    registry = TurnRegistry()
+    held = threading.Event()
+    seen = 0
+
+    def watch(turn: LiveTurn, reply: object) -> None:
+        nonlocal seen
+        with turn.lock:
+            turn.snapshot.text += str(reply)
+        seen += 1
+
+    def two(live):
+        yield "一"
+        yield "二"
+        held.wait(10)
+
+    try:
+        turn = registry.start("s1", two, question="二郎神怎么打", watch=watch)
+        assert turn is not None
+        while seen < 2:
+            time.sleep(0.01)
+        state = registry.snapshot("s1")
+        assert state is not None
+        assert state["question"] == "二郎神怎么打"
+        assert state["text"] == "一二"
+    finally:
+        held.set()

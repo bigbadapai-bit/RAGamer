@@ -74,6 +74,8 @@
       停止
     </button>
   </div>
+  {# 切回来接着看时才有内容：那一轮还没落库，「我问了什么」历史里没有 #}
+  <p id="live-question" class="mb-2 text-sm font-medium"></p>
   <p id="live-text" class="text-sm leading-relaxed whitespace-pre-wrap"></p>
   {# 来源、图片、版本由 `citations` 事件填进来——它比正文早得多（检索那一步就定了） #}
   <div id="live-sources" class="mt-3 hidden text-xs text-slate-500"></div>

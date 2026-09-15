@@ -74,7 +74,7 @@ from ragamer.knowledge import (
     KnowledgeBaseError,
     readable_knowledge_base,
 )
-from ragamer.live import CANCELLED, END, TurnRegistry
+from ragamer.live import CANCELLED, END, LiveTurn, TurnRegistry
 from ragamer.llm import LlmError
 from ragamer.logging import get_logger
 from ragamer.routing import RouteTable
@@ -264,6 +264,8 @@ def create_app(container: Container, chat: Chat | None = None) -> FastAPI:
                 label=label,
                 cancelled=live.cancelled.is_set,
             ),
+            question=question,
+            watch=_watch,
         )
         if turn is None:
             # 同一会话的第二问。**判在开流之前，却只能从流里说出口**：`EventSource`
@@ -277,6 +279,22 @@ def create_app(container: Container, chat: Chat | None = None) -> FastAPI:
         return StreamingResponse(
             _events(turn.queue), media_type="text/event-stream", headers=SSE_HEADERS
         )
+
+    @app.get("/api/chat/sessions/{session_id}/live")
+    def live_turn(session_id: str) -> dict[str, Any]:
+        """这个会话上正在跑的那一轮走到哪了。**没有在跑的时候 `running` 为 `false`。**
+
+        切回来时页面先问它一次：有在跑的接着显示（**连你问的那句一起**——那一轮没跑完
+        就不会落库，历史里查不到它），没有就照常读历史。跑着的时候隔一会儿再问一次，
+        直到 `running` 变回 `false`——那时历史里已经有了。
+
+        只读、不写。会话不存在照样 404，与另外几条端点同一个口径。
+        """
+        _conversation(chat, session_id)
+        snapshot = turns.snapshot(session_id)
+        if snapshot is None:
+            return {"session_id": session_id, "running": False}
+        return {"session_id": session_id, "running": True, **snapshot}
 
     @app.post("/api/chat/sessions/{session_id}/cancel")
     def cancel(session_id: str) -> dict[str, Any]:
@@ -368,6 +386,25 @@ def _events(queue: SimpleQueue[object]) -> Iterator[str]:
             yield _event("delta", {"text": item.text})
     if not stopped:
         yield _event("done", {})
+
+
+def _watch(turn: LiveTurn, reply: object) -> None:
+    """把这一轮走到哪了记进快照——**切回来接着看靠的就是它**。
+
+    只认三样：状态、已经生成的正文、引用（连同图片与版本）。页面那侧渲染的也是这三样，
+    与流上那几条事件共用同一套载荷形状。
+
+    **为什么是回调而不是这层自己判断**：`Status` / `Delta` / `Sources` 住在
+    `ragamer.conversations`，而 `ragamer.live` 在它的上游——那边运行时导入这几个类型
+    就成环了。
+    """
+    with turn.lock:
+        if isinstance(reply, Status):
+            turn.snapshot.status = reply.text
+        elif isinstance(reply, Delta):
+            turn.snapshot.text += reply.text
+        elif isinstance(reply, Sources):
+            turn.snapshot.citations = _sources_payload(reply)
 
 
 def _failure(exc: BaseException) -> str:
