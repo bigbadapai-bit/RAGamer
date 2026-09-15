@@ -175,10 +175,8 @@
     if (!turns || !form) return;
 
     var source = null;
-    // 切回来接着看时那条轮询。与 `source` 互斥：同一个会话同时只会有一轮在跑
+    // 那一轮跑到哪了的轮询。与 `source` 互斥：同一个会话同时只会有一轮在跑
     var timer = null;
-    // 这一趟有没有真的接上过一轮在跑的。没接上就不必在结束时多刷一次历史
-    var following = false;
 
     function refresh() {
       htmx.ajax("GET", turns.dataset.turnsUrl, { target: "#turns", swap: "innerHTML" });
@@ -189,7 +187,9 @@
       if (source) source.close();
       // `#turns` 会被整块换掉，所以每轮都重新取一次，不缓存这三个节点
       document.getElementById("live").classList.remove("hidden");
-      document.getElementById("live-question").textContent = "";
+      // 你问的那句先摆上：它与回答是两条，与答完之后历史里那两条长得一样
+      document.getElementById("live-question-row").classList.remove("hidden");
+      document.getElementById("live-question").textContent = question;
       document.getElementById("live-status").textContent = "";
       document.getElementById("live-text").textContent = "";
       document.getElementById("live-sources").classList.add("hidden");
@@ -252,6 +252,7 @@
       stop();
       if (timer) { clearInterval(timer); timer = null; }
       document.getElementById("live-question").textContent = "";
+      document.getElementById("live-question-row").classList.add("hidden");
       document.getElementById("live-text").textContent = "";
       document.getElementById("live-sources").classList.add("hidden");
       var images = document.getElementById("live-images");
@@ -303,12 +304,12 @@
     }
 
     /*
-      切回来时那一轮还在跑：先把它此刻的样子摆出来（**连你问的那句一起**——那一轮跑完
-      之前不落库，历史里查不到它），然后隔一会儿再看一眼，直到它跑完。跑完那一刻历史
-      里已经有了，`refresh()` 拉回来就是正常的样子。
+      那一轮跑到哪了。**页面一进来先问一次**：服务端其实已经把它渲染在页面上了，这一次
+      是为了接上后面的变化——还在跑就隔一会儿再问，跑完那一刻 `refresh()` 拉历史，那时
+      历史里已经有了，页面上换成正常的样子。
 
-      这里用轮询而不是接上原来那条 SSE：与导入页看进度是同一个姿势（后台跑 + 问一份
-      快照），不必让服务端为「后来的人」再留一份事件日志。
+      用轮询而不是接上原来那条 SSE：与导入页看进度是同一个姿势（后台跑 + 问一份快照），
+      不必让服务端为「后来的人」再留一份事件日志。
     */
     function follow() {
       fetch("/api/chat/sessions/" + turns.dataset.sessionId + "/live")
@@ -316,12 +317,13 @@
         .then(function (state) {
           if (!state.running) {
             if (timer) { clearInterval(timer); timer = null; }
-            // 只有真的接上过才刷新：页面刚打开、本来就没有在跑的轮次时不必多问一次
-            if (following) { following = false; refresh(); }
+            // **这一刷不能省**：服务端渲染这一页的时候那一轮可能还没落库，不刷就会一直
+            // 停在不含它的那一份历史上——切回来时它刚好跑完，正是这种情形
+            refresh();
             return;
           }
-          following = true;
           document.getElementById("live").classList.remove("hidden");
+          document.getElementById("live-question-row").classList.remove("hidden");
           document.getElementById("live-question").textContent = state.question || "";
           document.getElementById("live-status").textContent = state.status || "正在回答…";
           document.getElementById("live-text").textContent = state.text || "";

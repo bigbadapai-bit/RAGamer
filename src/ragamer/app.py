@@ -39,7 +39,7 @@ def create_app(container: Container) -> FastAPI:
     各接一遍就可能一边挡了缓存、一边没挡，而那种差别在界面上看不出来。
     """
     stack = build_chat(container)
-    app = create_api_app(container, chat=stack.chat)
+    app = create_api_app(container, chat=stack.chat, turns=stack.turns)
     app.include_router(create_router(container, stack))
     return app
 

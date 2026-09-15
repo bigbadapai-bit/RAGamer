@@ -597,7 +597,11 @@ def create_router(container: Container, stack: ChatStack) -> APIRouter:
         return templates.TemplateResponse(
             request,
             "partials/turns.html",
-            {"turns": _turn_rows(conversation.turns), "error": ""},
+            {
+                "turns": _turn_rows(conversation.turns),
+                "error": "",
+                "live": stack.turns.snapshot(session_id),
+            },
         )
 
     @router.post("/chat/{game_id}")
@@ -778,6 +782,9 @@ def _chat_page(
         "hot": (),
         "question": question,
         "clarification": _clarification_view(clarification, question) if clarification else None,
+        # 正在跑的那一轮（`ragamer.live` 的快照）。**页面自己就把它渲染出来**：切回来
+        # 时不必先等一次轮询，也就没有那一段白窗——而那一轮没落库，历史里没有它。
+        "live": None,
     }
     conversation = None
     if session_id:
@@ -794,6 +801,7 @@ def _chat_page(
                 **context,
             )
         context["turns"] = _turn_rows(conversation.turns)
+        context["live"] = stack.turns.snapshot(session_id)
     if game_id:
         try:
             knowledge = readable_knowledge_base(container.docs, game_id)

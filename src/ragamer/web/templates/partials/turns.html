@@ -62,22 +62,41 @@
 </p>
 {% endfor %}
 
-{# 正在流的那一轮先长在这里：进度一行、正文一段。答完之后整块被服务端重渲染的结果换掉，
-   所以这里不必也不该拼引用与图片——那些由 templates/partials/turns.html 上面的部分负责。 #}
-<div id="live" class="hidden max-w-[95%] rounded-lg border border-slate-200 bg-white px-4 py-3">
-  <div class="mb-1 flex items-center gap-3">
-    <span id="live-status" class="text-xs text-slate-500"></span>
-    {# 停止。**与「切走」是两件事**：切走只停转发，那一轮在服务端照跑完、回来刷得到；
-       这一下才是真收手，而收手的那一轮不写进会话。 #}
-    <button id="live-stop" type="button"
-            class="rounded border border-slate-300 px-2 py-0.5 text-xs hover:bg-slate-100">
-      停止
-    </button>
+{# 正在跑的那一轮：**问题一条气泡、回答一张卡片，与它落库之后长成的那两条一模一样**。
+   服务端就把它渲染出来（`live` 是那一轮此刻的快照）——切回来时不必先等一次轮询，
+   也就没有那一段白窗，而那一轮没落库，历史里根本没有它。没在跑的时候这里是个空壳，
+   由页面在提问那一刻填上。 #}
+<div id="live" class="{% if not live %}hidden{% endif %} space-y-4">
+  <article id="live-question-row"
+           class="{% if not live %}hidden{% endif %} ml-auto max-w-[85%] rounded-lg bg-slate-900 px-4 py-2 text-sm text-white">
+    {# 那一轮没落库，「我问了什么」历史里没有——只有快照记得住 #}
+    <span id="live-question">{{ live.question if live else "" }}</span>
+  </article>
+
+  <div class="max-w-[95%] rounded-lg border border-slate-200 bg-white px-4 py-3">
+    <div class="mb-1 flex items-center gap-3">
+      <span id="live-status" class="text-xs text-slate-500">{{ live.status if live else "" }}</span>
+      {# 停止。**与「切走」是两件事**：切走只停转发，那一轮在服务端照跑完、回来刷得到；
+         这一下才是真收手，而收手的那一轮不写进会话。 #}
+      <button id="live-stop" type="button"
+              class="rounded border border-slate-300 px-2 py-0.5 text-xs hover:bg-slate-100">
+        停止
+      </button>
+    </div>
+    <p id="live-text" class="text-sm leading-relaxed whitespace-pre-wrap">{{ live.text if live else "" }}</p>
+    {# 来源比正文早得多（检索那一步就定了）。服务端渲染这一份是为了切回来的**第一眼**
+       就齐；跑着的时候由 `citations` 事件或轮询刷新它，图片也从那两处补。 #}
+    <div id="live-sources"
+         class="mt-3 {% if not live or not live.citations %}hidden{% endif %} text-xs text-slate-500">
+      {% if live and live.citations %}
+      <span>来源 {{ live.citations.citations | length }} 条{% if live.citations.version %} · 版本 {{ live.citations.version }}{% endif %}</span>
+      <ol class="mt-1 space-y-0.5">
+        {% for citation in live.citations.citations %}
+        <li>{{ citation.label }}</li>
+        {% endfor %}
+      </ol>
+      {% endif %}
+    </div>
+    <div id="live-images" class="mt-3 hidden flex-wrap gap-2"></div>
   </div>
-  {# 切回来接着看时才有内容：那一轮还没落库，「我问了什么」历史里没有 #}
-  <p id="live-question" class="mb-2 text-sm font-medium"></p>
-  <p id="live-text" class="text-sm leading-relaxed whitespace-pre-wrap"></p>
-  {# 来源、图片、版本由 `citations` 事件填进来——它比正文早得多（检索那一步就定了） #}
-  <div id="live-sources" class="mt-3 hidden text-xs text-slate-500"></div>
-  <div id="live-images" class="mt-3 hidden flex-wrap gap-2"></div>
 </div>

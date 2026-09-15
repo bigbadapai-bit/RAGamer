@@ -108,7 +108,9 @@ class UrlImport(BaseModel):
     version: str = Field(default=UNVERSIONED, description="这次导入标注的版本，留空即未标注版本")
 
 
-def create_app(container: Container, chat: Chat | None = None) -> FastAPI:
+def create_app(
+    container: Container, chat: Chat | None = None, turns: TurnRegistry | None = None
+) -> FastAPI:
     """把组合根里那套依赖接成 ASGI 应用。
 
     `chat` 由 `ragamer.app` 传进来：整站只有一套读取侧，JSON 端点与页面共用同一份
@@ -122,9 +124,11 @@ def create_app(container: Container, chat: Chat | None = None) -> FastAPI:
     chat = chat if chat is not None else build_chat(container).chat
     app = FastAPI(title="RAGamer", summary="游戏攻略 RAG 助手")
     importer = build_importer(container)
-    #: 这个进程里正在跑的那几轮问答，见 `ragamer.live`。**一个应用一份**——
-    #: 它同时是「同一个会话只跑一轮」那把锁，接两份就等于没锁。
-    turns = TurnRegistry()
+    #: 正在跑的那几轮问答，见 `ragamer.live`。缺省自己建一份（直接打这个应用的测试
+    #: 走那条）；**跑整站时由 `ragamer.app` 把 `ChatStack` 里那一份传进来**——页面
+    #: 那边也要用它渲染「正在跑的那一轮」。接两份就等于没有「同一个会话只跑一轮」
+    #: 那把锁。
+    turns = turns if turns is not None else TurnRegistry()
 
     @app.post("/api/kb/{game_id}/import")
     async def import_sources(

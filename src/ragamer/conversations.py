@@ -48,7 +48,7 @@ from ragamer.answering import Answerer, Citation, ReadSide, require_question
 from ragamer.caching import CachedAnswerer
 from ragamer.clarifying import Clarification, Clarifier
 from ragamer.container import Container
-from ragamer.live import check_cancelled
+from ragamer.live import TurnRegistry, check_cancelled
 from ragamer.llm import Message
 from ragamer.logging import get_logger
 from ragamer.query import effective_version
@@ -541,6 +541,10 @@ class ChatStack:
 
     #: 多轮对话。开会话、列会话、问一轮都走它。
     chat: Chat
+    #: 正在跑的那几轮（`ragamer.live`）。**JSON 端点与页面共用这一份**：端点那边用
+    #: 它起一轮、停一轮；页面那边用它把「正在跑的那一轮」也渲染出来——切回来时不必
+    #: 先等一次轮询。接两份就等于没有「同一个会话只跑一轮」那把锁。
+    turns: TurnRegistry
     #: 挡了缓存的读取侧入口。**热门问题要直接问它**——那不是某一次对话的事，
     #: 但它与对话共用同一份缓存连接与同一个键空间，问的也是同一批提问。
     cache: CachedAnswerer
@@ -573,6 +577,7 @@ def build_chat(container: Container) -> ChatStack:
             ),
         ),
         cache=cache,
+        turns=TurnRegistry(),
     )
 
 
