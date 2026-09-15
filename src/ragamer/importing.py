@@ -39,6 +39,7 @@ from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from functools import partial
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 from ragamer.caching.base import AnswerCache, CacheError
 from ragamer.chunking import ChunkRules, chunk_document
@@ -68,6 +69,11 @@ BATCH_WORKERS = 4
 
 #: 文档大标题。MediaWiki 页面的条目名就在这里。
 _TITLE = re.compile(r"^#\s+(.+?)\s*$", re.MULTILINE)
+
+#: 网址里的页码：最后一段以 `_数字` 收尾，后面可以跟一个扩展名。
+#: 位数限死是「看着像页码才算」——`…/1803231_6.shtml` 是第 6 页，
+#: `…/id_20240815` 是日期不是页码，那种地址不加标号。
+_PAGED_TAIL = re.compile(r"_(\d{1,3})(?:\.[A-Za-z0-9]+)?$")
 
 
 class ImportStage(StrEnum):
@@ -143,7 +149,8 @@ class DocumentCollision(ValueError):
     def __init__(self, other: str, doc_title: str) -> None:
         super().__init__(
             f"这一批里的 {other} 也叫「{doc_title}」。文档标题同时是重导替换的范围："
-            "两条落成同一个标题只会留下一份。改掉其中一份的标题再导——"
+            "两条落成同一个标题只会留下一份。网址没有标题可改——地址里带页码的"
+            "（如 `…_6.shtml`）导入时会自动带上页码；本地资料改掉其中一份的标题再导。"
             "分两次导入也留不下两份，后一次会替掉前一次。"
         )
         self.other = other
@@ -213,19 +220,45 @@ class ImportResult:
         return self.error is None
 
 
-def document_title(markdown: str, filename: str) -> str:
+def document_title(markdown: str, source: str) -> str:
     """这份资料存进库里叫什么。
 
     先取正文的一级标题（词条页的条目名就在这里），取不到才回落到文件名。
     它对同一份资料必须稳定：文档标题同时是「重导时替换掉哪一批切片」的依据，
     换个文件名重传会变成两份文档——这是回落带来的已知代价。
 
+    网址来源还要带上页码标号（见 :func:`_page_mark`）：同站的分页攻略每一页的标题
+    逐字相同——实测游民星空那份图文攻略，三页的 HTML 标题与正文一级标题一模一样
+    ——而标题是替换键，不带标号时同一批里十页只活得下来一页，留下哪一页还取决于
+    线程调度。
+
     按行扫，**不认围栏代码块**：正文若以一段代码开头，代码里的 `#` 会被当成大标题。
     这与打标读结构（`ragamer.tagging` 的已知限）同源，是同一处妥协；
     但这里的影响面更大——标题是替换键，改错了旧的那批切片会留在库里。
     """
     title = _TITLE.search(markdown)
-    return title.group(1).strip() if title is not None else Path(filename).stem
+    base = title.group(1).strip() if title is not None else Path(source).stem
+    return base + _page_mark(source)
+
+
+def _page_mark(source: str) -> str:
+    """网址来源的页码标号；不是网址、或地址里读不出页码时是空串。
+
+    同站分页攻略的每一页标题逐字相同，而文档标题同时是重导替换的范围：十页落成
+    同一个标题，最后只活得下来一页。地址里的页码是这一页**唯一稳定**的身份——
+    不按「这一批里第几个」编号，那种号随同批伙伴的有无而变，于是单独重导一页
+    会拿到 1 号、把原来那一份删掉。
+
+    只认地址里读得出的页码，读不出就不加：标识必须能从这一条自己算出来，
+    靠猜（或靠同批还有谁）得来的号，重导时会算出另一个标题，旧的那批切片于是
+    留成查得出来、也删不掉的孤儿。
+    """
+    parts = urlsplit(source)
+    if parts.scheme not in ("http", "https"):
+        return ""
+    segment = unquote(parts.path.rstrip("/").rpartition("/")[2])
+    found = _PAGED_TAIL.search(segment)
+    return f"（{found.group(1)}）" if found is not None else ""
 
 
 def chunk_id(*, game_id: str, doc_title: str, version: str, chunk_index: int) -> int:

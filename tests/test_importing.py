@@ -440,6 +440,43 @@ def test_两个不同网址切成同一个标题时后一条失败():
     assert {chunk.source_url for chunk in stored(chunks)} == {PAGE_URL}
 
 
+#: 游民星空那份图文攻略：分页的每一页标题逐字相同，只有地址末尾的页码不一样。
+HANDBOOK_FIRST = "https://www.gamersky.com/handbook/202408/1803231.shtml"
+HANDBOOK_PAGE = "https://www.gamersky.com/handbook/202408/1803231_6.shtml"
+
+
+def test_同站分页攻略的每一页各自成一份():
+    """同名不再是撞车：地址里的页码让每一页有自己的标识，一批十页都存得下。"""
+    chunks = InMemoryChunkStore()
+    importer = make_importer(
+        chunks,
+        crawler=FakeCrawler(**{HANDBOOK_FIRST: WIKI_ARTICLE, HANDBOOK_PAGE: WIKI_ARTICLE}),
+    )
+
+    results = importer.batch_urls(
+        [HANDBOOK_FIRST, HANDBOOK_PAGE], game_id=GAME, vocabulary=BLACK_MYTH
+    )
+
+    assert [result.ok for result in results] == [True, True]
+    assert sorted(result.doc_title for result in results) == ["二郎神", "二郎神（6）"]
+    assert len(chunks.documents(GAME)) == 2
+
+
+def test_单独重导分页攻略里的一页只替它自己():
+    """页码来自地址、不来自「这一批里第几个」：单独重导一页不会碰掉别的页。"""
+    chunks = InMemoryChunkStore()
+    importer = make_importer(
+        chunks,
+        crawler=FakeCrawler(**{HANDBOOK_FIRST: WIKI_ARTICLE, HANDBOOK_PAGE: WIKI_ARTICLE}),
+    )
+    importer.batch_urls([HANDBOOK_FIRST, HANDBOOK_PAGE], game_id=GAME, vocabulary=BLACK_MYTH)
+
+    assert importer.import_url(HANDBOOK_PAGE, game_id=GAME, vocabulary=BLACK_MYTH).ok
+
+    assert {document.doc_title for document in chunks.documents(GAME)} == {"二郎神", "二郎神（6）"}
+    assert chunks.fetch_document(GAME, "二郎神", version=UNVERSIONED)
+
+
 def test_同一标题的两个版本互不相干():
     """文档标识是「标题 + 版本」：两个版本本来就要并存（ADR-0004），不是撞车。"""
     chunks = InMemoryChunkStore()
@@ -680,6 +717,33 @@ def test_文档标题取一级标题():
 def test_没有一级标题时回落到文件名():
     assert document_title("没有标题的正文", "两郎神.md") == "两郎神"
     assert document_title("", "路径/两郎神.md") == "两郎神"
+
+
+def test_网址带页码时标题带上页码():
+    """分页攻略的每一页标题逐字相同，靠地址里的页码才分得开（见 `_page_mark`）。"""
+    title = "《黑神话悟空》全探索图文攻略 支线+隐藏+重要收集路线讲解"
+
+    assert document_title(f"# {title}\n\n正文", HANDBOOK_PAGE) == f"{title}（6）"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://wiki.test/wiki/二郎神",  # 没有页码可读
+        "https://wiki.test/wiki/二郎神/打法",
+        "https://wiki.test/wiki/二郎神_技能",  # `_技能` 不是页码
+        "https://wiki.test/a/id_20240815",  # 八位数是日期不是页码
+    ],
+)
+def test_网址读不出页码时标题原样(url):
+    """加一个猜出来的号比不加更糟：标识必须能从这一条自己算出来。"""
+    assert document_title("# 二郎神\n\n正文", url) == "二郎神"
+
+
+def test_本地文件的标题不带页码():
+    """文件名里的 `_2` 是名字的一部分，不是身份的来源（重命名本来就换一份文档）。"""
+    assert document_title("# 二郎神\n\n正文", "攻略_2.md") == "二郎神"
+    assert document_title("# 二郎神\n\n正文", "C:\\资料\\攻略_2.md") == "二郎神"
 
 
 @pytest.mark.parametrize("version", [UNVERSIONED, "2.0"])
