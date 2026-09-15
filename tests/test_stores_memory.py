@@ -186,6 +186,44 @@ def test_资料只按这个游戏列(memory_container):
     assert [item.doc_title for item in store.documents("black_myth")] == ["二郎神"]
 
 
+def test_列出库里引用到的图片_key_去重排序(memory_container):
+    """删一份资料时要判断「这几张图还有没有别人在用」（见 `ChunkStore.image_keys`）。"""
+    store = memory_container.chunks
+    store.upsert(
+        "black_myth",
+        [
+            make_chunk(1, doc_title="二郎神", image_urls=("images/black_myth/ab12/立绘.png",)),
+            make_chunk(
+                2,
+                doc_title="白龙马",
+                image_urls=(
+                    "images/black_myth/ab12/立绘.png",
+                    "images/black_myth/cd34/地图.png",
+                    # 修复之前入库的切片里还留着外链：它不是对象，不该混进来
+                    "https://img.test/18px-图标-衣甲.png",
+                ),
+            ),
+        ],
+    )
+
+    assert store.image_keys("black_myth") == (
+        "images/black_myth/ab12/立绘.png",
+        "images/black_myth/cd34/地图.png",
+    )
+    # 跳到某一份自己的切片：删一份资料时要问的正是「**别人**引用到哪些」
+    assert store.image_keys("black_myth", excluding=("二郎神", "1.0")) == (
+        "images/black_myth/ab12/立绘.png",
+        "images/black_myth/cd34/地图.png",
+    )
+    assert store.image_keys("black_myth", excluding=("白龙马", "1.0")) == (
+        "images/black_myth/ab12/立绘.png",
+    )
+
+
+def test_还没有资料的库列图片_key_是空的(memory_container):
+    assert memory_container.chunks.image_keys("black_myth") == ()
+
+
 def test_取一份文档的全部切片按顺序且不混版本(memory_container):
     """聚合父块靠它：命中并截断之后回查同文档的兄弟切片。"""
     store = memory_container.chunks

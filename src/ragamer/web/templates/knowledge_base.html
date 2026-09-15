@@ -82,6 +82,8 @@
         <td class="py-2 pr-4 text-slate-500">{{ document.chunk_count }}</td>
         <td class="py-2 text-right">
           <a class="underline" href="{{ document.preview_url }}">看切分结果</a>
+          {# 删除走确认页，与删库那条路同一个姿势：先摆出将清掉什么，再让人决定 #}
+          <a class="ml-3 text-red-700 underline" href="{{ document.delete_url }}">删除</a>
         </td>
       </tr>
       {% endfor %}

@@ -1,0 +1,69 @@
+{#
+  删一份资料的确认页。与删库那张（knowledge_base_delete.html）同一个姿势，范围小一圈：
+  **只清这一份资料自己的那些**，库与别的资料都不动。
+
+  条数取自 `document_inventory`，与真删的是同一批——页面上写「8 个原图」而真删掉 20 个，
+  那份确认就成了摆设。
+#}
+{% extends "base.html" %}
+{% block content %}
+
+<p class="mb-6 text-sm text-slate-500">
+  <a class="underline" href="/kb/{{ game_id }}">← 取消，回到 {{ name }}</a>
+</p>
+
+<section class="rounded border border-red-300 bg-white p-5">
+  <h2 class="mb-1 text-lg font-medium text-red-800">将要清理的数据</h2>
+  <p class="mb-4 text-sm text-slate-500">
+    只清这一份资料自己的那些，库和别的资料都不动。清单里的条数是刚才数出来的。
+  </p>
+
+  <ul class="mb-5 space-y-2 text-sm">
+    <li class="rounded border border-slate-200 px-4 py-3">
+      <span class="font-medium">向量库</span>
+      <span class="text-slate-500">《{{ inventory.doc_title }}》（{{ version_label }}）在这个版本下的切片</span>
+      ——<strong>{{ inventory.chunk_count }}</strong> 条（正文、向量、标签）。
+      同一个标题的另一个版本不动
+    </li>
+    <li class="rounded border border-slate-200 px-4 py-3">
+      <span class="font-medium">对象存储</span>
+      <span class="text-slate-500">这些切片引用到的原图</span>
+      ——<strong>{{ inventory.image_count }}</strong> 个。
+      <strong>别的资料还在引用的那些不删</strong>：同一个来源被导成两份文档时两份指着同一批图，
+      删了会让另一份的图变成打不开的空图
+    </li>
+    <li class="rounded border border-slate-200 px-4 py-3">
+      <span class="font-medium">缓存</span>
+      <span class="text-slate-500">这个库的答案缓存</span>
+      ——按前缀清一遍（下次提问按现在的资料重算）。<strong>提问计数留着</strong>：库还在，
+      热门问题该留着
+    </li>
+  </ul>
+
+  <p class="mb-5 rounded border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-600">
+    <span class="font-medium">不动</span>：知识库配置（库还在）、会话（那是历史）。
+    删库那条路才会连它们一起清。
+  </p>
+
+  <p class="mb-5 rounded border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+    删掉就取不回来了。要回来的话得把这份资料重新导入一次——重新解析、重新向量化。
+  </p>
+
+  <form method="post" action="/kb/{{ game_id }}/documents/delete" class="space-y-4">
+    {# 标题与版本原样带回：删的是列表页上那一行，认的就是这一对取值 #}
+    <input type="hidden" name="doc_title" value="{{ inventory.doc_title }}">
+    <input type="hidden" name="version" value="{{ inventory.version }}">
+    <label class="flex items-start gap-2 text-sm">
+      <input type="checkbox" name="confirm" value="yes" class="mt-1">
+      <span>我知道这会清掉上面列出的数据，而且取不回来。</span>
+    </label>
+    <div class="flex items-center gap-4">
+      <button type="submit" class="rounded bg-red-700 px-4 py-2 text-sm font-medium text-white">
+        确认删除
+      </button>
+      <a class="text-sm underline" href="/kb/{{ game_id }}">取消</a>
+    </div>
+  </form>
+</section>
+
+{% endblock %}

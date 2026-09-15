@@ -206,6 +206,26 @@ def test_数资料要按标题与版本分组(settings: Settings, probe_chunks: 
         container.chunks.drop(PROBE_GAME)
 
 
+def test_列出库里引用到的图片_key(settings: Settings, probe_chunks: list[Chunk]):
+    """`image_urls` 是数组字段，扫全库只取它这一列要真的回得来（见 `ChunkStore.image_keys`）。
+
+    探针那一批里本来就摆了一条外链与一条对象 key：前者不该混进来。
+    """
+    container = build_container(settings)
+    container.chunks.check()
+    try:
+        container.chunks.ensure_collection(PROBE_GAME)
+        container.chunks.upsert(PROBE_GAME, list(probe_chunks))
+
+        assert container.chunks.image_keys(PROBE_GAME) == (
+            "images/black_myth/0123456789abcdef/phase2.jpg",
+        )
+        # 探针那一批全属于同一份：跳过它就什么都不剩
+        assert container.chunks.image_keys(PROBE_GAME, excluding=("探针文档", "1.0")) == ()
+    finally:
+        container.chunks.drop(PROBE_GAME)
+
+
 def test_列一个还没有资料的库得到空(settings: Settings):
     """建了库、一份资料都没导：页面上那句「还没有导入任何资料」靠它，扫不存在的表会炸。"""
     container = build_container(settings)

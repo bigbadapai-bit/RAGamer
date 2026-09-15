@@ -22,6 +22,7 @@ from ragamer.stores.base import (
     DocumentSummary,
     StoreError,
     collection_name,
+    is_image_key,
     matches,
     matches_where,
     normalize_prefix,
@@ -109,6 +110,26 @@ class InMemoryChunkStore:
         return tuple(
             DocumentSummary(doc_title, version, count)
             for (doc_title, version), count in sorted(counted.items())
+        )
+
+    def image_keys(
+        self, game_id: str, *, excluding: tuple[str, str] | None = None
+    ) -> tuple[str, ...]:
+        """与真实适配器同一套口径：库里切片引用到的对象 key，去重、排序。
+
+        `excluding` 是 `(文档标题, 版本)`，传了就跳过那一份自己的切片；**只算对象 key**
+        （切分摘掉图片地址那次修复之前入库的切片里还留着外链）——两处口径见协议里的说明。
+        """
+        return tuple(
+            sorted(
+                {
+                    key
+                    for chunk in self._collection(collection_name(game_id)).values()
+                    if excluding is None or (chunk.doc_title, chunk.version) != excluding
+                    for key in chunk.image_urls
+                    if is_image_key(key)
+                }
+            )
         )
 
     def delete_document(self, game_id: str, doc_title: str, *, version: str) -> None:

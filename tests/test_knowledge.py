@@ -19,11 +19,14 @@ from ragamer.knowledge import (
     KB_COLLECTION,
     BrokenKnowledgeBase,
     KnowledgeBase,
+    PurgeDocumentError,
     PurgeError,
     PurgeInventory,
     UnknownKnowledgeBase,
     create_knowledge_base,
+    document_inventory,
     list_knowledge_bases,
+    purge_document,
     purge_inventory,
     purge_knowledge_base,
     remove_term,
@@ -31,7 +34,7 @@ from ragamer.knowledge import (
     update_knowledge_base,
     vocabulary_of,
 )
-from ragamer.stores.base import UNVERSIONED, image_key, image_prefix
+from ragamer.stores.base import UNVERSIONED, StoreUnavailableError, image_key, image_prefix
 from ragamer.stores.memory import InMemoryDocStore, InMemoryObjectStore
 from ragamer.tagging import SubjectType, TagVocabulary
 
@@ -358,6 +361,153 @@ def test_清前缀时不碰_id_是它前缀的另一个库(container):
         image_key(sibling, "a1b2", "它的立绘.png")
     ]
     assert container.chunks.count(sibling) == 1
+
+
+# --- 删一份资料（`purge_document`） ---
+
+
+#: 这一份自己的图
+OWN_IMAGE = image_key(GAME, "a1b2", "立绘.png")
+#: 两份资料都引用着的图：同一个来源被导成两份标题不同的文档时就是这样
+SHARED_IMAGE = image_key(GAME, "c3d4", "地图.png")
+
+
+def _two_documents(container) -> None:
+    """一个建好的库，里面两份资料：共用一张图，各自还有自己的一张。"""
+    create_knowledge_base(container.docs, KnowledgeBase.new(GAME, "黑神话·悟空"))
+    container.chunks.upsert(
+        GAME,
+        [
+            make_chunk(1, doc_title="二郎神", image_urls=(OWN_IMAGE, SHARED_IMAGE)),
+            make_chunk(
+                2,
+                doc_title="白骨精",
+                image_urls=(SHARED_IMAGE, image_key(GAME, "e5f6", "三阶段.png")),
+            ),
+        ],
+    )
+    for key in (OWN_IMAGE, SHARED_IMAGE, image_key(GAME, "e5f6", "三阶段.png")):
+        container.objects.put(key, b"PNG")
+
+
+def _purge_document(container, objects=None, cache=None):
+    return purge_document(
+        container.chunks,
+        objects if objects is not None else container.objects,
+        cache if cache is not None else container.cache,
+        GAME,
+        doc_title="二郎神",
+        version="1.0",
+    )
+
+
+def test_删一份资料只动它自己的那一片(container):
+    _two_documents(container)
+
+    inventory = _purge_document(container)
+
+    assert (inventory.chunk_count, inventory.image_count) == (1, 1)
+    assert container.chunks.fetch_document(GAME, "二郎神", version="1.0") == []
+    remaining = container.chunks.fetch_document(GAME, "白骨精", version="1.0")
+    assert [chunk.doc_title for chunk in remaining] == ["白骨精"]
+    # 库本身还在：删的是资料，不是库
+    assert container.docs.get(KB_COLLECTION, GAME) is not None
+
+
+def test_别的资料还在引用的原图不删(container):
+    """对象 key 里那层摘要来自来源本身：同一个来源被导成两份标题不同的文档时，两份指着
+    同一批 key——照单删下去，另一份的图会变成打不开的空图，而且不报错。"""
+    _two_documents(container)
+
+    _purge_document(container)
+
+    keys = set(container.objects.list_keys())
+    assert SHARED_IMAGE in keys
+    assert image_key(GAME, "e5f6", "三阶段.png") in keys
+    assert OWN_IMAGE not in keys  # 只有这一份在用的那张，跟着走
+
+
+def test_确认页数的与真删的是同一批(container):
+    """页面上写「8 个原图」而真删掉 20 个，那份确认就成了摆设。"""
+    _two_documents(container)
+
+    counted = document_inventory(container.chunks, GAME, doc_title="二郎神", version="1.0")
+    deleted = _purge_document(container)
+
+    assert (counted.chunk_count, counted.image_count) == (deleted.chunk_count, deleted.image_count)
+    assert (counted.chunk_count, counted.image_count) == (1, 1)
+
+
+def test_数一遍不动任何数据(container):
+    _two_documents(container)
+
+    document_inventory(container.chunks, GAME, doc_title="二郎神", version="1.0")
+
+    assert container.chunks.count(GAME) == 2
+    assert len(container.objects.list_keys()) == 3
+
+
+def test_删一份资料清缓存但留着提问计数与会话(container):
+    """库还在，热门问题该留着；会话是历史，删库那条路才会连它一起清。"""
+    _two_documents(container)
+    container.docs.put(SESSIONS, "s1", {"game_id": GAME, "title": "二郎神怎么打"})
+    container.cache.set(CACHED_KEY, CachedAnswer("先定身再贴身输出[1]。"))
+    container.cache.record_question(GAME, "二郎神怎么打")
+
+    _purge_document(container)
+
+    assert container.cache.get(CACHED_KEY) is None
+    assert container.cache.top_questions(GAME) != ()
+    assert container.docs.find(SESSIONS, {"game_id": GAME}) != []
+
+
+def test_只删对象_key_外链不会被拿去删(container):
+    """切分摘掉图片地址那次修复之前入库的切片里还留着外链——拿一条网址去删对象，
+    只会把那一步整条弄失败（而切片本来是该删掉的）。"""
+    create_knowledge_base(container.docs, KnowledgeBase.new(GAME, "黑神话·悟空"))
+    container.chunks.upsert(
+        GAME,
+        [make_chunk(1, doc_title="二郎神", image_urls=("https://img.test/18px-图标-衣甲.png",))],
+    )
+
+    inventory = _purge_document(container)
+
+    assert inventory.image_count == 0
+    assert container.chunks.fetch_document(GAME, "二郎神", version="1.0") == []
+
+
+class BrokenObjectStore(InMemoryObjectStore):
+    """删对象时炸的存储。"""
+
+    def delete(self, key: str) -> None:
+        raise StoreUnavailableError("MinIO", "minio.test:9000", 5.0, "连接被拒绝")
+
+
+def test_原图删不掉时报出来_已经删掉的切片不回头(container):
+    """一处失败不跳过其余，也不假装成功：缓存照清，报出还差哪一处。"""
+    _two_documents(container)
+    container.cache.set(CACHED_KEY, CachedAnswer("先定身[1]。"))
+
+    with pytest.raises(PurgeDocumentError, match="对象存储"):
+        _purge_document(container, objects=BrokenObjectStore())
+
+    assert container.chunks.fetch_document(GAME, "二郎神", version="1.0") == []
+    assert container.cache.get(CACHED_KEY) is None
+
+
+class ExplodingDocumentCache(InMemoryAnswerCache):
+    """清缓存时炸的缓存。这一路不能静默跳过：漏掉那一处，再问同一个问题还会命中
+    基于旧语料的答案，而它带着已删资料的引用、看起来完全正常。"""
+
+    def invalidate(self, game_id: str) -> int:
+        raise CacheUnavailableError("Redis", "redis.test:6379", 5.0, "连接被拒绝")
+
+
+def test_缓存清不掉也算没清干净(container):
+    _two_documents(container)
+
+    with pytest.raises(PurgeDocumentError, match="缓存"):
+        _purge_document(container, cache=ExplodingDocumentCache())
 
 
 # --- 术语映射的增删 ---

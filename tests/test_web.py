@@ -17,7 +17,7 @@ import re
 import threading
 import time
 from dataclasses import replace
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 
 import pytest
 from fastapi.testclient import TestClient
@@ -1320,4 +1320,138 @@ def test_数不出来时不让确认():
     response = client.get(DELETE_URL)
 
     assert response.status_code == 500
+    assert "确认删除" not in response.text
+
+
+# --- 验收：删一份资料（库与别的资料都不动） ---
+
+DOC_DELETE_URL = f"{CONFIG_URL}/documents/delete"
+
+
+def doc_delete_url(doc_title: str = DOC_TITLE, version: str = UNVERSIONED) -> str:
+    return f"{DOC_DELETE_URL}?{urlencode({'doc_title': doc_title, 'version': version})}"
+
+
+def with_images(container, doc_title: str, *names: str) -> tuple[str, ...]:
+    """把这一份的切片挂上原图，返回那些对象 key。
+
+    真实导入时这些 key 由补图那一层写进去（`publish_assets`），这里直接摆上——要验的是
+    删除时「这些图还有没有别人在用」那一层判断，不是图片怎么来的。
+    """
+    keys = tuple(image_key(GAME, "a1b2", name) for name in names)
+    container.chunks.upsert(
+        GAME,
+        [
+            replace(chunk, image_urls=keys)
+            for chunk in container.chunks.fetch_document(GAME, doc_title, version=UNVERSIONED)
+        ],
+    )
+    for key in keys:
+        container.objects.put(key, b"PNG")
+    return keys
+
+
+def test_知识库页那一行有删除入口_链到确认页(client, container):
+    do_import(client)
+
+    page = kb_page(client).text
+
+    link = re.search(r'href="(/kb/[^"]*documents/delete[^"]*)"', page)
+    assert link is not None, page
+    confirm = client.get(html.unescape(link.group(1)))
+    assert confirm.status_code == 200
+    assert "将要清理的数据" in confirm.text
+    assert DOC_TITLE in confirm.text
+    assert "确认删除" in confirm.text
+
+
+def test_删一份资料的确认页列出将要清掉的东西(client, container):
+    do_import(client)
+    with_images(container, DOC_TITLE, "立绘.png")
+
+    page = client.get(doc_delete_url()).text
+
+    assert f"<strong>{len(stored(container))}</strong> 条" in page
+    assert "<strong>1</strong> 个" in page  # 原图
+    # 说清哪些不动：库还在、会话是历史、提问计数留着
+    assert "知识库配置" in page and "会话" in page and "提问计数" in page
+    # 预览页那条只读的规矩不破：删除入口只在列表页那一行上
+    assert "documents/delete" not in preview(client).text
+
+
+def test_没勾确认不会删掉一份资料(client, container):
+    do_import(client)
+    with_images(container, DOC_TITLE, "立绘.png")
+
+    response = client.post(DOC_DELETE_URL, data={"doc_title": DOC_TITLE, "version": ""})
+
+    assert response.status_code == 400
+    assert "先把那句确认勾上" in response.text
+    assert stored(container)  # 一片都没少
+    assert container.objects.list_keys(image_prefix(GAME))
+
+
+def test_删一份资料只清它自己的那些(client, container):
+    do_import(client)
+    do_import(client, upload("白龙马.md", DRAGON))
+    count = len(stored(container))
+    with_images(container, DOC_TITLE, "立绘.png", "地图.png")
+
+    response = client.post(
+        DOC_DELETE_URL,
+        data={"doc_title": DOC_TITLE, "version": "", "confirm": "yes"},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert parse_qs(urlparse(response.headers["location"]).query) == {
+        "deleted_doc": [DOC_TITLE],
+        "chunks": [str(count)],
+        "images": ["2"],
+    }
+    # 这一份没了，另一份原样在
+    assert stored(container) == []
+    assert container.chunks.fetch_document(GAME, "白龙马", version=UNVERSIONED)
+    # 原图跟着走了
+    assert container.objects.list_keys(image_prefix(GAME)) == []
+    # 库还在
+    assert container.docs.get(KB_COLLECTION, GAME) is not None
+
+    page = client.get(response.headers["location"]).text
+    assert f"已删除《{DOC_TITLE}》" in page
+    assert f"清掉 {count} 条切片、2 个原图" in page
+    rows = rows_of(page)
+    assert sum("白龙马" in body for body in rows) == 1
+    assert sum("documents/delete" in body for body in rows) == 1  # 只剩一行有删除入口
+
+
+def test_删一份不存在的资料时说清而不是给一张空确认页(client, container):
+    """给一张「将删掉 0 条切片」的确认页，点下去只会以为删成功了。"""
+    do_import(client)
+
+    response = client.get(doc_delete_url(doc_title="没这份"))
+
+    assert response.status_code == 404
+    assert "没有《没这份》" in response.text
+    assert "确认删除" not in response.text
+
+
+class UnreachableChunkStore(BrokenChunkStore):
+    """连按文档查都查不了的向量库：删一份资料那条路问的就是它。"""
+
+    def fetch_document(self, game_id: str, doc_title: str, *, version):
+        self._refuse()
+        return super().fetch_document(game_id, doc_title, version=version)
+
+
+def test_清点不出资料占用的数据时不让确认():
+    chunks = UnreachableChunkStore()
+    container = make_container(chunks=chunks)
+    container.docs.put(KB_COLLECTION, GAME, KB)
+    client = TestClient(create_app(container))
+
+    response = client.get(doc_delete_url())
+
+    assert response.status_code == 500
+    assert "清点不出这份资料占用的数据" in response.text
     assert "确认删除" not in response.text

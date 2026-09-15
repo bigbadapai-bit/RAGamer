@@ -303,6 +303,28 @@ class ChunkStore(Store, Protocol):
         """
         ...
 
+    def image_keys(
+        self, game_id: str, *, excluding: tuple[str, str] | None = None
+    ) -> tuple[str, ...]:
+        """这个库里切片引用到的图片对象 key，去重、排序。
+
+        `excluding` 是一个 `(文档标题, 版本)`：传了就跳过那一份自己的切片。删一份资料时要
+        问的正是「**别人**引用到的有哪些」——这一问不能靠「全库有哪些、再把自己那批减掉」：
+        返回的是并集，减自己会把两份**共用**的 key 一起减掉，共用图于是被当成没人用而删掉。
+        对象 key 里那层摘要来自来源本身（文件的字节摘要、网址的哈希，见 `image_key`），
+        同一个来源被导成两份标题不同的文档时两份就指着同一批 key——那正是要防的边角。
+
+        **只读切片，不碰对象存储**：真删由调用方按 key 走 `ObjectStore.delete`。
+        只取 `image_urls` 那一列（外加判断 `excluding` 用的两列），所以它是一次全库扫
+        （与 `documents` 同一笔代价）。
+
+        **只算对象 key**（`is_image_key`）：切分摘掉图片地址那次修复之前入库的切片里还留着
+        外链，那些不是对象，拿去删只会把删除那一步整条弄失败。
+
+        库还不存在（建了库但一份资料都没导）时返回空元组，不报错。
+        """
+        ...
+
     def delete_document(self, game_id: str, doc_title: str, *, version: str) -> None:
         """删掉一份文档在**这个版本**下的全部切片。
 

@@ -30,11 +30,13 @@ from ragamer.caching.base import AnswerCache
 from ragamer.logging import get_logger
 from ragamer.stores.base import (
     UNVERSIONED,
+    Chunk,
     ChunkStore,
     DocStore,
     ObjectStore,
     collection_name,
     image_folder,
+    is_image_key,
 )
 from ragamer.tagging import SubjectType, TagVocabulary
 
@@ -348,6 +350,160 @@ def purge_knowledge_base(
     )
     return PurgeInventory(
         chunk_count=chunk_count, image_count=image_count, session_count=session_count
+    )
+
+
+@dataclass(frozen=True)
+class DocumentInventory:
+    """一份资料在各处占着多少东西。确认页与删完的回话都用它。
+
+    `image_count` 数的是**这份资料引用、且删除之后没有别人再引用**的那些原图——与真删的
+    必须是同一批：页面上写「8 张原图」而真删掉 20 张，或者反过来留下几张打不开的图，
+    那份确认就成了摆设。
+    """
+
+    doc_title: str
+    version: str
+    chunk_count: int
+    image_count: int
+
+
+class PurgeDocumentError(KnowledgeBaseError):
+    """删一份资料时有哪一处没清干净。
+
+    与 `PurgeError` 同一个姿势：**已经清掉的那些不回头**，把还差的那几处报出来，
+    界面上可以再点一次（再清一次不会出错）。
+    """
+
+    status = 500
+
+    def __init__(self, game_id: str, doc_title: str, failures: Sequence[str]) -> None:
+        self.game_id = game_id
+        self.doc_title = doc_title
+        self.failures = tuple(failures)
+        super().__init__(
+            f"《{doc_title}》没有删干净：" + "；".join(failures) + "。这个库还在，可以再删一次"
+        )
+
+
+def _document_image_keys(found: Sequence[Chunk]) -> tuple[str, ...]:
+    """这些切片引用到的图片对象 key，去重、保持首次出现次序。
+
+    **只认对象 key**（`is_image_key`）：切分时就把地址摘走了（`ragamer.chunking`），
+    而那个修复之前入库的切片里还留着外链——拿一条网址去删对象，只会把那一步整条弄失败。
+    """
+    return tuple(
+        dict.fromkeys(key for chunk in found for key in chunk.image_urls if is_image_key(key))
+    )
+
+
+def _unshared_image_keys(
+    chunks: ChunkStore, game_id: str, mine: Sequence[str], *, doc_title: str, version: str
+) -> tuple[str, ...]:
+    """`mine` 里那些**库里别的切片没有再引用**的 key。
+
+    问法是「库里除这一份之外还引用到哪些」，而不是「全库有哪些再把自己那批减掉」：
+    `image_keys` 返回的是并集，减自己会把两份**共用**的 key 一起减掉，共用图于是被当成
+    没人用而删掉——那个边角正是这个判断要防的。传 `excluding` 而不是先删切片再扫，
+    是因为**数的时候切片还在库里、删的时候才没有**，两次都要得到同一个答案。
+    """
+    others = set(chunks.image_keys(game_id, excluding=(doc_title, version)))
+    return tuple(key for key in mine if key not in others)
+
+
+def document_inventory(
+    chunks: ChunkStore, game_id: str, *, doc_title: str, version: str
+) -> DocumentInventory:
+    """数一遍这份资料占着多少东西。**只读**，删之前给确认页用。
+
+    与 `purge_document` 数的是同一批（见 `DocumentInventory`）。数不出来时抛出去、
+    别猜——那份确认页上写着「将要删掉什么」，猜出来的数字让人确认的是另一件事。
+    """
+    found = chunks.fetch_document(game_id, doc_title, version=version)
+    mine = _document_image_keys(found)
+    return DocumentInventory(
+        doc_title=doc_title,
+        version=version,
+        chunk_count=len(found),
+        image_count=len(
+            _unshared_image_keys(chunks, game_id, mine, doc_title=doc_title, version=version)
+        ),
+    )
+
+
+def purge_document(
+    chunks: ChunkStore,
+    objects: ObjectStore,
+    cache: AnswerCache,
+    game_id: str,
+    *,
+    doc_title: str,
+    version: str,
+) -> DocumentInventory:
+    """删掉一份资料：**切片 → 原图 → 缓存**，一处失败不跳过其余。
+
+    与 `purge_knowledge_base` 同一个姿势，范围收在这一份资料上：
+
+    - **切片**先取再删（`fetch_document` + `delete_document`）：取是为了知道这份资料引用过
+      哪些图，切片一删就问不出来了。`delete_document` 的 `version` 是精确匹配，同一个标题
+      的另一个版本不动（ADR-0004）。
+    - **原图**只删这份引用、而库里别的切片没有再引用的那些：对象 key 里那层摘要来自来源
+      本身（文件的字节摘要、网址的哈希），同一个来源被导成两份标题不同的文档时两份指着
+      同一批 key——照单删下去，另一份的图会变成打不开的空图，而且不报错。逐个 key 删而不是
+      按前缀删：对象存储只提供这两种删法，而按前缀会把别人那一份的图一起收走。
+    - **缓存**按前缀清（`invalidate`）：不清的话，再问同一个问题还会命中基于旧语料的答案，
+      而它带着已删资料的引用、看起来完全正常。这里**不清提问计数**（那是 `drop`）——
+      库还在，热门问题该留着。
+    - **不动**知识库配置（库还在），也**不动会话**：那是历史，删库连会话一起清是因为
+      整个库都没了。
+
+    一处失败不跳过其余，理由与 `purge_knowledge_base` 一致：一次就能看清还差什么。
+
+    :raises PurgeDocumentError: 有哪一处没清干净。
+    """
+    chunk_count = 0
+    image_count = 0
+    orphans: tuple[str, ...] = ()
+    failures: list[str] = []
+
+    try:
+        found = chunks.fetch_document(game_id, doc_title, version=version)
+        chunk_count = len(found)
+        mine = _document_image_keys(found)
+        # 先问再删：`excluding` 把那几列跳过去，与删没删过无关，所以这一步的答案与
+        # 确认页上数出来的那个一定一致
+        orphans = _unshared_image_keys(chunks, game_id, mine, doc_title=doc_title, version=version)
+        chunks.delete_document(game_id, doc_title, version=version)
+    except Exception as exc:
+        failures.append(f"向量库：{exc}")
+
+    try:
+        for key in orphans:
+            objects.delete(key)
+        image_count = len(orphans)
+    except Exception as exc:
+        failures.append(f"对象存储：{exc}")
+
+    try:
+        cache.invalidate(game_id)
+    except Exception as exc:
+        failures.append(f"缓存：{exc}")
+
+    if failures:
+        raise PurgeDocumentError(game_id, doc_title, failures)
+    logger.info(
+        "从 %s 删掉《%s》（版本 %r）：清掉 %d 条切片、%d 个原图，缓存按前缀清了一遍",
+        game_id,
+        doc_title,
+        version,
+        chunk_count,
+        image_count,
+    )
+    return DocumentInventory(
+        doc_title=doc_title,
+        version=version,
+        chunk_count=chunk_count,
+        image_count=image_count,
     )
 
 

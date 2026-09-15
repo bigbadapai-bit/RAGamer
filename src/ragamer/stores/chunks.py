@@ -41,6 +41,7 @@ from ragamer.stores.base import (
     DocumentSummary,
     StoreError,
     collection_name,
+    is_image_key,
     require_vectors,
     unavailable,
 )
@@ -499,6 +500,41 @@ class MilvusChunkStore:
             timeout=self._timeout,
         )
         return sorted((_chunk(row) for row in rows), key=lambda chunk: chunk.chunk_index)
+
+    def image_keys(
+        self, game_id: str, *, excluding: tuple[str, str] | None = None
+    ) -> tuple[str, ...]:
+        """这个库里切片引用到的图片对象 key，去重、排序（见协议里的说明）。
+
+        与 `documents` 同一个打法、同一笔代价：迭代器分页扫，不落 `offset + limit`
+        那个 16384 的上限。`excluding` 靠多取 `doc_title` 与 `version` 两列在本地跳过，
+        不去拼过滤表达式——表达式只由适配器从 `ChunkFilter` 生成，这里没有那个形状。
+        库还不存在时返回空元组，不报错。
+        """
+        client = self._client()
+        name = collection_name(game_id)
+        if not client.has_collection(name, timeout=self._timeout):
+            return ()
+        iterator = client.query_iterator(
+            collection_name=name,
+            batch_size=VERSION_SCAN_BATCH,
+            filter="",
+            output_fields=["doc_title", "version", "image_urls"],
+            timeout=self._timeout,
+        )
+        found: set[str] = set()
+        try:
+            while batch := iterator.next():
+                for row in batch:
+                    key_of_row = (str(row["doc_title"]), str(row["version"]))
+                    if excluding is not None and key_of_row == excluding:
+                        continue
+                    found.update(
+                        str(key) for key in (row.get("image_urls") or ()) if is_image_key(str(key))
+                    )
+        finally:
+            iterator.close()
+        return tuple(sorted(found))
 
     def delete_document(self, game_id: str, doc_title: str, *, version: str) -> None:
         """先按文档查回主键，再只删版本精确对上的那些（见协议里的说明）。

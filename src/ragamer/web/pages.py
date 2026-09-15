@@ -48,11 +48,14 @@ from ragamer.jobs import ImportJobs, JobItem, JobSnapshot
 from ragamer.knowledge import (
     KnowledgeBase,
     KnowledgeBaseError,
+    PurgeDocumentError,
     PurgeError,
     create_knowledge_base,
+    document_inventory,
     find_knowledge_base,
     knowledge_base_of,
     list_knowledge_bases,
+    purge_document,
     purge_inventory,
     purge_knowledge_base,
     readable_knowledge_base,
@@ -172,14 +175,26 @@ def create_router(container: Container, stack: ChatStack) -> APIRouter:
         return RedirectResponse(f"/import?{urlencode({'game_id': game_id})}", status_code=303)
 
     @router.get("/kb/{game_id}")
-    def knowledge_base_page(request: Request, game_id: str, saved: bool = False) -> Response:
+    def knowledge_base_page(
+        request: Request,
+        game_id: str,
+        saved: bool = False,
+        deleted_doc: str = "",
+        chunks: int = 0,
+        images: int = 0,
+    ) -> Response:
         """单个库的配置页：名称、启用的类目、术语映射、现行版本，以及删库入口。"""
-        return _knowledge_base_page(
-            request,
-            container,
-            game_id,
-            message="已保存。下一次导入打标与切分预览读的就是这一份。" if saved else "",
-        )
+        if saved:
+            message = "已保存。下一次导入打标与切分预览读的就是这一份。"
+        elif deleted_doc:
+            # 回话里带上真清掉的条数，与确认页上写的「将要」对得上（删库那条路同一个道理）
+            message = (
+                f"已删除《{deleted_doc}》：清掉 {chunks} 条切片、{images} 个原图，"
+                "这个库的答案缓存也按前缀清了一遍。"
+            )
+        else:
+            message = ""
+        return _knowledge_base_page(request, container, game_id, message=message)
 
     @router.post("/kb/{game_id}")
     def save_kb(
@@ -291,6 +306,72 @@ def create_router(container: Container, stack: ChatStack) -> APIRouter:
             }
         )
         return RedirectResponse(f"/kb?{query}", status_code=303)
+
+    @router.get("/kb/{game_id}/documents/delete")
+    def delete_document_page(
+        request: Request, game_id: str, doc_title: str = "", version: str = ""
+    ) -> Response:
+        """删一份资料前的确认页：这份资料占着多少东西，摆出来让人决定。
+
+        `doc_title` 与 `version` 走查询串（和切分预览同一对取值），列表页那一行链过来。
+        """
+        return _document_delete_page(
+            request, container, game_id, doc_title=doc_title, version=version
+        )
+
+    @router.post("/kb/{game_id}/documents/delete")
+    def delete_document(
+        request: Request,
+        game_id: str,
+        doc_title: Annotated[str, Form()] = "",
+        version: Annotated[str, Form()] = "",
+        confirm: Annotated[str, Form()] = "",
+    ) -> Response:
+        """真删一份资料：**切片 → 原图 → 缓存**，都只是这一份自己的那些。"""
+        try:
+            knowledge_base_of(container.docs, game_id)
+        except (ValueError, KnowledgeBaseError) as exc:
+            return _knowledge_bases_page(
+                request, container, error=str(exc), status_code=_status_of(exc)
+            )
+        if not confirm:
+            # 删除不可逆，确认那一勾不是装饰：没勾就退回去，别把它当成手滑
+            return _document_delete_page(
+                request,
+                container,
+                game_id,
+                doc_title=doc_title,
+                version=version,
+                error="先把那句确认勾上，再点删除",
+                status_code=400,
+            )
+        try:
+            inventory = purge_document(
+                chunks=container.chunks,
+                objects=container.objects,
+                cache=container.cache,
+                game_id=game_id,
+                doc_title=doc_title,
+                version=version,
+            )
+        except PurgeDocumentError as exc:
+            return _document_delete_page(
+                request,
+                container,
+                game_id,
+                doc_title=doc_title,
+                version=version,
+                error=str(exc),
+                status_code=exc.status,
+            )
+        query = urlencode(
+            {
+                "deleted_doc": inventory.doc_title,
+                "chunks": inventory.chunk_count,
+                "images": inventory.image_count,
+            }
+        )
+        return RedirectResponse(f"/kb/{game_id}?{query}", status_code=303)
 
     @router.get("/import")
     def import_page(request: Request, game_id: str = "", job: str = "") -> Response:
@@ -1060,9 +1141,11 @@ def _document_rows(container: Container, game_id: str) -> list[dict[str, Any]]:
             "doc_title": document.doc_title,
             # 空串是未标注版本（ADR-0004）：界面上直接显示空串像没渲染出来
             "version": document.version,
-            "version_label": document.version or "未标注版本",
+            "version_label": _version_label(document.version),
             "chunk_count": document.chunk_count,
             "preview_url": _preview_url(game_id, document.doc_title, document.version),
+            # 删这一份的入口。**预览页上没有它**：那一页的定位是只读（见 `preview.html`）
+            "delete_url": _delete_document_url(game_id, document.doc_title, document.version),
         }
         for document in documents
     ]
@@ -1147,6 +1230,73 @@ def _delete_page(
         error=error,
         status_code=status_code,
     )
+
+
+def _document_delete_page(
+    request: Request,
+    container: Container,
+    game_id: str,
+    *,
+    doc_title: str,
+    version: str,
+    error: str = "",
+    status_code: int = 200,
+) -> Response:
+    """删一份资料的确认页。
+
+    条数取自 `document_inventory`，与实际清理**同一份数法**（理由与 `_delete_page` 那边
+    一样）：页面上写「8 个原图」而真删掉 20 个，那份确认就成了摆设。数不出来时干脆不让
+    人确认——闭着眼睛删不是确认。
+
+    库里没有这一份时**回配置页并说清楚**（404），而不是给一张「将删掉 0 条切片」的确认页：
+    那样点下去只会以为删成功了。
+    """
+    try:
+        knowledge_base = knowledge_base_of(container.docs, game_id)
+    except (ValueError, KnowledgeBaseError) as exc:
+        return _knowledge_bases_page(
+            request, container, error=str(exc), status_code=_status_of(exc)
+        )
+    if not doc_title:
+        return _knowledge_base_page(request, container, game_id, error="没说要删哪一份资料")
+    try:
+        inventory = document_inventory(
+            container.chunks, game_id, doc_title=doc_title, version=version
+        )
+    except Exception as exc:
+        # 兜住全部异常的理由与 `_delete_page` 那边一样：适配器只把「连不上」包成 StoreError
+        return _knowledge_base_page(
+            request,
+            container,
+            game_id,
+            error=f"清点不出这份资料占用的数据：{exc}",
+            status_code=500,
+        )
+    if not inventory.chunk_count:
+        return _knowledge_base_page(
+            request,
+            container,
+            game_id,
+            error=f"这个库里没有《{doc_title}》（{_version_label(version)}）这份资料",
+            status_code=404,
+        )
+    return _page(
+        request,
+        "document_delete.html",
+        f"删除资料 {doc_title}",
+        "/kb",
+        game_id=game_id,
+        name=knowledge_base.name,
+        inventory=inventory,
+        version_label=_version_label(version),
+        error=error,
+        status_code=status_code,
+    )
+
+
+def _version_label(version: str) -> str:
+    """版本在界面上的写法。空串是未标注版本（ADR-0004），直接显示空串像没渲染出来。"""
+    return version or "未标注版本"
 
 
 def _accept(container: Container) -> str:
@@ -1505,6 +1655,13 @@ def _chunk_rows(chunks: Sequence[Chunk], version: str) -> list[dict[str, Any]]:
 
 def _preview_url(game_id: str, doc_title: str, version: str) -> str:
     return f"/kb/{game_id}/preview?{urlencode({'doc_title': doc_title, 'version': version})}"
+
+
+def _delete_document_url(game_id: str, doc_title: str, version: str) -> str:
+    """删一份资料的确认页地址。与切分预览用的是同一对取值（`doc_title` + `version`），
+    而 `version` 取的是库里的**精确**那个——确认页据此删，同标题的另一个版本不动。"""
+    query = urlencode({"doc_title": doc_title, "version": version})
+    return f"/kb/{game_id}/documents/delete?{query}"
 
 
 def _subject_type(value: str) -> SubjectType:
