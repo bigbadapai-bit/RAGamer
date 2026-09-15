@@ -13,12 +13,14 @@ from __future__ import annotations
 
 import json
 
+import pytest
 from fastapi.testclient import TestClient
 
 from ragamer.api import create_app
 from ragamer.clarifying import CONFIDENT
 from ragamer.conversations import SESSION_PAGE_SIZE
 from ragamer.knowledge import KB_COLLECTION
+from ragamer.live import TurnCancelled, TurnRegistry
 from ragamer.llm import FakeLlm
 from ragamer.websearch import FakeWebSearch, WebResult
 
@@ -27,6 +29,7 @@ from .conftest import (
     RecordingChunkStore,
     chunk_store,
     joint_reply,
+    make_chat,
     make_chunk,
     make_container,
 )
@@ -371,6 +374,62 @@ def test_路由表配坏了当场422():
     response = client.get(f"/api/chat/sessions/{session_id}/ask", params={"question": QUESTION})
 
     assert response.status_code == 422
+
+
+# --- 一轮归谁：断开与取消 ---
+
+
+def test_页面断开之后那一轮照样落进会话():
+    """这一轮归属会话，不归属那条 SSE。**断开只是没人取队列了**。
+
+    队列不取就是页面断开那个形状——转发那个生成器被丢掉时，跑这一轮的线程还在，
+    而落库是它做的（`conversations._replies` 的最后一行）。
+    """
+    container = make_container(llm=FakeLlm(said(QUESTION), REPLY), chunks=chunk_store(GAME, DOC))
+    container.docs.put(KB_COLLECTION, GAME, KB)
+    chat = make_chat(container)
+    session_id = chat.start(game_id=GAME, version="").session_id
+    live = TurnRegistry().start(
+        session_id,
+        lambda turn: chat.ask(session_id, QUESTION, games=(), cancelled=turn.cancelled.is_set),
+    )
+    assert live is not None and live.thread is not None
+    live.thread.join(20)
+
+    written = chat.open(session_id).turns
+    assert [item.role for item in written] == ["user", "assistant"]
+    assert written[-1].content == REPLY
+
+
+def test_取消之后这一轮什么都不写():
+    """取消与断开是两件事：断开留痕（上一条），取消当没问过。"""
+    container = make_container(llm=FakeLlm(said(QUESTION), REPLY), chunks=chunk_store(GAME, DOC))
+    container.docs.put(KB_COLLECTION, GAME, KB)
+    chat = make_chat(container)
+    session_id = chat.start(game_id=GAME, version="").session_id
+
+    with pytest.raises(TurnCancelled):
+        list(chat.ask(session_id, QUESTION, games=(), cancelled=lambda: True))
+
+    assert chat.open(session_id).turns == ()
+
+
+def test_取消一个没有在跑的会话返回假():
+    """点「停止」的那一刻那一轮可能刚好答完——那不是错误，也不该报成错误。"""
+    client = client_with(FakeLlm(said(QUESTION), REPLY), DOC)
+    session_id = start(client)
+
+    response = client.post(f"/api/chat/sessions/{session_id}/cancel")
+
+    assert response.status_code == 200
+    assert response.json() == {"session_id": session_id, "cancelled": False}
+
+
+def test_取消一个不存在的会话返回404():
+    """与另外几条端点同一个口径：会话选错了是请求的问题，不是「已经没什么可停的」。"""
+    client = client_with(FakeLlm())
+
+    assert client.post("/api/chat/sessions/nope/cancel").status_code == 404
 
 
 # --- 边界 ---

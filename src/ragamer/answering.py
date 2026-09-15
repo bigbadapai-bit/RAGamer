@@ -45,11 +45,12 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from typing import Literal, Protocol, runtime_checkable
 
 from ragamer.chunking import PATH_SEPARATOR
+from ragamer.live import TurnCancelled
 from ragamer.llm import LlmClient, LlmRequest, Message
 from ragamer.logging import get_logger
 from ragamer.query import version_filter
@@ -241,6 +242,7 @@ class ReadSide(Protocol):
         version: str = "",
         current_version: str = "",
         route: Route | None = None,
+        cancelled: Callable[[], bool] | None = None,
     ) -> AnswerStream:
         """与 :meth:`answer` 同一套检索与提示，只是正文逐字产出。"""
         ...
@@ -417,6 +419,7 @@ class Answerer:
         version: str = "",
         current_version: str = "",
         route: Route | None = None,
+        cancelled: Callable[[], bool] | None = None,
     ) -> AnswerStream:
         """与 :meth:`answer` 同一套检索与提示，只是正文逐字产出。
 
@@ -443,11 +446,14 @@ class Answerer:
             version=version,
             current_version=current_version,
             route=route,
+            cancelled=cancelled,
         )
         if not sources:
             return AnswerStream((), (), iter((NOT_FOUND,)))
         return AnswerStream(
-            _citations(sources), _image_urls(sources), self._streamed(question, sources)
+            _citations(sources),
+            _image_urls(sources),
+            self._streamed(question, sources, cancelled=cancelled),
         )
 
     def _sources(
@@ -458,11 +464,15 @@ class Answerer:
         version: str,
         current_version: str,
         route: Route | None,
+        cancelled: Callable[[], bool] | None = None,
     ) -> tuple[_Source, ...]:
         """检索、聚合父块、编号。**一条内容都没有时返回空元组**，不编造内容。
 
         `answer` 与 `stream` 共用这一段：两条路给出去的引用与图片必须是同一批、同一个顺序，
         各写一遍迟早会分岔——而引用对不上内容这件事，从答案本身看不出来。
+
+        `cancelled` 只走 `stream` 那条路：`answer` 是同步一次给全的，调用方没有中途
+        收手的时机。
         """
         where = version_filter(version, current_version=current_version)
         found = retrieve(
@@ -475,6 +485,7 @@ class Answerer:
             route=route,
             llm=self.llm,
             search=self.search,
+            cancelled=cancelled,
         )
         # 聚合在截断之后：先由断崖定下哪些文档进得来，再按文档把兄弟切片一次查齐
         blocks = (
@@ -501,15 +512,27 @@ class Answerer:
         )
         return sources
 
-    def _streamed(self, question: str, sources: Sequence[_Source]) -> Iterator[str]:
+    def _streamed(
+        self,
+        question: str,
+        sources: Sequence[_Source],
+        *,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> Iterator[str]:
         """逐字转出去，**吐完之后**才检查引用编号。
 
         编号检查要整段正文才做得成，而流式这一路没有累积——所以在这里攒一份。
         调用方在正文收完之前就把流丢掉时，这个生成器会被关掉，检查也就不做了：
         那一轮本来就不该留下任何东西，没有正文可核对。
+
+        **取消那一查放在这一层，而不是调用方的循环里**：模型那段等待发生在两次
+        `yield` 之间，只有在这里才看得见它。抛出去时这一帧跟着销毁，上游那个模型流
+        被关闭（`GeneratorExit` 传进去），那边的 HTTP 请求也就断了——不必等它吐完。
         """
         produced: list[str] = []
         for piece in self.llm.stream(_request(question, sources)):
+            if cancelled is not None and cancelled():
+                raise TurnCancelled
             produced.append(piece)
             yield piece
         _warn_on_unknown_citations("".join(produced), len(sources))

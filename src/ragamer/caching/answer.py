@@ -21,7 +21,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 
 from ragamer.answering import Answer, Answerer, AnswerStream
@@ -120,6 +120,7 @@ class CachedAnswerer:
         current_version: str = "",
         rewritten_query: str = "",
         route: Route | None = None,
+        cancelled: Callable[[], bool] | None = None,
     ) -> AnswerStream:
         """:meth:`answer` 的流式形态：命中就重放缓存，未命中边走边吐。
 
@@ -127,6 +128,8 @@ class CachedAnswerer:
         一致」的全部内容。
 
         :param route: 这次走哪几路召回，原样交给下层。不进缓存键，理由同 :meth:`answer`。
+        :param cancelled: 要不要收手，原样交给下层。**命中缓存那条路不传**：重放是
+            本地逐字复读，没有可省的等待，而它要的 `replay` 本来就没有取消的口子。
         :raises ValueError: 问题为空。
         :raises ragamer.llm.LlmError: 生成失败。流到一半失败也照抛。
         """
@@ -146,6 +149,7 @@ class CachedAnswerer:
             version=version,
             current_version=current_version,
             route=route,
+            cancelled=cancelled,
         )
         return AnswerStream(
             streamed.citations, streamed.images, self._written_back(key, streamed, question)

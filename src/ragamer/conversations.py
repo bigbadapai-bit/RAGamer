@@ -48,6 +48,7 @@ from ragamer.answering import Answerer, Citation, ReadSide, require_question
 from ragamer.caching import CachedAnswerer
 from ragamer.clarifying import Clarification, Clarifier
 from ragamer.container import Container
+from ragamer.live import check_cancelled
 from ragamer.llm import Message
 from ragamer.logging import get_logger
 from ragamer.query import effective_version
@@ -388,6 +389,7 @@ class Chat:
         label: str = "",
         games: Sequence[Game] = (),
         routes: RouteTable = DEFAULT_TABLE,
+        cancelled: Callable[[], bool] | None = None,
     ) -> Iterator[Reply]:
         """问一句，逐字拿回答案：若干条 :class:`Status`，一个 :class:`Sources`，
         然后若干个 :class:`Delta`。
@@ -427,6 +429,10 @@ class Chat:
         :raises ValueError: 问题为空。空问题会让检索查出任意一批切片。
         :raises ragamer.clarifying.UnknownPending: 没有这个暂停点。
         :raises ragamer.clarifying.NotACandidate: 选的不在那次反问给出的候选里。
+        :param cancelled: 这一轮要不要收手。**每一步之间问它一次**，答「是」就抛
+            :class:`TurnCancelled`——落库那行因此执行不到，这一轮当没问过。不给就是
+            不取消。它是**协作式**的：正在跑的那一次模型调用或精排要等它自己返回，
+            见 :class:`ragamer.live.LiveTurn`。
         """
         require_question(question)  # 拦在理解那一步之前：空问题没得可理解，别白调一次模型
         conversation = self.open(session_id)
@@ -439,6 +445,7 @@ class Chat:
             label=label,
             games=games,
             routes=routes,
+            cancelled=cancelled,
         )
 
     def _replies(
@@ -452,6 +459,7 @@ class Chat:
         label: str = "",
         games: Sequence[Game],
         routes: RouteTable,
+        cancelled: Callable[[], bool] | None = None,
     ) -> Iterator[Reply]:
         """把这一轮从头做到尾，**每一步之前先报一条进度**，最后收完正文才落库。
 
@@ -483,6 +491,7 @@ class Chat:
                 yield outcome
                 return
             resolved = outcome
+        check_cancelled(cancelled)
         yield Status("正在检索资料")
         route = routes.route_for(resolved.query_type)
         stream = self.answerer.stream(
@@ -491,6 +500,7 @@ class Chat:
             version=resolved.version,
             current_version=current_version,
             route=route,
+            cancelled=cancelled,
         )
         sources = Sources(
             stream.citations,
@@ -508,6 +518,7 @@ class Chat:
             len(stream.citations),
         )
         yield sources
+        check_cancelled(cancelled)
         yield Status("正在生成答案")
         produced: list[str] = []
         for piece in stream.deltas:

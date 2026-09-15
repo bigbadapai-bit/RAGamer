@@ -47,11 +47,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 
 from ragamer.chunking import DEFAULT_MAX_CHARS
 from ragamer.expanding import hypothetical, rewrite
+from ragamer.live import check_cancelled
 from ragamer.llm import LlmClient, LlmError, LlmRejected
 from ragamer.logging import get_logger
 from ragamer.routing import WIRED_PATHS, RecallPath, Route
@@ -133,6 +134,7 @@ def retrieve(
     route: Route | None = None,
     llm: LlmClient | None = None,
     search: WebSearch | None = None,
+    cancelled: Callable[[], bool] | None = None,
 ) -> Retrieval:
     """按 `route` 选中的那几路取候选，融合、精排、截断后交给生成。
 
@@ -151,6 +153,9 @@ def retrieve(
         主检索路**：这一层不替调用方选路。选中了还没接上的路会跳过并留痕。
     :param llm: 多查询改写与 HyDE 要用的模型客户端。不给就用不了这两路，选中的话跳过。
     :param search: 联网兜底要用的外部检索。不给就用不了这一路，选中的话跳过。
+    :param cancelled: 要不要收手。**每一路开跑之前问一次**，答「是」就抛
+        :class:`ragamer.live.TurnCancelled`。它是协作式的：正在跑的那一次向量化或
+        精排要等它自己返回，检查点只能拦在它们之间。
     :raises ModelOutputError: 向量化或精排的条数与候选对不上。宁可当场炸：
         按短的一边截齐会得到一个静默错位的排序，查不出、也不报错。
     :raises ragamer.llm.LlmError: **最终一条内容都没取到、而且有路失败**，且失败里有它。
@@ -160,7 +165,9 @@ def retrieve(
     """
     paths = _paths_to_run(route, llm=llm, search=search)
     failures: list[Exception] = []
+    check_cancelled(cancelled)
     plans = _plans(query, paths, llm=llm, failures=failures)
+    check_cancelled(cancelled)
     lists = _recall(
         plans,
         game_id=game_id,
@@ -172,6 +179,7 @@ def retrieve(
     )
     web: list[WebResult] = []
     if RecallPath.WEB in paths:
+        check_cancelled(cancelled)
         web = _web(query, search=search, failures=failures)
     found = rrf(lists)
     if not found and not web and failures:
@@ -182,6 +190,8 @@ def retrieve(
         raise failures[0]
     if not found:
         return Retrieval(web=tuple(web))  # 空候选上白调一次精排
+    # 精排那一段（实测最长二十几秒）打不断，检查点只能摆在它前面
+    check_cancelled(cancelled)
     return Retrieval(cliff_cut(_reranked(query, found, reranker)), tuple(web))
 
 

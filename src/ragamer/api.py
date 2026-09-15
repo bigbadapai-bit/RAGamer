@@ -44,6 +44,7 @@ from __future__ import annotations
 import json
 from collections.abc import Iterator, Mapping
 from dataclasses import asdict
+from queue import SimpleQueue
 from typing import Annotated, Any
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -58,8 +59,8 @@ from ragamer.conversations import (
     Chat,
     Conversation,
     ConversationNotFound,
+    Delta,
     Game,
-    Reply,
     SessionPage,
     Sources,
     Status,
@@ -73,6 +74,7 @@ from ragamer.knowledge import (
     KnowledgeBaseError,
     readable_knowledge_base,
 )
+from ragamer.live import CANCELLED, END, TurnRegistry
 from ragamer.llm import LlmError
 from ragamer.logging import get_logger
 from ragamer.routing import RouteTable
@@ -120,6 +122,9 @@ def create_app(container: Container, chat: Chat | None = None) -> FastAPI:
     chat = chat if chat is not None else build_chat(container).chat
     app = FastAPI(title="RAGamer", summary="游戏攻略 RAG 助手")
     importer = build_importer(container)
+    #: 这个进程里正在跑的那几轮问答，见 `ragamer.live`。**一个应用一份**——
+    #: 它同时是「同一个会话只跑一轮」那把锁，接两份就等于没锁。
+    turns = TurnRegistry()
 
     @app.post("/api/kb/{game_id}/import")
     async def import_sources(
@@ -228,6 +233,11 @@ def create_app(container: Container, chat: Chat | None = None) -> FastAPI:
         这一层**不等正文**：返回的是个还没开始跑的生成器，读正文由 ASGI 那边拉。
         端点本身是同步的，FastAPI 会把它放进线程池——检索与生成都是阻塞调用，
         写在 `async def` 里会把事件循环钉住。
+
+        **这一轮跑在后台线程里，不属于这条请求**（`ragamer.live`）：页面断开、刷新、
+        切走都只停转发，那一轮照跑完、照落库——回来刷新就看得到它。真要收手得走
+        `POST /api/chat/sessions/{session_id}/cancel`。同一个会话同时只允许一轮，
+        第二问当场被挡回来（从流里的 `error` 说出口，理由见上）。
         """
         if not question.strip():
             raise HTTPException(status_code=400, detail="问题不能为空")
@@ -236,19 +246,51 @@ def create_app(container: Container, chat: Chat | None = None) -> FastAPI:
         # 这一层手里这一份只用来决定「去哪个库问」。
         conversation = _conversation(chat, session_id)
         knowledge = _kb_document(container, conversation.game_id)
-        replies = chat.ask(
+        # 这几样**在这一侧先取出来**，不进那个后台线程：它们不碰模型，快，而且失败原因
+        # 明确（路由表配坏了 422、候选读不出来也是），值得一个正常的状态码。放进线程里
+        # 就只剩流里一条 `error`——响应头那时已经发出去了。
+        routes = _route_table(knowledge, game_id=conversation.game_id)
+        games = _games(container)
+        turn = turns.start(
             session_id,
-            question,
-            version=version,
-            current_version=str(knowledge.get("version", "")),
-            games=_games(container),
-            routes=_route_table(knowledge, game_id=conversation.game_id),
-            pending_id=pending_id,
-            label=label,
+            lambda live: chat.ask(
+                session_id,
+                question,
+                version=version,
+                current_version=str(knowledge.get("version", "")),
+                games=games,
+                routes=routes,
+                pending_id=pending_id,
+                label=label,
+                cancelled=live.cancelled.is_set,
+            ),
         )
+        if turn is None:
+            # 同一会话的第二问。**判在开流之前，却只能从流里说出口**：`EventSource`
+            # 在非 2xx 时什么细节都不给（见上面的说明），所以这里回一条只带 `error`
+            # 的流，而不是 409。
+            return StreamingResponse(
+                _refusal("这个会话上已经有一轮在答了，等它答完，或者先把它停掉。"),
+                media_type="text/event-stream",
+                headers=SSE_HEADERS,
+            )
         return StreamingResponse(
-            _events(replies), media_type="text/event-stream", headers=SSE_HEADERS
+            _events(turn.queue), media_type="text/event-stream", headers=SSE_HEADERS
         )
+
+    @app.post("/api/chat/sessions/{session_id}/cancel")
+    def cancel(session_id: str) -> dict[str, Any]:
+        """让这个会话上正在跑的那一轮收手。**不可逆**：那一轮不写进会话，当没问过。
+
+        没有在跑的一轮时照样 200（`cancelled` 为 `false`）：用户点「停止」的那一刻
+        那一轮可能刚好答完，那不是错误，也不该报成错误。
+
+        **收手不是抢占式的**。跑那一轮的线程要到下一个检查点才看得见这个信号，而检查点
+        之间可能隔着一次模型往返、一次向量化或者一次精排（最长二十几秒），见
+        `ragamer.live`。会话不存在照样 404——与另外几条端点同一个口径。
+        """
+        _conversation(chat, session_id)
+        return {"session_id": session_id, "cancelled": turns.cancel(session_id)}
 
     return app
 
@@ -262,7 +304,7 @@ class SessionRequest(BaseModel):
     version: str = ""
 
 
-def _events(replies: Iterator[Reply]) -> Iterator[str]:
+def _events(queue: SimpleQueue[object]) -> Iterator[str]:
     """一轮问答 → SSE 字节流。
 
     正常那一轮是五种事件，**前四种按发生的先后**：
@@ -287,44 +329,71 @@ def _events(replies: Iterator[Reply]) -> Iterator[str]:
     只有流里的 `error` 带得回原因。收不到 `done` 就是这一轮没有正常结束，会话里相应地
     什么都没写（见 `ragamer.conversations`）。
 
-    **兜住「断开不留痕」的不是这里，是落库的时机**：会话只在正文全部收完之后才写，
-    所以流在半路停住时它一个字都没写。消费方把生成器丢掉时，这里收到的是
-    `GeneratorExit`——它不是 `Exception`，下面那几 个 `except` 接不住它，于是它一路把
-    上游那个生成器也关掉，模型那边的请求跟着结束。
+    **这一层不管「断开留不留痕」**：那一轮跑在后台线程里（`ragamer.live`），页面断开
+    只是让它不再被转发，答案照常跑完、照常落库。消费方把这里丢掉时收到的是
+    `GeneratorExit`——队列还在，跑那一轮的线程照跑不误，这个异常够不着它。
+
+    队列里的哨兵决定怎么收尾：**收到结束哨兵才发 `done`**，而哨兵是那一轮跑完
+    （落库之后）才放进去的——所以页面看见 `done` 的时候，刷新一定读得到这一轮。
+    被取消的那一轮放的是另一个哨兵，这里直接结束、不发 `done`：它没走完。
 
     三类失败分得开：**生成挂掉**是模型这一次不行，按 WARNING；**检索或落库挂掉**
     （`StoreError` / `ModelOutputError`）是系统性的，按 ERROR；**暂停点对不上**
     （选的不在候选里、暂停点已经不在了）是这一次请求本身的问题，按 WARNING——
-    排查时看的不是同一个地方。
+    排查时看的不是同一个地方。失败是后台那一轮把异常放进队列送过来的，分类在
+    :func:`_failure` 里做。
     """
     yield SSE_RETRY
     stopped = False
-    try:
-        for reply in replies:
-            if isinstance(reply, Status):
-                yield _event("status", {"text": reply.text})
-            elif isinstance(reply, Clarification):
-                # 这一轮没走完：等着用户点。收尾那条 `done` 因此不能发
-                stopped = True
-                yield _event("clarification", _clarification_payload(reply))
-            elif isinstance(reply, Sources):
-                yield _event("citations", _sources_payload(reply))
-            else:
-                yield _event("delta", {"text": reply.text})
-    except LlmError as exc:
-        logger.warning("生成中途失败，这一轮不写进会话：%s", exc)
-        yield _event("error", {"message": str(exc)})
-        return
-    except (NotACandidate, UnknownPending) as exc:
-        logger.warning("暂停点这条路走不通，这一轮不写进会话：%s", exc)
-        yield _event("error", {"message": str(exc)})
-        return
-    except (ModelOutputError, StoreError) as exc:
-        logger.error("检索或落库失败，这一轮没有答案也不写进会话：%s", exc)
-        yield _event("error", {"message": str(exc)})
-        return
+    while True:
+        item = queue.get()
+        if item is CANCELLED:
+            # 被取消的那一轮不发 `done`：它没走完。页面多半已经自己收好了（停止是它点的），
+            # 这一条留给「在别处取消」的那种——转发的这一侧只是安静地结束
+            return
+        if item is END:
+            break
+        if isinstance(item, BaseException):
+            yield _failure(item)
+            return
+        if isinstance(item, Status):
+            yield _event("status", {"text": item.text})
+        elif isinstance(item, Clarification):
+            # 这一轮没走完：等着用户点。收尾那条 `done` 因此不能发
+            stopped = True
+            yield _event("clarification", _clarification_payload(item))
+        elif isinstance(item, Sources):
+            yield _event("citations", _sources_payload(item))
+        elif isinstance(item, Delta):
+            yield _event("delta", {"text": item.text})
     if not stopped:
         yield _event("done", {})
+
+
+def _failure(exc: BaseException) -> str:
+    """后台那一轮抛出来的失败 → 一条 `error` 事件。三类分开记，口径与原来一致。"""
+    if isinstance(exc, LlmError):
+        logger.warning("生成中途失败，这一轮不写进会话：%s", exc)
+    elif isinstance(exc, (NotACandidate, UnknownPending)):
+        logger.warning("暂停点这条路走不通，这一轮不写进会话：%s", exc)
+    elif isinstance(exc, (ModelOutputError, StoreError)):
+        logger.error("检索或落库失败，这一轮没有答案也不写进会话：%s", exc)
+    else:
+        # 从前这种异常会把响应头后面的连接直接掐断，原因只留在服务端日志里；
+        # 现在它至少还能变成一条说得出口的事件
+        logger.error("这一轮意外失败，什么都没写进会话：%s", exc)
+    return _event("error", {"message": str(exc)})
+
+
+def _refusal(message: str) -> Iterator[str]:
+    """开流之前就判掉、却只能从流里说出口的那点事（同一会话的第二问）。
+
+    回一整条流而不是一个状态码：浏览器原生的 `EventSource` 在非 2xx 时什么细节都不给
+    （见 :func:`ask` 的说明），「这个会话上已经有一轮在答了」这句话只有走 `error`
+    才到得了页面。
+    """
+    yield SSE_RETRY
+    yield _event("error", {"message": message})
 
 
 def _clarification_payload(clarification: Clarification) -> dict[str, Any]:
