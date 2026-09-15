@@ -65,7 +65,15 @@
 {# 正在流的那一轮先长在这里：进度一行、正文一段。答完之后整块被服务端重渲染的结果换掉，
    所以这里不必也不该拼引用与图片——那些由 templates/partials/turns.html 上面的部分负责。 #}
 <div id="live" class="hidden max-w-[95%] rounded-lg border border-slate-200 bg-white px-4 py-3">
-  <div id="live-status" class="mb-1 text-xs text-slate-500"></div>
+  <div class="mb-1 flex items-center gap-3">
+    <span id="live-status" class="text-xs text-slate-500"></span>
+    {# 停止。**与「切走」是两件事**：切走只停转发，那一轮在服务端照跑完、回来刷得到；
+       这一下才是真收手，而收手的那一轮不写进会话。 #}
+    <button id="live-stop" type="button"
+            class="rounded border border-slate-300 px-2 py-0.5 text-xs hover:bg-slate-100">
+      停止
+    </button>
+  </div>
   <p id="live-text" class="text-sm leading-relaxed whitespace-pre-wrap"></p>
   {# 来源、图片、版本由 `citations` 事件填进来——它比正文早得多（检索那一步就定了） #}
   <div id="live-sources" class="mt-3 hidden text-xs text-slate-500"></div>

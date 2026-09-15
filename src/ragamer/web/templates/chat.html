@@ -266,6 +266,26 @@
       source = null;
     }
 
+    /*
+      停止：**先告诉服务端收手，再断自己这条流**。反过来只 close 的话，那走的是
+      「切走」那条路——服务端继续把这一轮跑完并写进会话，而用户点的是「别答了」。
+      收手不是抢占式的：服务端要到下一个检查点才停得下来，检索里那次精排最长二十几秒。
+    */
+    function cancelTurn() {
+      fetch("/api/chat/sessions/" + turns.dataset.sessionId + "/cancel", { method: "POST" })
+        .catch(function () {
+          // 收手这一步没成，界面也得收干净——不能把人卡在一个动不了的框里
+        });
+      stop();
+      document.getElementById("live-text").textContent = "";
+      document.getElementById("live-sources").classList.add("hidden");
+      var images = document.getElementById("live-images");
+      images.textContent = "";
+      images.classList.add("hidden");
+      // 这一轮停在原地，而它**不会**写进会话：刷新一下就没了
+      document.getElementById("live-status").textContent = "已停止，这一轮没有写进会话。";
+    }
+
     function choices(payload, question) {
       var box = document.createElement("section");
       box.className = "rounded border border-amber-300 bg-amber-50 px-4 py-3 text-sm";
@@ -292,6 +312,12 @@
       box.appendChild(row);
       turns.appendChild(box);
     }
+
+    // 委托挂在 `#turns` 上：答完一轮之后 htmx 会把它里面的东西整个换掉，那个停止
+    // 按钮跟着换新，直接绑在按钮上的监听会一起没
+    turns.addEventListener("click", function (event) {
+      if (event.target && event.target.id === "live-stop") cancelTurn();
+    });
 
     document.querySelectorAll("form[data-ask]").forEach(function (item) {
       item.addEventListener("submit", function (event) {
