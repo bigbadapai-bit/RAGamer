@@ -229,6 +229,12 @@ class RerankSettings(BaseModel):
     """
 
     model: NonEmptyStr = "BAAI/bge-reranker-v2-m3"
+    #: 一次算几条候选的分数。**越小越快，与直觉相反**：精排按候选长度排序之后再分批，
+    #: 而批内要补齐到最长的那一条——批次越大，补出来的零头越多。
+    #: 本机实测（CPU、41 条候选、单条 21~509 token，交叉顺序各测两遍、同档两次相差
+    #: 不到 1%）：batch=2 → 41.0s、4 → 44.0s、8 → 57.3s、16 → 81.1s。
+    #: **最优点与设备、与语料的长度分布都有关**（这一批长度很散），所以默认值留在这里
+    #: 不动，换机器先重测；本机在 `.env` 里覆盖成 2。
     batch_size: int = Field(default=8, ge=1, le=1024)
     #: 单条候选的 token 上限。同样**不要往下调**，理由见 `EmbedSettings.max_length`。
     max_length: int = Field(default=8192, ge=1, le=32768)
