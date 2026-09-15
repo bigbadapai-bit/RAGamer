@@ -1,0 +1,110 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "RAGamer 导入链路",
+    "output": "docs/diagrams/import-pipeline.html",
+    "locale": "zh-CN",
+    "quality_profile": "standard",
+    "views": [
+      {
+        "id": "six-stages",
+        "label": "六阶段主路径",
+        "focus": ["jobs", "normalize", "enrich", "chunk", "tag", "embed", "store", "page"],
+        "note": "六个阶段依次推进，每进入一个发一条进度事件；失败信息点名的就是其中一个。导入页每 1s 轮询一次快照。"
+      },
+      {
+        "id": "sources",
+        "label": "取正文的三种走法",
+        "focus": ["normalize", "mineru", "crawler", "minio"],
+        "note": "PDF 与图片走 MinerU 云端，网址走自建爬虫，md / txt 直接读字节。原图在归一化那一层就收进对象存储，此后再无区别。"
+      },
+      {
+        "id": "deps",
+        "label": "每一步牵动谁",
+        "focus": ["enrich", "ocr", "vlm", "minio", "tag", "llm", "mongo", "embed", "bge", "store", "milvus", "redis"],
+        "note": "补图同时牵动本地的 RapidOCR 与云端的视觉模型；打标读 Mongo 的术语映射，读不出结构才调语言模型；入库后清一次答案缓存。"
+      }
+    ]
+  },
+  "lanes": [
+    { "id": "ui", "label": "界面与任务" },
+    { "id": "store", "label": "依赖 · 抓取与存储" },
+    { "id": "pipe", "label": "导入编排 · Importer._run" },
+    { "id": "models", "label": "依赖 · 模型" }
+  ],
+  "phases": [
+    { "id": "intake", "label": "取回并归一", "fromCol": 0, "toCol": 1 },
+    { "id": "structure", "label": "切分与打标", "fromCol": 2, "toCol": 3, "variant": "emphasis" },
+    { "id": "persist", "label": "向量化与入库", "fromCol": 4, "toCol": 5, "variant": "dashed" }
+  ],
+  "mainPath": ["normalize", "enrich", "chunk", "tag", "embed", "store"],
+  "nodes": [
+    { "id": "jobs", "lane": "ui", "col": 0, "type": "backend", "label": "ImportJobs", "sublabel": "后台线程 · 一批 4 条并发", "width": 150 },
+    { "id": "page", "lane": "ui", "col": 5, "type": "frontend", "label": "导入页", "sublabel": "上传 / 网址 / 轮询每条走到第几步", "width": 150 },
+
+    { "id": "crawler", "lane": "store", "col": 0, "type": "backend", "label": "自建爬虫", "sublabel": "取网页正文与外链原图", "tag": "robots + 按主机限频", "width": 150 },
+    { "id": "minio", "lane": "store", "col": 1, "type": "database", "label": "MinIO", "sublabel": "原图按对象 key 收好", "width": 150 },
+    { "id": "mongo", "lane": "store", "col": 3, "type": "database", "label": "MongoDB", "sublabel": "术语映射 / 知识库配置", "width": 150 },
+    { "id": "redis", "lane": "store", "col": 4, "type": "database", "label": "Redis", "sublabel": "清答案缓存，不动计数", "width": 150 },
+    { "id": "milvus", "lane": "store", "col": 5, "type": "database", "label": "Milvus", "sublabel": "chunks collection", "width": 150 },
+
+    { "id": "normalize", "lane": "pipe", "col": 0, "type": "backend", "label": "ParserRouter", "sublabel": "① 归一化", "width": 150 },
+    { "id": "enrich", "lane": "pipe", "col": 1, "type": "backend", "label": "ImageEnricher", "sublabel": "② 补图", "width": 150 },
+    { "id": "chunk", "lane": "pipe", "col": 2, "type": "backend", "label": "chunk_document", "sublabel": "③ 切分", "width": 150 },
+    { "id": "tag", "lane": "pipe", "col": 3, "type": "backend", "label": "tag_document", "sublabel": "④ 打标", "width": 150 },
+    { "id": "embed", "lane": "pipe", "col": 4, "type": "backend", "label": "_vectorize", "sublabel": "⑤ 向量化", "width": 150 },
+    { "id": "store", "lane": "pipe", "col": 5, "type": "backend", "label": "_store", "sublabel": "⑥ 入库", "width": 150 },
+
+    { "id": "mineru", "lane": "models", "col": 0, "type": "external", "label": "MinerU 云端", "sublabel": "PDF / 图片 → md", "tag": "超时 600s", "width": 150 },
+    { "id": "ocr", "lane": "models", "col": 1, "type": "backend", "label": "RapidOCR", "sublabel": "图内文字回填正文", "tag": "本地", "width": 150 },
+    { "id": "vlm", "lane": "models", "col": 2, "type": "external", "label": "视觉模型", "sublabel": "只写图上才有的信息", "tag": "云端", "width": 150 },
+    { "id": "llm", "lane": "models", "col": 3, "type": "external", "label": "语言模型", "sublabel": "读不出结构时兜底打标", "tag": "云端", "width": 150 },
+    { "id": "bge", "lane": "models", "col": 4, "type": "backend", "label": "BGE-M3", "sublabel": "稠密 + 稀疏双向量", "tag": "本地", "width": 150 }
+  ],
+  "edges": [
+    { "id": "run", "from": "jobs", "to": "normalize", "label": "逐条跑六阶段", "variant": "emphasis" },
+    { "id": "snapshot", "from": "jobs", "to": "page", "label": "进度快照", "variant": "dashed" },
+
+    { "id": "to-crawler", "from": "normalize", "to": "crawler", "label": "网址", "variant": "default" },
+    { "id": "to-mineru", "from": "normalize", "to": "mineru", "label": "PDF / 图片", "variant": "default" },
+
+    { "id": "n2e", "from": "normalize", "to": "enrich", "label": "md", "variant": "emphasis" },
+    { "id": "e2c", "from": "enrich", "to": "chunk", "label": "带图正文", "variant": "emphasis" },
+    { "id": "c2t", "from": "chunk", "to": "tag", "label": "切片", "variant": "emphasis" },
+    { "id": "t2e", "from": "tag", "to": "embed", "label": "带标签切片", "variant": "emphasis" },
+    { "id": "e2s", "from": "embed", "to": "store", "label": "向量行", "variant": "emphasis" },
+
+    { "id": "to-minio", "from": "enrich", "to": "minio", "label": "原图", "variant": "dashed" },
+    { "id": "to-ocr", "from": "enrich", "to": "ocr", "label": "每个图片条目", "variant": "dashed" },
+    { "id": "to-vlm", "from": "enrich", "to": "vlm", "label": "空着的替代文本", "variant": "dashed" },
+    { "id": "to-mongo", "from": "tag", "to": "mongo", "label": "读术语映射", "variant": "dashed" },
+    { "id": "to-llm", "from": "tag", "to": "llm", "label": "结构读不出时", "variant": "dashed" },
+    { "id": "to-bge", "from": "embed", "to": "bge", "label": "两路向量", "variant": "dashed" },
+    { "id": "to-milvus", "from": "store", "to": "milvus", "label": "写切片", "variant": "emphasis" },
+    { "id": "to-redis", "from": "store", "to": "redis", "label": "导入完成即清", "variant": "dashed" }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "一条链，三个来源",
+      "items": [
+        "PDF 与图片走 MinerU 云端，网址走自建爬虫，md / txt 直接读字节；原图在归一化那一层收进对象存储，此后再无区别。"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "补图这一步最重",
+      "items": [
+        "MinerU 不识别图片区域里的文字，二次 OCR 补的就是这一块：每个 image 条目都做，文字插在该图引用所在那一行的末尾。"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "失败只到一条",
+      "items": [
+        "六个阶段各自失败互不牵连，同批其余照跑；两条资料落成同一个文档标识时后一条当场失败，且挡在重试之外。"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,599 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "RAGamer 检索链路",
+    "output": "docs/diagrams/retrieval-architecture.html",
+    "locale": "zh-CN",
+    "quality_profile": "standard",
+    "views": [
+      {
+        "id": "understand",
+        "label": "一次提问的理解与澄清",
+        "focus": [
+          "chat",
+          "ask",
+          "live",
+          "cache",
+          "redis",
+          "understand",
+          "clarify",
+          "mongo"
+        ],
+        "note": "联合输出一次调用同时给出游戏、版本、改写问法与查询类型；判不准才写待澄清记录，并把候选交回页面再问一次。"
+      },
+      {
+        "id": "recall",
+        "label": "六路召回与融合",
+        "focus": [
+          "route",
+          "main",
+          "meta",
+          "multi",
+          "hyde",
+          "table",
+          "web",
+          "rrf",
+          "milvus",
+          "bge"
+        ],
+        "note": "路由按查询类型挑路，不做无差别全跑；联网那一路不进融合，单独成一批交给生成并标注来源。"
+      },
+      {
+        "id": "rank",
+        "label": "排序、截断与聚合",
+        "focus": [
+          "rrf",
+          "rerank",
+          "reranker",
+          "cliff",
+          "parents",
+          "answer"
+        ],
+        "note": "融合分只用来排候选池，交出去的顺序由精排给；聚合发生在断崖截断之后，且不单独入库。"
+      }
+    ]
+  },
+  "layout": {
+    "mode": "grid",
+    "cols": 7,
+    "gapX": 56,
+    "gapY": 44
+  },
+  "components": [
+    {
+      "id": "chat",
+      "type": "frontend",
+      "label": "对话页",
+      "sublabel": "多轮 · 流式 · 引用 · 原图 · 版本徽章",
+      "row": 3,
+      "col": 0,
+      "size": [
+        148,
+        58
+      ]
+    },
+    {
+      "id": "ask",
+      "type": "backend",
+      "label": "提问端点",
+      "sublabel": "GET …/ask · SSE 五种事件",
+      "row": 3,
+      "col": 1,
+      "size": [
+        148,
+        58
+      ]
+    },
+    {
+      "id": "live",
+      "type": "backend",
+      "label": "轮次快照",
+      "sublabel": "GET …/live · 切回来接着看",
+      "row": 4,
+      "col": 1,
+      "size": [
+        148,
+        58
+      ]
+    },
+    {
+      "id": "cache",
+      "type": "backend",
+      "label": "答案缓存",
+      "sublabel": "游戏 + 版本 + 改写问法",
+      "row": 2,
+      "col": 1,
+      "size": [
+        148,
+        58
+      ]
+    },
+    {
+      "id": "redis",
+      "type": "database",
+      "label": "Redis",
+      "sublabel": "答案缓存 + 热门问题",
+      "row": 2,
+      "col": 0,
+      "size": [
+        148,
+        58
+      ]
+    },
+    {
+      "id": "understand",
+      "type": "backend",
+      "label": "联合输出",
+      "sublabel": "游戏 · 版本 · 改写 · 类型 · 确定度",
+      "row": 3,
+      "col": 2,
+      "size": [
+        148,
+        58
+      ]
+    },
+    {
+      "id": "clarify",
+      "type": "security",
+      "label": "澄清反问",
+      "sublabel": "候选只从语料里取",
+      "row": 4,
+      "col": 2,
+      "size": [
+        148,
+        58
+      ]
+    },
+    {
+      "id": "mongo",
+      "type": "database",
+      "label": "MongoDB",
+      "sublabel": "会话 · 待澄清 · 知识库",
+      "row": 5,
+      "col": 2,
+      "size": [
+        148,
+        58
+      ]
+    },
+    {
+      "id": "route",
+      "type": "backend",
+      "label": "查询路由",
+      "sublabel": "查询类型 → 走哪几路",
+      "row": 3,
+      "col": 3,
+      "size": [
+        148,
+        58
+      ]
+    },
+    {
+      "id": "main",
+      "type": "backend",
+      "label": "主混合检索路",
+      "sublabel": "稠密 + 稀疏，同一批数据",
+      "row": 0,
+      "col": 4,
+      "size": [
+        148,
+        58
+      ]
+    },
+    {
+      "id": "meta",
+      "type": "backend",
+      "label": "元数据过滤路",
+      "sublabel": "按标签取，单路稠密",
+      "row": 1,
+      "col": 4,
+      "size": [
+        148,
+        58
+      ]
+    },
+    {
+      "id": "multi",
+      "type": "backend",
+      "label": "多查询改写路",
+      "sublabel": "改写几段分别去检索",
+      "row": 2,
+      "col": 4,
+      "size": [
+        148,
+        58
+      ]
+    },
+    {
+      "id": "hyde",
+      "type": "backend",
+      "label": "HyDE 路",
+      "sublabel": "假想答案只用于检索",
+      "row": 3,
+      "col": 4,
+      "size": [
+        148,
+        58
+      ]
+    },
+    {
+      "id": "table",
+      "type": "backend",
+      "label": "结构化表格路",
+      "sublabel": "属性写在表格里的那一类",
+      "row": 4,
+      "col": 4,
+      "size": [
+        148,
+        58
+      ]
+    },
+    {
+      "id": "web",
+      "type": "external",
+      "label": "联网兜底路",
+      "sublabel": "博查检索 · 引用带 url",
+      "row": 5,
+      "col": 4,
+      "size": [
+        148,
+        58
+      ]
+    },
+    {
+      "id": "bge",
+      "type": "backend",
+      "label": "BGE-M3",
+      "sublabel": "稠密 + 稀疏双向量",
+      "tag": "本地",
+      "row": 0,
+      "col": 5,
+      "size": [
+        148,
+        58
+      ]
+    },
+    {
+      "id": "milvus",
+      "type": "database",
+      "label": "Milvus",
+      "sublabel": "chunks collection",
+      "row": 1,
+      "col": 5,
+      "size": [
+        148,
+        58
+      ]
+    },
+    {
+      "id": "rrf",
+      "type": "backend",
+      "label": "RRF 融合",
+      "sublabel": "k = 60，削弱头部优势",
+      "row": 2,
+      "col": 5,
+      "size": [
+        148,
+        58
+      ]
+    },
+    {
+      "id": "rerank",
+      "type": "backend",
+      "label": "精排",
+      "sublabel": "长上下文模型，摘要路径删掉",
+      "row": 3,
+      "col": 5,
+      "size": [
+        148,
+        58
+      ]
+    },
+    {
+      "id": "reranker",
+      "type": "backend",
+      "label": "bge-reranker-v2-m3",
+      "sublabel": "本地精排",
+      "tag": "本地",
+      "row": 3,
+      "col": 6,
+      "size": [
+        148,
+        58
+      ]
+    },
+    {
+      "id": "cliff",
+      "type": "backend",
+      "label": "断崖截断",
+      "sublabel": "按分数落差定位置，不凑数",
+      "row": 4,
+      "col": 5,
+      "size": [
+        148,
+        58
+      ]
+    },
+    {
+      "id": "parents",
+      "type": "backend",
+      "label": "聚合父块",
+      "sublabel": "回查同文档兄弟切片",
+      "row": 4,
+      "col": 6,
+      "size": [
+        148,
+        58
+      ]
+    },
+    {
+      "id": "bocha",
+      "type": "external",
+      "label": "博查检索",
+      "sublabel": "外部搜索服务",
+      "tag": "云端",
+      "row": 5,
+      "col": 3,
+      "size": [
+        148,
+        58
+      ]
+    },
+    {
+      "id": "answer",
+      "type": "backend",
+      "label": "生成",
+      "sublabel": "正文 + 引用 + 原图",
+      "row": 5,
+      "col": 5,
+      "size": [
+        148,
+        58
+      ]
+    },
+    {
+      "id": "llm",
+      "type": "external",
+      "label": "语言模型",
+      "sublabel": "理解 · 改写 · 生成",
+      "tag": "云端",
+      "row": 5,
+      "col": 6,
+      "size": [
+        148,
+        58
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "五路融合 · rrf()",
+      "wraps": [
+        "main",
+        "meta",
+        "multi",
+        "hyde",
+        "table"
+      ],
+      "pad": 16
+    }
+  ],
+  "connections": [
+    {
+      "id": "ask-from-chat",
+      "from": "chat",
+      "to": "ask",
+      "label": "提问",
+      "variant": "emphasis"
+    },
+    {
+      "id": "live-from-chat",
+      "from": "chat",
+      "to": "live",
+      "label": "轮询快照",
+      "variant": "dashed"
+    },
+    {
+      "id": "ask-cache",
+      "from": "ask",
+      "to": "cache",
+      "label": "先查缓存",
+      "variant": "emphasis"
+    },
+    {
+      "id": "cache-redis",
+      "from": "cache",
+      "to": "redis"
+    },
+    {
+      "id": "cache-understand",
+      "from": "cache",
+      "to": "understand",
+      "label": "未命中",
+      "variant": "emphasis"
+    },
+    {
+      "id": "understand-clarify",
+      "from": "understand",
+      "to": "clarify",
+      "label": "确定度不够",
+      "variant": "security",
+      "labelDy": 24
+    },
+    {
+      "id": "clarify-mongo",
+      "from": "clarify",
+      "to": "mongo",
+      "label": "待澄清记录",
+      "variant": "dashed",
+      "labelDy": 24
+    },
+    {
+      "id": "understand-route",
+      "from": "understand",
+      "to": "route",
+      "label": "查询类型",
+      "variant": "emphasis",
+      "labelDy": 161
+    },
+    {
+      "id": "route-main",
+      "from": "route",
+      "to": "main",
+      "variant": "emphasis"
+    },
+    {
+      "id": "route-meta",
+      "from": "route",
+      "to": "meta",
+      "variant": "emphasis"
+    },
+    {
+      "id": "route-multi",
+      "from": "route",
+      "to": "multi",
+      "variant": "emphasis"
+    },
+    {
+      "id": "route-hyde",
+      "from": "route",
+      "to": "hyde",
+      "variant": "emphasis"
+    },
+    {
+      "id": "route-table",
+      "from": "route",
+      "to": "table",
+      "variant": "emphasis"
+    },
+    {
+      "id": "route-web",
+      "from": "route",
+      "to": "web",
+      "label": "时效型",
+      "variant": "dashed"
+    },
+    {
+      "id": "main-rrf",
+      "from": "main",
+      "to": "rrf",
+      "variant": "emphasis"
+    },
+    {
+      "id": "meta-rrf",
+      "from": "meta",
+      "to": "rrf",
+      "variant": "emphasis"
+    },
+    {
+      "id": "multi-rrf",
+      "from": "multi",
+      "to": "rrf",
+      "variant": "emphasis"
+    },
+    {
+      "id": "hyde-rrf",
+      "from": "hyde",
+      "to": "rrf",
+      "variant": "emphasis"
+    },
+    {
+      "id": "table-rrf",
+      "from": "table",
+      "to": "rrf",
+      "variant": "emphasis"
+    },
+    {
+      "id": "rrf-rerank",
+      "from": "rrf",
+      "to": "rerank",
+      "label": "候选池",
+      "variant": "emphasis",
+      "labelDy": 24
+    },
+    {
+      "id": "rerank-reranker",
+      "from": "rerank",
+      "to": "reranker"
+    },
+    {
+      "id": "rerank-cliff",
+      "from": "rerank",
+      "to": "cliff",
+      "label": "精排分",
+      "variant": "emphasis",
+      "labelDy": 24
+    },
+    {
+      "id": "cliff-parents",
+      "from": "cliff",
+      "to": "parents",
+      "label": "截断之后才聚合",
+      "variant": "emphasis",
+      "labelDy": 216
+    },
+    {
+      "id": "parents-answer",
+      "from": "parents",
+      "to": "answer",
+      "variant": "emphasis"
+    },
+    {
+      "id": "web-answer",
+      "from": "web",
+      "to": "answer",
+      "label": "单独成一批",
+      "variant": "dashed",
+      "labelDy": 106
+    },
+    {
+      "id": "web-bocha",
+      "from": "web",
+      "to": "bocha"
+    },
+    {
+      "id": "main-bge",
+      "from": "main",
+      "to": "bge",
+      "label": "问句向量化",
+      "labelDy": 648
+    },
+    {
+      "id": "meta-milvus",
+      "from": "meta",
+      "to": "milvus",
+      "label": "取切片"
+    },
+    {
+      "id": "answer-llm",
+      "from": "answer",
+      "to": "llm",
+      "variant": "dashed"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "理解那一次调用不白花",
+      "items": [
+        "游戏、版本、改写问法、查询类型、确定度由同一次模型调用一并给出，路由不额外加调用。"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "联网那一路不参与融合",
+      "items": [
+        "外部结果不是语料里的切片，没有父块可回查，也不该被精排与断崖当成语料。"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "缓存靠改写后的问题归一",
+      "items": [
+        "精确匹配就够，不做语义缓存；理解结果在进程内另记一份，抵住改写抖动。"
+      ]
+    }
+  ]
+}
